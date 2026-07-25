@@ -276,13 +276,15 @@ python download_all_2b2t.py \
   --workers 4 \
   --requests-per-second 2 \
   --discovery-samples 25 \
+  --space-headroom-percent 20 \
   --resume \
   --no-fallback
 ```
 
 En este equipo, `run_full_download_luisa.sh` monta el contenedor APFS alojado
 en la unidad `LuisA`, evita el desperdicio de ExFAT, mantiene el equipo
-despierto y ejecuta exactamente ese alcance:
+despierto y ejecuta exactamente ese alcance. Usa una reserva adicional del
+18 % porque cada grupo ya incorpora un 25 % conservador de incertidumbre:
 
 ```bash
 ./run_full_download_luisa.sh
@@ -295,6 +297,7 @@ Valores predeterminados relevantes:
 - timeout de 30 segundos;
 - 5 intentos por petición;
 - 25 muestras de descubrimiento por grupo;
+- 20 % de reserva de espacio adicional, configurable;
 - límite de 16 MiB por respuesta.
 
 Opciones útiles:
@@ -304,6 +307,7 @@ Opciones útiles:
 --retries INTENTOS
 --discovery-samples CANTIDAD
 --max-tile-bytes BYTES
+--space-headroom-percent PORCENTAJE
 --refresh-discovery
 --skip-smoke-test
 --no-fallback
@@ -593,7 +597,8 @@ Antes de la descarga completa, el programa:
 4. descuenta datos completos que ya existen;
 5. calcula el tiempo mínimo según `--requests-per-second`;
 6. consulta el espacio libre del volumen;
-7. exige además un 20 % de espacio libre sobre la estimación conservadora.
+7. exige además la reserva indicada por `--space-headroom-percent` sobre la
+   estimación conservadora; el valor predeterminado es 20 %.
 
 Si la selección completa no cabe, no borra nada. Informa cuánto falta y, salvo
 que se use `--no-fallback`, intenta un plan reducido:
@@ -602,13 +607,19 @@ que se use `--no-fallback`, intenta un plan reducido:
 2. primero LOD 10 y después niveles progresivamente más finos;
 3. siempre un intervalo contiguo desde LOD 10 para que el quadtree pueda
    navegar;
-4. únicamente los niveles que aún dejen el 20 % adicional.
+4. únicamente los niveles que aún dejen la reserva adicional configurada.
 
 Si ni el primer nivel priorizado cabe, la descarga no empieza. Durante la
 ejecución se vuelve a comprobar el disco después de cada tile y se detiene si
 el espacio libre cae por debajo del piso seguro, que es el mayor entre 512 MiB
-y el 20 % del plan conservador. `estimate.json` conserva tanto el plan reducido
-como el comando para continuar la selección original más adelante.
+y el porcentaje configurado del plan conservador. `estimate.json` conserva
+tanto el plan reducido como el comando para continuar la selección original
+más adelante.
+
+La reserva adicional no sustituye el margen interno: se aplica después del
+25 % de incertidumbre por muestreo. Por ejemplo, 18 % de reserva equivale a
+exigir aproximadamente 47,5 % sobre la estimación puntual
+(`1,25 × 1,18 = 1,475`).
 
 Las cifras cambian con las muestras del origen, los tiles ya descargados, la
 unidad de asignación y el espacio libre. Siempre debe prevalecer el
@@ -617,18 +628,22 @@ mapa completo se detenga si no cabe, en vez de declarar terminado un subconjunto
 
 ## Estado actual de la descarga y espacio
 
-Instantánea del **24 de julio de 2026 a las 18:55 UTC−6**:
+Instantánea del **24 de julio de 2026 a las 19:19 UTC−6**:
 
-- `LuisA` está montada y tiene aproximadamente 1,3 TiB libres;
+- `LuisA` está montada y tiene 1,34 TiB libres;
 - un sparsebundle alojado en `LuisA` está montado como `/Volumes/2b2t Tiles`;
 - el contenedor usa APFS con bloques de 4 KiB, frente a los 128 KiB de ExFAT;
-- se copiaron y verificaron 89 199 tiles: 89 199 válidos, 0 corruptos;
+- el inventario arrancó la cola con más de 90 000 tiles completos y 0 corruptos;
 - la sesión detached `obsidian_atlas_full` está activa;
 - el alcance solicitado es `overworld,nether,end × base,overlay,newchunks ×
   LOD 0..10`;
 - `--no-fallback` impide sustituir silenciosamente el mapa completo por un plan
   parcial;
-- el preflight de 99 grupos está en curso y publica su propia barra.
+- el preflight de 99 grupos terminó y aprobó el alcance completo;
+- la estimación conservadora restante es 1,12 TiB; con 18 % de reserva exige
+  1,33 TiB, por debajo del espacio libre;
+- la cola estimada contiene 17 157 504 solicitudes y publica su barra cada
+  cinco segundos; a 2 solicitudes/s, el tiempo mínimo ronda 99 días.
 
 Los datos viven en:
 

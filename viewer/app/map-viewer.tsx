@@ -2064,6 +2064,7 @@ const DOWNLOAD_STATUS_META: Record<
   fallback_complete: { label: "Prioridad completa", tone: "warning" },
   incomplete: { label: "Incompleta", tone: "warning" },
   stopped: { label: "Pausada", tone: "warning" },
+  preflight_blocked: { label: "Falta espacio", tone: "error" },
   error: { label: "Con errores", tone: "error" },
   smoke_test_complete: { label: "Prueba completa", tone: "complete" },
   unknown: { label: "Estado desconocido", tone: "neutral" },
@@ -2267,8 +2268,8 @@ function DownloadProgressCard({
           value={progress.tilesCompleted.toLocaleString("es-GT")}
         />
         <ProgressMetric
-          label="Pendientes"
-          value={progress.tilesPending.toLocaleString("es-GT")}
+          label={progress.status === "discovering" ? "Grupos restantes" : "Restantes"}
+          value={progress.remainingRequests.toLocaleString("es-GT")}
         />
         <ProgressMetric label="Velocidad" value={speed} />
         <ProgressMetric

@@ -24,6 +24,7 @@ export interface DownloadProgressSnapshot {
   readonly tilesFailed: number;
   readonly plannedRequests: number | null;
   readonly processedRequests: number;
+  readonly remainingRequests: number;
   readonly progressPercent: number | null;
   readonly progressPercentSource: ProgressPercentSource;
   readonly progressKind: string | null;
@@ -157,6 +158,11 @@ export function parseDownloadProgress(
         : isFinishedStatus(status) && processedRequests > 0
           ? processedRequests
           : null;
+  const remainingRequests =
+    nonNegativeInteger(value.remaining_requests) ??
+    (plannedRequests === null
+      ? tilesPending
+      : Math.max(0, plannedRequests - processedRequests));
 
   const reportedPercent = finiteNonNegative(value.progress_percent);
   let progressPercent: number | null = null;
@@ -190,6 +196,7 @@ export function parseDownloadProgress(
     tilesFailed,
     plannedRequests,
     processedRequests,
+    remainingRequests,
     progressPercent,
     progressPercentSource,
     progressKind: readShortString(value.progress_kind, 64)?.toLowerCase() ?? null,

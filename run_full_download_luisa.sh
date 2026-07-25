@@ -44,6 +44,7 @@ exec caffeinate -im "${python_bin}" "${project_dir}/download_all_2b2t.py" \
   --timeout 30 \
   --retries 5 \
   --discovery-samples 25 \
+  --space-headroom-percent 18 \
   --resume \
   --skip-smoke-test \
   --no-fallback

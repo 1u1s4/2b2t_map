@@ -37,6 +37,7 @@ test("progress parser prefers explicit counters and percentage", () => {
   assert.equal(progress.updatedAtTimestamp, Date.parse("2026-07-24T12:34:56Z"));
   assert.equal(progress.plannedRequests, 100);
   assert.equal(progress.processedRequests, 25);
+  assert.equal(progress.remainingRequests, 75);
   assert.equal(progress.progressPercent, 24.75);
   assert.equal(progress.progressPercentSource, "reported");
   assert.equal(progress.progressKind, "estimated");
@@ -59,6 +60,7 @@ test("progress parser derives a useful fallback from legacy fields", () => {
 
   assert.equal(progress.processedRequests, 10);
   assert.equal(progress.plannedRequests, 40);
+  assert.equal(progress.remainingRequests, 30);
   assert.equal(progress.progressPercent, 25);
   assert.equal(progress.progressPercentSource, "derived");
   assert.equal(progress.downloadedBytes, 4096);

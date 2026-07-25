@@ -86,6 +86,7 @@ SCHEMA_SOURCES = {
 
 RETRYABLE_STATUSES = {408, 425, 429}
 TERMINAL_STATUSES = {"complete", "absent", "probe_complete"}
+DEFAULT_SPACE_HEADROOM_PERCENT = 20.0
 
 
 def utc_now() -> str:
@@ -145,6 +146,18 @@ def allocated_payload_bytes(size_bytes: int, allocation_unit: int) -> int:
         return 0
     unit = max(1, allocation_unit)
     return math.ceil(size_bytes / unit) * unit
+
+
+def bytes_with_space_headroom(
+    conservative_bytes: int,
+    space_headroom_percent: float,
+) -> int:
+    """Add the configured free-space reserve to a conservative estimate."""
+
+    return math.ceil(
+        max(0, conservative_bytes)
+        * (1.0 + space_headroom_percent / 100.0)
+    )
 
 
 def is_retryable_http_status(status: int) -> bool:
@@ -1399,6 +1412,7 @@ class DownloadPlan:
     requests: int
     free_bytes: int
     required_with_headroom: int
+    space_headroom_percent: float
 
 
 PROGRESS_PROCESSED_STATUSES = frozenset(
@@ -1513,6 +1527,14 @@ def download_plan_payload(plan: DownloadPlan) -> dict[str, Any]:
         "requests": plan.requests,
         "free_bytes": plan.free_bytes,
         "required_with_headroom": plan.required_with_headroom,
+        "space_headroom_percent": plan.space_headroom_percent,
+        "headroom_bytes": max(
+            0, plan.required_with_headroom - plan.conservative_bytes
+        ),
+        "space_shortfall_bytes": max(
+            0, plan.required_with_headroom - plan.free_bytes
+        ),
+        "fits": plan.required_with_headroom <= plan.free_bytes,
     }
 
 
@@ -1706,8 +1728,10 @@ def discover_estimates(
             "processed_requests": group_index,
             "known_requests": total_groups,
             "estimated_requests": total_groups,
+            "remaining_requests": remaining_groups,
             "progress_percent": percent,
             "progress_kind": "phase",
+            "download_started": False,
             "requested_scope": requested_scope,
             "effective_scope": requested_scope,
             "fallback": False,
@@ -1867,8 +1891,8 @@ def discover_estimates(
                 mean_candidate = (
                     point_bytes / candidates if candidates else 0.0
                 )
-                # Margen de incertidumbre de 25 %, independiente del 20 % de
-                # espacio adicional exigido en el preflight.
+                # Margen de incertidumbre de 25 %, independiente de la reserva
+                # adicional configurable exigida en el preflight.
                 conservative = math.ceil(point_bytes * 1.25)
                 estimated_requests = candidates
                 row = EstimateRow(
@@ -1945,6 +1969,7 @@ def build_plan(
     free_bytes: int,
     existing_bytes: int,
     allow_fallback: bool,
+    space_headroom_percent: float = DEFAULT_SPACE_HEADROOM_PERCENT,
 ) -> DownloadPlan:
     point_total = math.ceil(
         sum(
@@ -1955,7 +1980,10 @@ def build_plan(
     conservative_total = max(
         0, sum(row.conservative_bytes for row in rows) - existing_bytes
     )
-    required = math.ceil(conservative_total * 1.20)
+    required = bytes_with_space_headroom(
+        conservative_total,
+        space_headroom_percent,
+    )
     requests = sum(row.estimated_requests for row in rows)
     if free_bytes >= required:
         return DownloadPlan(
@@ -1969,9 +1997,25 @@ def build_plan(
             requests,
             free_bytes,
             required,
+            space_headroom_percent,
         )
 
-    if not allow_fallback or "base" not in layers or "overworld" not in dimensions:
+    if not allow_fallback:
+        return DownloadPlan(
+            dimensions,
+            layers,
+            set(lods),
+            rows,
+            False,
+            point_total,
+            conservative_total,
+            requests,
+            free_bytes,
+            required,
+            space_headroom_percent,
+        )
+
+    if "base" not in layers or "overworld" not in dimensions:
         return DownloadPlan(
             dimensions,
             layers,
@@ -1983,6 +2027,7 @@ def build_plan(
             requests,
             free_bytes,
             required,
+            space_headroom_percent,
         )
 
     base_rows = sorted(
@@ -2001,7 +2046,13 @@ def build_plan(
     running = 0
     for row in base_rows:
         tentative = running + row.conservative_bytes
-        if math.ceil(tentative * 1.20) <= free_bytes:
+        if (
+            bytes_with_space_headroom(
+                tentative,
+                space_headroom_percent,
+            )
+            <= free_bytes
+        ):
             selected_rows.append(row)
             selected_lods.add(row.lod)
             running = tentative
@@ -2035,7 +2086,8 @@ def build_plan(
         running,
         sum(row.estimated_requests for row in selected_rows),
         free_bytes,
-        math.ceil(running * 1.20),
+        bytes_with_space_headroom(running, space_headroom_percent),
+        space_headroom_percent,
     )
 
 
@@ -2177,10 +2229,13 @@ class ProgressTracker:
             "planned_requests": progress["planned_requests"],
             "processed_requests": progress["processed_requests"],
             "known_requests": progress["known_requests"],
+            "remaining_requests": progress["remaining_requests"],
             "session_processed_requests": self.processed,
             "estimated_requests": self.estimated_requests,
             "progress_percent": progress["progress_percent"],
             "progress_kind": progress["progress_kind"],
+            "phase": "download",
+            "download_started": True,
             "requested_scope": self.requested_scope,
             "effective_scope": self.effective_scope,
             "fallback": self.fallback,
@@ -2232,10 +2287,13 @@ class ProgressTracker:
             "planned_requests": progress["planned_requests"],
             "processed_requests": progress["processed_requests"],
             "known_requests": progress["known_requests"],
+            "remaining_requests": progress["remaining_requests"],
             "session_processed_requests": self.processed,
             "estimated_requests": self.estimated_requests,
             "progress_percent": progress["progress_percent"],
             "progress_kind": progress["progress_kind"],
+            "phase": "download",
+            "download_started": True,
             "requested_scope": self.requested_scope,
             "effective_scope": self.effective_scope,
             "fallback": self.fallback,
@@ -2321,7 +2379,14 @@ def run_download_queue(
     )
     free_floor = max(
         512 * 1024 * 1024,
-        math.ceil(plan.conservative_bytes * 0.20),
+        max(
+            0,
+            bytes_with_space_headroom(
+                plan.conservative_bytes,
+                plan.space_headroom_percent,
+            )
+            - plan.conservative_bytes,
+        ),
     )
     logger.info(
         "Descarga: dimensiones=%s capas=%s LODs=%s workers=%d "
@@ -2519,6 +2584,16 @@ def positive_int(raw: str) -> int:
     return value
 
 
+def nonnegative_percentage(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("debe ser un porcentaje") from exc
+    if not math.isfinite(value) or not 0 <= value <= 100:
+        raise argparse.ArgumentTypeError("debe estar entre 0 y 100")
+    return value
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -2597,6 +2672,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Límite de seguridad por respuesta.",
     )
     parser.add_argument(
+        "--space-headroom-percent",
+        type=nonnegative_percentage,
+        default=DEFAULT_SPACE_HEADROOM_PERCENT,
+        help=(
+            "Reserva adicional sobre la estimación ya conservadora "
+            f"(predeterminado: {DEFAULT_SPACE_HEADROOM_PERCENT:g} %%)."
+        ),
+    )
+    parser.add_argument(
         "--estimate-only",
         action="store_true",
         help="Descubre y estima, pero no inicia la descarga.",
@@ -2670,6 +2754,8 @@ def build_resume_command(args: argparse.Namespace) -> str:
         str(args.discovery_samples),
         "--max-tile-bytes",
         str(args.max_tile_bytes),
+        "--space-headroom-percent",
+        str(args.space_headroom_percent),
         "--resume",
     ]
     if args.skip_smoke_test:
@@ -2830,9 +2916,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     resume_command = build_resume_command(args)
     plan: DownloadPlan | None = None
+    preflight_blocked = False
 
     try:
         logger.info("Salida: %s", output_root)
+        if args.space_headroom_percent < DEFAULT_SPACE_HEADROOM_PERCENT:
+            logger.warning(
+                "Reserva adicional reducida a %.2f %% (predeterminado: "
+                "%.2f %%); cada grupo conserva además 25 %% de "
+                "incertidumbre por muestreo.",
+                args.space_headroom_percent,
+                DEFAULT_SPACE_HEADROOM_PERCENT,
+            )
         logger.info("Verificando el contrato público de 2b2t.place...")
         schema_session = requests.Session()
         schema_session.headers["User-Agent"] = USER_AGENT
@@ -2939,8 +3034,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             sum(row.conservative_bytes for row in estimate_rows)
             - existing_bytes,
         )
-        full_required_with_headroom = math.ceil(
-            full_conservative_bytes * 1.20
+        full_required_with_headroom = bytes_with_space_headroom(
+            full_conservative_bytes,
+            args.space_headroom_percent,
         )
         plan = build_plan(
             dimensions=args.dimensions,
@@ -2950,6 +3046,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             free_bytes=free_bytes,
             existing_bytes=existing_bytes,
             allow_fallback=not args.no_fallback,
+            space_headroom_percent=args.space_headroom_percent,
         )
         plan_payload = download_plan_payload(plan)
         database.set_metadata("last_estimate", plan_payload)
@@ -2960,7 +3057,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             human_bytes(full_conservative_bytes),
         )
         logger.info(
-            "Requerido con 20 %% adicional: %s",
+            "Requerido con %.2f %% adicional: %s",
+            args.space_headroom_percent,
             human_bytes(full_required_with_headroom),
         )
         logger.info("Espacio libre: %s", human_bytes(plan.free_bytes))
@@ -2970,13 +3068,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.requests_per_second,
             human_duration(full_requests / args.requests_per_second),
         )
-        if plan.fallback:
+        full_fits = full_required_with_headroom <= plan.free_bytes
+        if not full_fits:
             missing = max(0, full_required_with_headroom - plan.free_bytes)
-            logger.warning(
-                "La selección completa no cabe. Faltan al menos %s. "
-                "No se eliminará ningún archivo.",
-                human_bytes(missing),
-            )
+            if full_conservative_bytes <= plan.free_bytes:
+                logger.warning(
+                    "La estimación conservadora cabe, pero faltan %s para "
+                    "cumplir la reserva adicional de %.2f %%. "
+                    "No se eliminará ningún archivo.",
+                    human_bytes(missing),
+                    args.space_headroom_percent,
+                )
+            else:
+                logger.warning(
+                    "La estimación conservadora no cabe. Faltan al menos %s. "
+                    "No se eliminará ningún archivo.",
+                    human_bytes(missing),
+                )
+        if plan.fallback:
             if plan.lods:
                 logger.warning(
                     "Prioridad automática: base/overworld, LODs %s "
@@ -2997,8 +3106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             else:
                 raise RuntimeError(
-                    "ni siquiera el primer LOD priorizado cabe con 20 % "
-                    "de espacio adicional"
+                    "ni siquiera el primer LOD priorizado cabe con "
+                    f"{args.space_headroom_percent:g} % de espacio adicional"
                 )
 
         estimate_payload = {
@@ -3015,6 +3124,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.estimate_only:
             logger.info("Estimación terminada; no se inició la descarga.")
             return 0
+        if not full_fits and args.no_fallback:
+            missing = full_required_with_headroom - plan.free_bytes
+            preflight_blocked = True
+            raise RuntimeError(
+                "la selección completa requiere "
+                f"{human_bytes(full_required_with_headroom)} con "
+                f"{args.space_headroom_percent:g} % de margen; faltan "
+                f"{human_bytes(missing)}"
+            )
 
         summary = run_download_queue(
             plan=plan,
@@ -3065,7 +3183,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         summary = {
             "updated_at": utc_now(),
-            "status": "error",
+            "status": "preflight_blocked" if preflight_blocked else "error",
+            "phase": "preflight" if preflight_blocked else None,
+            "download_started": False if preflight_blocked else None,
             "reason": f"{type(exc).__name__}: {exc}",
             **{
                 key: error_progress[key]
@@ -3075,6 +3195,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "known_requests",
                     "progress_percent",
                     "progress_kind",
+                    "remaining_requests",
                 )
             },
             "requested_scope": scope_payload(
