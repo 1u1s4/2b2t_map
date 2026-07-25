@@ -9,7 +9,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 from tile_core import (
     WebPValidationError,
@@ -18,6 +18,9 @@ from tile_core import (
     sha256_file,
     validate_webp_file,
 )
+
+FUTURES_PER_WORKER = 2
+ROW_PAGE_SIZE = 256
 
 
 @dataclass(slots=True)
@@ -103,6 +106,34 @@ def check_file(
         )
 
 
+def iter_complete_rows(
+    connection: sqlite3.Connection,
+    *,
+    max_id: int,
+    page_size: int = ROW_PAGE_SIZE,
+) -> Iterator[sqlite3.Row]:
+    """Yield the initial complete-row snapshot in bounded keyset pages."""
+
+    if page_size <= 0:
+        raise ValueError("page_size must be greater than zero")
+    last_id = 0
+    while last_id < max_id:
+        rows = connection.execute(
+            """
+            SELECT id, relative_path, size_bytes, sha256
+            FROM tiles
+            WHERE status='complete' AND id>? AND id<=?
+            ORDER BY id
+            LIMIT ?
+            """,
+            (last_id, max_id, page_size),
+        ).fetchall()
+        if not rows:
+            return
+        yield from rows
+        last_id = int(rows[-1]["id"])
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     output_root = args.out.expanduser().resolve()
@@ -123,79 +154,101 @@ def main(argv: Sequence[str] | None = None) -> int:
     connection = sqlite3.connect(database_path, timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout=30000")
-    rows = connection.execute(
+    initial = connection.execute(
         """
-        SELECT id, relative_path, size_bytes, sha256
+        SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id
         FROM tiles
         WHERE status='complete'
-        ORDER BY id
         """
-    ).fetchall()
-    print(f"Verificando {len(rows):,} tiles completos...")
+    ).fetchone()
+    assert initial is not None
+    total_rows = int(initial["count"])
+    max_id = int(initial["max_id"])
+    print(f"Verificando {total_rows:,} tiles completos...")
 
     valid = 0
     invalid = 0
     verified_bytes = 0
     errors: list[dict[str, object]] = []
+    max_in_flight = max(args.workers, args.workers * FUTURES_PER_WORKER)
+    rows = iter_complete_rows(connection, max_id=max_id)
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=args.workers,
         thread_name_prefix="verify",
     ) as executor:
-        futures = [
-            executor.submit(
-                check_file,
-                int(row["id"]),
-                output_root / str(row["relative_path"]),
-                (
-                    int(row["size_bytes"])
-                    if row["size_bytes"] is not None
-                    else None
-                ),
-                str(row["sha256"]) if row["sha256"] else None,
+        futures: set[concurrent.futures.Future[CheckResult]] = set()
+        exhausted = False
+        index = 0
+        while futures or not exhausted:
+            while len(futures) < max_in_flight and not exhausted:
+                try:
+                    row = next(rows)
+                except StopIteration:
+                    exhausted = True
+                    break
+                futures.add(
+                    executor.submit(
+                        check_file,
+                        int(row["id"]),
+                        output_root / str(row["relative_path"]),
+                        (
+                            int(row["size_bytes"])
+                            if row["size_bytes"] is not None
+                            else None
+                        ),
+                        str(row["sha256"]) if row["sha256"] else None,
+                    )
+                )
+            if not futures:
+                continue
+
+            done, futures = concurrent.futures.wait(
+                futures,
+                return_when=concurrent.futures.FIRST_COMPLETED,
             )
-            for row in rows
-        ]
-        for index, future in enumerate(
-            concurrent.futures.as_completed(futures), 1
-        ):
-            result = future.result()
-            if result.valid:
-                valid += 1
-                verified_bytes += result.size_bytes
-                connection.execute(
-                    """
-                    UPDATE tiles SET size_bytes=?, sha256=?,
-                        error_message=NULL, updated_at=datetime('now')
-                    WHERE id=?
-                    """,
-                    (result.size_bytes, result.sha256, result.row_id),
-                )
-            else:
-                invalid += 1
-                errors.append(
-                    {
-                        "row_id": result.row_id,
-                        "path": str(result.path),
-                        "error": result.error,
-                    }
-                )
-                if args.requeue_corrupt:
+            for future in done:
+                index += 1
+                result = future.result()
+                if result.valid:
+                    valid += 1
+                    verified_bytes += result.size_bytes
                     connection.execute(
                         """
-                        UPDATE tiles SET status='pending', sha256=NULL,
-                            error_message=?, updated_at=datetime('now')
+                        UPDATE tiles SET size_bytes=?, sha256=?,
+                            error_message=NULL, updated_at=datetime('now')
                         WHERE id=?
                         """,
-                        (f"verify_download.py: {result.error}", result.row_id),
+                        (result.size_bytes, result.sha256, result.row_id),
                     )
-            if index % 1000 == 0:
-                connection.commit()
-                print(
-                    f"\r{index:,}/{len(rows):,} "
-                    f"válidos={valid:,} inválidos={invalid:,}",
-                    end="",
-                    flush=True,
-                )
+                else:
+                    invalid += 1
+                    errors.append(
+                        {
+                            "row_id": result.row_id,
+                            "path": str(result.path),
+                            "error": result.error,
+                        }
+                    )
+                    if args.requeue_corrupt:
+                        connection.execute(
+                            """
+                            UPDATE tiles SET status='pending', sha256=NULL,
+                                error_message=?, updated_at=datetime('now')
+                            WHERE id=?
+                            """,
+                            (
+                                f"verify_download.py: {result.error}",
+                                result.row_id,
+                            ),
+                        )
+                if index % 1000 == 0:
+                    connection.commit()
+                    print(
+                        f"\r{index:,}/{total_rows:,} "
+                        f"válidos={valid:,} inválidos={invalid:,}",
+                        end="",
+                        flush=True,
+                    )
     connection.commit()
 
     status_counts = {
@@ -208,7 +261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = {
         "database": str(database_path),
         "output": str(output_root),
-        "checked": len(rows),
+        "checked": total_rows,
         "valid": valid,
         "invalid": invalid,
         "verified_bytes": verified_bytes,

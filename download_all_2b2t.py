@@ -84,7 +84,7 @@ SCHEMA_SOURCES = {
     ),
 }
 
-RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_STATUSES = {408, 425, 429}
 TERMINAL_STATUSES = {"complete", "absent", "probe_complete"}
 
 
@@ -126,6 +126,29 @@ def human_duration(seconds: float | None) -> str:
         parts.append(f"{minutes}m")
     parts.append(f"{seconds}s")
     return " ".join(parts)
+
+
+def filesystem_allocation_unit(path: Path) -> int:
+    """Return the smallest filesystem allocation unit used for new files."""
+
+    try:
+        stats = os.statvfs(path)
+        return max(1, int(stats.f_frsize or stats.f_bsize or 1))
+    except OSError:
+        return 4096
+
+
+def allocated_payload_bytes(size_bytes: int, allocation_unit: int) -> int:
+    """Estimate physical bytes consumed by one payload on the destination."""
+
+    if size_bytes <= 0:
+        return 0
+    unit = max(1, allocation_unit)
+    return math.ceil(size_bytes / unit) * unit
+
+
+def is_retryable_http_status(status: int) -> bool:
+    return status in RETRYABLE_STATUSES or 500 <= status <= 599
 
 
 def parse_retry_after(value: str | None, now: float | None = None) -> float | None:
@@ -770,6 +793,31 @@ class TileDatabase:
             )
         }
 
+    def work_counts_for(
+        self,
+        dimensions: Sequence[str],
+        layers: Sequence[str],
+        min_lod: int,
+    ) -> dict[str, int]:
+        """Count selected tiles and discovery ancestors in the active queue."""
+
+        dimension_marks = ",".join("?" for _ in dimensions)
+        layer_marks = ",".join("?" for _ in layers)
+        return {
+            str(row["status"]): int(row["count"])
+            for row in self.connection.execute(
+                f"""
+                SELECT status, COUNT(*) AS count
+                FROM tiles
+                WHERE dimension IN ({dimension_marks})
+                  AND layer IN ({layer_marks})
+                  AND lod >= ?
+                GROUP BY status
+                """,
+                [*dimensions, *layers, min_lod],
+            )
+        }
+
     def http_errors(self) -> dict[str, int]:
         return {
             str(row["code"]): int(row["count"])
@@ -1144,7 +1192,7 @@ class TileFetcher:
                 )
 
                 if (
-                    last_status not in RETRYABLE_STATUSES
+                    not is_retryable_http_status(last_status)
                     and last_status != 403
                 ):
                     break
@@ -1334,6 +1382,9 @@ class EstimateRow:
     mean_bytes_existing: float
     conservative_bytes: int
     estimated_requests: int
+    allocation_unit_bytes: int = 1
+    mean_allocated_bytes_existing: float = 0.0
+    estimated_allocated_bytes: int = 0
 
 
 @dataclasses.dataclass(slots=True)
@@ -1348,6 +1399,104 @@ class DownloadPlan:
     requests: int
     free_bytes: int
     required_with_headroom: int
+
+
+PROGRESS_PROCESSED_STATUSES = frozenset(
+    {
+        "complete",
+        "absent",
+        "probe_complete",
+        "failed",
+        "error",
+        "corrupt",
+        "protection",
+    }
+)
+
+
+def scope_payload(
+    dimensions: Sequence[str],
+    layers: Sequence[str],
+    lods: Iterable[int],
+) -> dict[str, Any]:
+    """Return a stable description of a requested or effective download scope."""
+
+    return {
+        "dimensions": list(dimensions),
+        "layers": list(layers),
+        "lods": sorted(set(lods)),
+    }
+
+
+def calculate_progress(
+    status_counts: dict[str, int],
+    *,
+    estimated_requests: int,
+    successful_final: bool = False,
+) -> dict[str, Any]:
+    """Calculate resume-aware progress from the persistent queue.
+
+    The estimate covers work not discovered in the quadtree yet. The known row
+    count takes over when irregular extensions make the estimate too small.
+    Existing terminal rows are included, so resuming does not restart at 0 %.
+    """
+
+    normalized = {
+        str(status): max(0, int(count))
+        for status, count in status_counts.items()
+    }
+    known_requests = sum(normalized.values())
+    processed_requests = sum(
+        normalized.get(status, 0)
+        for status in PROGRESS_PROCESSED_STATUSES
+    )
+    estimate = max(0, int(estimated_requests))
+
+    if successful_final:
+        # At a successful queue drain the discovered tree is authoritative.
+        # Sparse 404-pruned layers may legitimately finish below the original
+        # rectangular estimate.
+        planned_requests = processed_requests
+        progress_percent = 100.0
+        progress_kind = "actual"
+    else:
+        planned_requests = max(1, estimate, known_requests)
+        progress_percent = min(
+            100.0,
+            processed_requests * 100.0 / planned_requests,
+        )
+        progress_kind = (
+            "dynamic" if known_requests > estimate else "estimated"
+        )
+
+    return {
+        "planned_requests": planned_requests,
+        "processed_requests": processed_requests,
+        "known_requests": known_requests,
+        "progress_percent": progress_percent,
+        "progress_kind": progress_kind,
+        "remaining_requests": max(
+            0, planned_requests - processed_requests
+        ),
+    }
+
+
+def render_progress_bar(percent: float, *, width: int = 28) -> str:
+    """Render a compact ASCII-only progress bar for terminals and log files."""
+
+    if width <= 0:
+        raise ValueError("width debe ser mayor que cero")
+    value = min(100.0, max(0.0, float(percent)))
+    filled = min(width, max(0, round(width * value / 100.0)))
+    return f"[{'#' * filled}{'-' * (width - filled)}] {value:6.2f}%"
+
+
+def final_status_for_plan(status: str, *, fallback: bool) -> str:
+    """Avoid presenting a completed reduced plan as the full requested scope."""
+
+    if status == "complete" and fallback:
+        return "fallback_complete"
+    return status
 
 
 def download_plan_payload(plan: DownloadPlan) -> dict[str, Any]:
@@ -1537,18 +1686,72 @@ def discover_estimates(
     rows: list[EstimateRow] = []
     total_groups = len(dimensions) * len(layers) * len(lods)
     group_index = 0
+    allocation_unit = filesystem_allocation_unit(fetcher.output_root)
+    discovery_started = time.monotonic()
+    requested_scope = scope_payload(dimensions, layers, lods)
+
+    def report_discovery_progress() -> None:
+        elapsed = max(0.001, time.monotonic() - discovery_started)
+        group_rate = group_index / elapsed
+        remaining_groups = max(0, total_groups - group_index)
+        percent = (
+            group_index * 100.0 / total_groups if total_groups else 100.0
+        )
+        counts = database.counts_for(dimensions, layers)
+        payload = {
+            "updated_at": utc_now(),
+            "status": "discovering",
+            "phase": "discovery",
+            "planned_requests": total_groups,
+            "processed_requests": group_index,
+            "known_requests": total_groups,
+            "estimated_requests": total_groups,
+            "progress_percent": percent,
+            "progress_kind": "phase",
+            "requested_scope": requested_scope,
+            "effective_scope": requested_scope,
+            "fallback": False,
+            "tiles_completed": counts.get("complete", 0),
+            "tiles_pending": counts.get("pending", 0)
+            + counts.get("downloading", 0),
+            "tiles_absent": counts.get("absent", 0),
+            "tiles_corrupt": counts.get("corrupt", 0),
+            "tiles_failed": counts.get("failed", 0)
+            + counts.get("error", 0)
+            + counts.get("protection", 0),
+            "data_downloaded_bytes": database.total_downloaded_bytes_for(
+                dimensions, layers
+            ),
+            "eta_seconds": (
+                remaining_groups / group_rate if group_rate > 0 else None
+            ),
+            "http_errors": database.http_errors_for(dimensions, layers),
+            "effective_requests_per_second": getattr(
+                getattr(fetcher, "limiter", None),
+                "rate",
+                None,
+            ),
+            "output": str(fetcher.output_root.resolve()),
+        }
+        atomic_write_json(fetcher.output_root / "progress.json", payload)
+
     logger.info(
         "Fase de descubrimiento: %d grupos, hasta %d muestras GET por grupo.",
         total_groups,
         samples_per_group,
     )
+    logger.info(
+        "Unidad de asignación del destino: %s por archivo.",
+        human_bytes(allocation_unit),
+    )
+    report_discovery_progress()
 
     for dimension in dimensions:
         for layer in layers:
             for lod in sorted(lods, reverse=True):
                 group_index += 1
-                sizes: list[int] = []
                 existing_sizes: list[int] = []
+                allocated_existing_sizes: list[int] = []
                 found = 0
                 coordinates = sample_coordinates(
                     dimension, lod, samples_per_group
@@ -1607,10 +1810,12 @@ def discover_estimates(
                             f"{spec.url}: HTTP {status_code!r}; "
                             f"{error or 'sin respuesta WebP válida'}"
                         )
-                    sizes.append(size if exists else 0)
                     if exists:
                         found += 1
                         existing_sizes.append(size)
+                        allocated_existing_sizes.append(
+                            allocated_payload_bytes(size, allocation_unit)
+                        )
                     if fetcher.stop_event.is_set():
                         raise RuntimeError(
                             fetcher.protection_reason
@@ -1631,30 +1836,37 @@ def discover_estimates(
                 mean_existing = (
                     statistics.fmean(existing_sizes) if existing_sizes else 0.0
                 )
-                mean_candidate = statistics.fmean(sizes) if sizes else 0.0
+                mean_allocated_existing = (
+                    statistics.fmean(allocated_existing_sizes)
+                    if allocated_existing_sizes
+                    else 0.0
+                )
+                point_bytes = 0.0
 
                 # Evita que una muestra casual de tiles transparentes produzca
                 # una falsa estimación de cero para capas dispersas.
-                if found and mean_candidate <= 0:
-                    mean_candidate = max(512.0, mean_existing * density)
-                if found == 0 and rows:
+                if found:
+                    logical_point = estimated_available * mean_existing
+                    allocated_point = (
+                        estimated_available * mean_allocated_existing
+                    )
+                    point_bytes = max(logical_point, allocated_point)
+                elif rows:
                     previous = rows[-1]
                     if (
                         previous.dimension == dimension
                         and previous.layer == layer
                         and previous.lod == lod + 1
-                        and previous.mean_bytes_per_candidate > 0
+                        and previous.estimated_allocated_bytes > 0
                     ):
                         # Si el muestreo fino falla por dispersión, conserva
                         # como piso 1.5× el tamaño total del LOD padre.
-                        previous_total = (
-                            previous.candidate_tiles
-                            * previous.mean_bytes_per_candidate
+                        point_bytes = (
+                            previous.estimated_allocated_bytes * 1.5
                         )
-                        mean_candidate = (
-                            previous_total * 1.5 / candidates
-                        )
-                point_bytes = candidates * mean_candidate
+                mean_candidate = (
+                    point_bytes / candidates if candidates else 0.0
+                )
                 # Margen de incertidumbre de 25 %, independiente del 20 % de
                 # espacio adicional exigido en el preflight.
                 conservative = math.ceil(point_bytes * 1.25)
@@ -1671,11 +1883,19 @@ def discover_estimates(
                     mean_bytes_existing=mean_existing,
                     conservative_bytes=conservative,
                     estimated_requests=estimated_requests,
+                    allocation_unit_bytes=allocation_unit,
+                    mean_allocated_bytes_existing=mean_allocated_existing,
+                    estimated_allocated_bytes=math.ceil(point_bytes),
                 )
                 rows.append(row)
+                report_discovery_progress()
                 logger.info(
-                    "[%d/%d] %s/%s LOD %d: candidatos=%s, "
+                    "%s [%d/%d] %s/%s LOD %d: candidatos=%s, "
                     "muestras=%d/%d, tamaño conservador=%s",
+                    render_progress_bar(
+                        group_index * 100.0 / total_groups,
+                        width=20,
+                    ),
                     group_index,
                     total_groups,
                     dimension,
@@ -1868,10 +2088,15 @@ class ProgressTracker:
         started_bytes: int,
         dimensions: Sequence[str],
         layers: Sequence[str],
+        min_lod: int = MIN_LOD,
+        requested_scope: dict[str, Any] | None = None,
+        effective_scope: dict[str, Any] | None = None,
+        fallback: bool = False,
     ) -> None:
         self.output_root = output_root
         self.database = database
-        self.planned_requests = max(1, planned_requests)
+        self.estimated_requests = max(0, int(planned_requests))
+        self.planned_requests = self.estimated_requests
         self.resume_command = resume_command
         self.logger = logger
         self.limiter = limiter
@@ -1887,6 +2112,15 @@ class ProgressTracker:
         self.started_bytes = started_bytes
         self.dimensions = list(dimensions)
         self.layers = list(layers)
+        self.min_lod = min_lod
+        default_scope = scope_payload(
+            self.dimensions,
+            self.layers,
+            range(min_lod, MAX_LOD + 1),
+        )
+        self.requested_scope = dict(requested_scope or default_scope)
+        self.effective_scope = dict(effective_scope or default_scope)
+        self.fallback = bool(fallback)
         self.latencies: list[float] = []
         self.http_errors: Counter[int] = Counter()
 
@@ -1908,6 +2142,20 @@ class ProgressTracker:
             self.http_errors[result.http_code] += 1
         self.report(force=force)
 
+    def _progress_metrics(
+        self, *, successful_final: bool = False
+    ) -> dict[str, Any]:
+        work_counts = self.database.work_counts_for(
+            self.dimensions,
+            self.layers,
+            self.min_lod,
+        )
+        return calculate_progress(
+            work_counts,
+            estimated_requests=self.estimated_requests,
+            successful_final=successful_final,
+        )
+
     def report(self, *, force: bool = False) -> None:
         now = time.monotonic()
         if not force and now - self.last_report < 5:
@@ -1916,12 +2164,26 @@ class ProgressTracker:
         elapsed = max(0.001, now - self.started)
         tile_rate = self.processed / elapsed
         byte_rate = self.session_bytes / elapsed
-        remaining = max(0, self.planned_requests - self.processed)
-        eta = remaining / tile_rate if tile_rate > 0 else None
+        progress = self._progress_metrics()
+        eta = (
+            progress["remaining_requests"] / tile_rate
+            if tile_rate > 0
+            else None
+        )
         counts = self.database.counts_for(self.dimensions, self.layers)
         payload = {
             "updated_at": utc_now(),
             "status": "running",
+            "planned_requests": progress["planned_requests"],
+            "processed_requests": progress["processed_requests"],
+            "known_requests": progress["known_requests"],
+            "session_processed_requests": self.processed,
+            "estimated_requests": self.estimated_requests,
+            "progress_percent": progress["progress_percent"],
+            "progress_kind": progress["progress_kind"],
+            "requested_scope": self.requested_scope,
+            "effective_scope": self.effective_scope,
+            "fallback": self.fallback,
             "tiles_completed": counts.get("complete", 0),
             "tiles_pending": counts.get("pending", 0)
             + counts.get("downloading", 0),
@@ -1943,8 +2205,12 @@ class ProgressTracker:
         }
         atomic_write_json(self.output_root / "progress.json", payload)
         self.logger.info(
-            "Progreso: completados=%s pendientes=%s | %.2f tiles/s | "
+            "%s Progreso: procesadas=%s/%s | completados=%s "
+            "pendientes=%s | %.2f tiles/s | "
             "%.2f MB/s | datos=%s | ETA=%s | HTTP=%s",
+            render_progress_bar(payload["progress_percent"]),
+            f"{payload['processed_requests']:,}",
+            f"{payload['planned_requests']:,}",
             f"{payload['tiles_completed']:,}",
             f"{payload['tiles_pending']:,}",
             tile_rate,
@@ -1956,11 +2222,23 @@ class ProgressTracker:
 
     def finalize(self, status: str, reason: str | None = None) -> dict[str, Any]:
         self.report(force=True)
+        successful_final = status in ("complete", "fallback_complete")
+        progress = self._progress_metrics(successful_final=successful_final)
         counts = self.database.counts_for(self.dimensions, self.layers)
         payload = {
             "updated_at": utc_now(),
             "status": status,
             "reason": reason,
+            "planned_requests": progress["planned_requests"],
+            "processed_requests": progress["processed_requests"],
+            "known_requests": progress["known_requests"],
+            "session_processed_requests": self.processed,
+            "estimated_requests": self.estimated_requests,
+            "progress_percent": progress["progress_percent"],
+            "progress_kind": progress["progress_kind"],
+            "requested_scope": self.requested_scope,
+            "effective_scope": self.effective_scope,
+            "fallback": self.fallback,
             "tiles_completed": counts.get("complete", 0),
             "tiles_pending": counts.get("pending", 0)
             + counts.get("downloading", 0),
@@ -1979,6 +2257,13 @@ class ProgressTracker:
             "output": str(self.output_root.resolve()),
         }
         atomic_write_json(self.output_root / "progress.json", payload)
+        self.logger.info(
+            "%s Solicitudes procesadas: %s/%s (%s)",
+            render_progress_bar(payload["progress_percent"]),
+            f"{payload['processed_requests']:,}",
+            f"{payload['planned_requests']:,}",
+            payload["progress_kind"],
+        )
         return payload
 
 
@@ -1992,6 +2277,7 @@ def run_download_queue(
     stop_event: threading.Event,
     logger: logging.Logger,
     resume_command: str,
+    requested_scope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not plan.lods:
         raise RuntimeError("no hay ningún LOD que quepa con el margen requerido")
@@ -2024,6 +2310,14 @@ def run_download_queue(
         started_bytes=started_bytes,
         dimensions=plan.dimensions,
         layers=plan.layers,
+        min_lod=min_lod,
+        requested_scope=requested_scope,
+        effective_scope=scope_payload(
+            plan.dimensions,
+            plan.layers,
+            plan.lods,
+        ),
+        fallback=plan.fallback,
     )
     free_floor = max(
         512 * 1024 * 1024,
@@ -2151,6 +2445,15 @@ def run_download_queue(
             )
             logger.error(reason)
 
+    final_status = final_status_for_plan(
+        final_status,
+        fallback=plan.fallback,
+    )
+    if final_status == "fallback_complete" and reason is None:
+        reason = (
+            "plan priorizado completado; la selección solicitada completa "
+            "no cabía con el margen de espacio requerido"
+        )
     return progress.finalize(final_status, reason)
 
 
@@ -2281,8 +2584,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--discovery-samples",
         type=positive_int,
-        default=3,
-        help="Muestras GET por dimensión/capa/LOD para estimar tamaño.",
+        default=25,
+        help=(
+            "Muestras GET por dimensión/capa/LOD para estimar tamaño "
+            "(predeterminado: 25)."
+        ),
     )
     parser.add_argument(
         "--max-tile-bytes",
@@ -2380,50 +2686,73 @@ def revalidate_database(
     output_root: Path,
     logger: logging.Logger,
 ) -> tuple[int, int]:
-    rows = database.connection.execute(
-        "SELECT id, relative_path FROM tiles WHERE status='complete'"
-    ).fetchall()
+    snapshot = database.connection.execute(
+        """
+        SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id
+        FROM tiles WHERE status='complete'
+        """
+    ).fetchone()
+    assert snapshot is not None
+    total = int(snapshot["count"])
+    max_id = int(snapshot["max_id"])
+    last_id = 0
     valid = 0
     invalid = 0
-    for index, row in enumerate(rows, 1):
-        path = output_root / str(row["relative_path"])
-        validation = validate_webp(path)
-        if validation.valid:
-            valid += 1
-            database.connection.execute(
-                """
-                UPDATE tiles SET size_bytes=?, sha256=?, error_message=NULL,
-                    updated_at=? WHERE id=?
-                """,
-                (
-                    validation.size_bytes,
-                    validation.sha256,
-                    utc_now(),
-                    row["id"],
-                ),
-            )
-        else:
-            invalid += 1
-            database.connection.execute(
-                """
-                UPDATE tiles SET status='pending', sha256=NULL,
-                    error_message=?, updated_at=? WHERE id=?
-                """,
-                (
-                    f"revalidación: {validation.error}",
-                    utc_now(),
-                    row["id"],
-                ),
-            )
-        if index % 1000 == 0:
-            database.connection.commit()
-            logger.info(
-                "Revalidación: %d/%d (válidos=%d, inválidos=%d)",
-                index,
-                len(rows),
-                valid,
-                invalid,
-            )
+    checked = 0
+    while last_id < max_id:
+        rows = database.connection.execute(
+            """
+            SELECT id, relative_path
+            FROM tiles
+            WHERE status='complete' AND id>? AND id<=?
+            ORDER BY id
+            LIMIT 256
+            """,
+            (last_id, max_id),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            path = output_root / str(row["relative_path"])
+            validation = validate_webp(path)
+            if validation.valid:
+                valid += 1
+                database.connection.execute(
+                    """
+                    UPDATE tiles SET size_bytes=?, sha256=?,
+                        error_message=NULL, updated_at=? WHERE id=?
+                    """,
+                    (
+                        validation.size_bytes,
+                        validation.sha256,
+                        utc_now(),
+                        row["id"],
+                    ),
+                )
+            else:
+                invalid += 1
+                database.connection.execute(
+                    """
+                    UPDATE tiles SET status='pending', sha256=NULL,
+                        error_message=?, updated_at=? WHERE id=?
+                    """,
+                    (
+                        f"revalidación: {validation.error}",
+                        utc_now(),
+                        row["id"],
+                    ),
+                )
+            checked += 1
+            if checked % 1000 == 0:
+                database.connection.commit()
+                logger.info(
+                    "Revalidación: %d/%d (válidos=%d, inválidos=%d)",
+                    checked,
+                    total,
+                    valid,
+                    invalid,
+                )
+        last_id = int(rows[-1]["id"])
     database.connection.commit()
     return valid, invalid
 
@@ -2436,6 +2765,25 @@ def print_final_summary(
     logger.info("Estado final: %s", summary["status"])
     if summary.get("reason"):
         logger.info("Motivo: %s", summary["reason"])
+    if summary.get("requested_scope"):
+        logger.info(
+            "Alcance solicitado: %s",
+            json.dumps(summary["requested_scope"], ensure_ascii=False),
+        )
+    if summary.get("effective_scope"):
+        logger.info(
+            "Alcance efectivo: %s%s",
+            json.dumps(summary["effective_scope"], ensure_ascii=False),
+            " (fallback)" if summary.get("fallback") else "",
+        )
+    if "processed_requests" in summary:
+        logger.info(
+            "Progreso final: %s %s/%s solicitudes (%s)",
+            render_progress_bar(summary.get("progress_percent", 0.0)),
+            f"{summary['processed_requests']:,}",
+            f"{summary.get('planned_requests', 0):,}",
+            summary.get("progress_kind", "desconocido"),
+        )
     logger.info("Descargados: %s", f"{summary['tiles_completed']:,}")
     logger.info("Ausentes: %s", f"{summary['tiles_absent']:,}")
     logger.info("Corruptos: %s", f"{summary['tiles_corrupt']:,}")
@@ -2481,6 +2829,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger=logger,
     )
     resume_command = build_resume_command(args)
+    plan: DownloadPlan | None = None
 
     try:
         logger.info("Salida: %s", output_root)
@@ -2532,9 +2881,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "smoke_test", {"passed": True, "at": utc_now(), "tiles": 9}
             )
         if args.smoke_test_only:
+            smoke_progress = calculate_progress(
+                {"complete": 9},
+                estimated_requests=9,
+                successful_final=True,
+            )
+            smoke_scope = scope_payload(
+                ["overworld"],
+                ["base"],
+                [0],
+            )
             summary = {
                 "status": "smoke_test_complete",
                 "reason": None,
+                **{
+                    key: smoke_progress[key]
+                    for key in (
+                        "planned_requests",
+                        "processed_requests",
+                        "known_requests",
+                        "progress_percent",
+                        "progress_kind",
+                    )
+                },
+                "requested_scope": smoke_scope,
+                "effective_scope": smoke_scope,
+                "fallback": False,
                 "tiles_completed": database.counts().get("complete", 0),
                 "tiles_absent": database.counts().get("absent", 0),
                 "tiles_corrupt": database.counts().get("corrupt", 0),
@@ -2653,9 +3025,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             stop_event=stop_event,
             logger=logger,
             resume_command=resume_command,
+            requested_scope=scope_payload(
+                args.dimensions,
+                args.layers,
+                args.lods,
+            ),
         )
         print_final_summary(summary, logger)
-        if summary["status"] == "complete":
+        if summary["status"] in ("complete", "fallback_complete"):
             return 0
         if summary["status"] == "stopped":
             return 130
@@ -2665,11 +3042,52 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
     except Exception as exc:
         logger.exception("No se pudo continuar: %s", exc)
-        counts = database.counts_for(args.dimensions, args.layers)
+        effective_dimensions = (
+            plan.dimensions if plan is not None else args.dimensions
+        )
+        effective_layers = plan.layers if plan is not None else args.layers
+        effective_lods = (
+            plan.lods
+            if plan is not None and plan.lods
+            else args.lods
+        )
+        counts = database.counts_for(
+            effective_dimensions,
+            effective_layers,
+        )
+        error_progress = calculate_progress(
+            database.work_counts_for(
+                effective_dimensions,
+                effective_layers,
+                min(effective_lods),
+            ),
+            estimated_requests=plan.requests if plan is not None else 0,
+        )
         summary = {
             "updated_at": utc_now(),
             "status": "error",
             "reason": f"{type(exc).__name__}: {exc}",
+            **{
+                key: error_progress[key]
+                for key in (
+                    "planned_requests",
+                    "processed_requests",
+                    "known_requests",
+                    "progress_percent",
+                    "progress_kind",
+                )
+            },
+            "requested_scope": scope_payload(
+                args.dimensions,
+                args.layers,
+                args.lods,
+            ),
+            "effective_scope": scope_payload(
+                effective_dimensions,
+                effective_layers,
+                effective_lods,
+            ),
+            "fallback": bool(plan is not None and plan.fallback),
             "tiles_completed": counts.get("complete", 0),
             "tiles_pending": counts.get("pending", 0)
             + counts.get("downloading", 0),
@@ -2679,10 +3097,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             + counts.get("error", 0)
             + counts.get("protection", 0),
             "space_used_bytes": database.total_downloaded_bytes_for(
-                args.dimensions, args.layers
+                effective_dimensions, effective_layers
             ),
             "http_errors": database.http_errors_for(
-                args.dimensions, args.layers
+                effective_dimensions, effective_layers
             ),
             "resume_command": resume_command,
             "output": str(output_root),

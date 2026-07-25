@@ -715,6 +715,276 @@ canvas:focus-visible {
   line-height: 1.45;
 }
 
+.download-progress-card {
+  margin-top: 10px;
+  overflow: hidden;
+  padding: 12px;
+  border: 1px solid rgba(98, 168, 255, 0.22);
+  border-radius: 15px;
+  background:
+    linear-gradient(145deg, rgba(98, 168, 255, 0.085), transparent 54%),
+    rgba(3, 12, 22, 0.56);
+}
+
+.download-progress-heading {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+}
+
+.download-progress-heading > svg {
+  color: var(--blue);
+}
+
+.download-progress-heading > div {
+  min-width: 0;
+}
+
+.download-progress-heading span,
+.download-progress-heading strong {
+  display: block;
+}
+
+.download-progress-heading > div > span {
+  color: var(--blue);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+  letter-spacing: 0.1em;
+}
+
+.download-progress-heading > div > strong {
+  margin-top: 3px;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-status {
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.035em;
+  white-space: nowrap;
+}
+
+.download-status.running {
+  border-color: rgba(98, 168, 255, 0.28);
+  color: #b9d8ff;
+  background: rgba(98, 168, 255, 0.1);
+}
+
+.download-status.complete {
+  border-color: rgba(38, 217, 199, 0.32);
+  color: #a5fff5;
+  background: rgba(38, 217, 199, 0.1);
+}
+
+.download-status.warning {
+  border-color: rgba(255, 189, 74, 0.32);
+  color: #ffda8e;
+  background: rgba(255, 189, 74, 0.1);
+}
+
+.download-status.error {
+  border-color: rgba(255, 102, 95, 0.34);
+  color: #ffb2ae;
+  background: rgba(255, 102, 95, 0.1);
+}
+
+.download-progress-summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.download-progress-summary strong {
+  color: var(--text);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 19px;
+  letter-spacing: -0.045em;
+}
+
+.download-progress-summary span {
+  overflow: hidden;
+  color: var(--quiet);
+  font-size: 8px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-progress-track {
+  position: relative;
+  height: 7px;
+  margin-top: 7px;
+  overflow: hidden;
+  border: 1px solid rgba(98, 168, 255, 0.14);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.download-progress-track > span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--blue), var(--mint));
+  box-shadow: 0 0 14px rgba(38, 217, 199, 0.45);
+  transition: width 360ms ease;
+}
+
+.download-progress-track.is-indeterminate > span {
+  width: 36%;
+  min-width: 0;
+  animation: download-progress-scan 1.35s ease-in-out infinite;
+}
+
+@keyframes download-progress-scan {
+  from {
+    transform: translateX(-105%);
+  }
+
+  to {
+    transform: translateX(285%);
+  }
+}
+
+.download-progress-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 11px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--line);
+}
+
+.download-progress-metrics > div {
+  min-width: 0;
+  padding: 8px 9px;
+  background: rgba(7, 17, 31, 0.94);
+}
+
+.download-progress-metrics span,
+.download-progress-metrics strong {
+  display: block;
+}
+
+.download-progress-metrics span {
+  color: var(--quiet);
+  font-size: 8px;
+}
+
+.download-progress-metrics strong {
+  margin-top: 3px;
+  overflow: hidden;
+  color: #dceafa;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-progress-updated {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 9px;
+  color: var(--quiet);
+  font-size: 8px;
+}
+
+.download-progress-updated .source-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  background: var(--mint);
+  box-shadow: 0 0 9px rgba(38, 217, 199, 0.55);
+}
+
+.download-progress-updated time {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--font-geist-mono), monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-progress-updated small {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.download-progress-updated.is-stale {
+  color: var(--amber);
+}
+
+.download-progress-updated.is-stale .source-dot {
+  background: var(--amber);
+  box-shadow: 0 0 9px rgba(255, 189, 74, 0.5);
+}
+
+.download-progress-errors {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 7px;
+  margin-top: 9px;
+  padding: 8px;
+  border: 1px solid rgba(255, 102, 95, 0.23);
+  border-radius: 10px;
+  color: #ffc0bc;
+  background: rgba(255, 102, 95, 0.07);
+}
+
+.download-progress-errors svg {
+  margin-top: 1px;
+}
+
+.download-progress-errors p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.download-progress-errors p + p {
+  margin-top: 3px;
+}
+
+.download-progress-card.has-message p {
+  margin: 9px 0 0 27px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.download-progress-card.has-error {
+  border-color: rgba(255, 189, 74, 0.25);
+}
+
+.download-progress-card.has-error .download-progress-heading > svg {
+  color: var(--amber);
+}
+
+.metric-caption {
+  margin: 13px 0 -4px;
+  color: var(--quiet);
+  font-size: 8px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

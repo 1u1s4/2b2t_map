@@ -1,6 +1,8 @@
 "use client";
 
 import {
+  Activity,
+  AlertTriangle,
   Archive,
   AreaChart,
   Check,
@@ -39,6 +41,11 @@ import {
   type TileKey,
   type TileLayer,
 } from "./lib/local-tile-source";
+import {
+  readDownloadProgress,
+  type DownloadProgressReadResult,
+  type DownloadProgressSnapshot,
+} from "./lib/download-progress";
 import {
   type ChangeEvent,
   type FormEvent,
@@ -103,6 +110,12 @@ type TileStats = {
   local: number;
   remote: number;
   missing: number;
+};
+
+type DownloadProgressState = {
+  source: LocalTileSource;
+  result: DownloadProgressReadResult;
+  checkedAt: number;
 };
 
 type ActivePointer = {
@@ -346,6 +359,8 @@ export function MapViewer() {
     remote: 0,
     missing: 0,
   });
+  const [downloadProgress, setDownloadProgress] =
+    useState<DownloadProgressState | null>(null);
   const [renderVersion, setRenderVersion] = useState(0);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [selectedHighlightId, setSelectedHighlightId] = useState<string | null>(
@@ -460,6 +475,39 @@ export function MapViewer() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!localSource) return;
+
+    let cancelled = false;
+    let reading = false;
+    const refresh = async () => {
+      if (reading) return;
+      reading = true;
+      try {
+        const result = await readDownloadProgress(localSource.directory);
+        if (!cancelled) {
+          setDownloadProgress({
+            source: localSource,
+            result,
+            checkedAt: Date.now(),
+          });
+        }
+      } finally {
+        reading = false;
+      }
+    };
+
+    void refresh();
+    const interval = window.setInterval(() => {
+      void refresh();
+    }, 5_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [localSource]);
 
   const ensureTile = useCallback(
     (key: TileKey) => {
@@ -1576,6 +1624,23 @@ export function MapViewer() {
                 </span>
                 <span className={`switch ${onlineFallback ? "on" : ""}`} />
               </button>
+              {localSource && (
+                <DownloadProgressCard
+                  result={
+                    downloadProgress?.source === localSource
+                      ? downloadProgress.result
+                      : null
+                  }
+                  checkedAt={
+                    downloadProgress?.source === localSource
+                      ? downloadProgress.checkedAt
+                      : null
+                  }
+                />
+              )}
+              <p className="metric-caption">
+                Tiles consultados por el mapa en esta sesión
+              </p>
               <div className="stats-grid">
                 <Metric label="Local" value={tileStats.local} tone="mint" />
                 <Metric label="Online" value={tileStats.remote} tone="blue" />
@@ -1986,6 +2051,285 @@ function DockButton({
       <span>{label}</span>
       {badge ? <i>{badge}</i> : null}
     </button>
+  );
+}
+
+const DOWNLOAD_STATUS_META: Record<
+  string,
+  { readonly label: string; readonly tone: string }
+> = {
+  discovering: { label: "Analizando", tone: "running" },
+  running: { label: "Descargando", tone: "running" },
+  complete: { label: "Completa", tone: "complete" },
+  fallback_complete: { label: "Prioridad completa", tone: "warning" },
+  incomplete: { label: "Incompleta", tone: "warning" },
+  stopped: { label: "Pausada", tone: "warning" },
+  error: { label: "Con errores", tone: "error" },
+  smoke_test_complete: { label: "Prueba completa", tone: "complete" },
+  unknown: { label: "Estado desconocido", tone: "neutral" },
+};
+
+function formatProgressPercent(value: number) {
+  return new Intl.NumberFormat("es-GT", {
+    maximumFractionDigits: value < 10 ? 1 : 0,
+  }).format(value);
+}
+
+function formatBytes(value: number | null) {
+  if (value === null) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let unitIndex = 0;
+  let normalized = value;
+  while (normalized >= 1024 && unitIndex < units.length - 1) {
+    normalized /= 1024;
+    unitIndex += 1;
+  }
+  return `${new Intl.NumberFormat("es-GT", {
+    maximumFractionDigits: normalized < 10 && unitIndex > 0 ? 2 : 1,
+  }).format(normalized)} ${units[unitIndex]}`;
+}
+
+function formatDuration(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return "—";
+  const seconds = Math.max(0, Math.round(value));
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours < 48) {
+    return remainingMinutes ? `${hours} h ${remainingMinutes} min` : `${hours} h`;
+  }
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  return remainingHours ? `${days} d ${remainingHours} h` : `${days} d`;
+}
+
+function formatUpdatedAt(progress: DownloadProgressSnapshot) {
+  if (progress.updatedAtTimestamp === null) return "Sin fecha válida";
+  return new Intl.DateTimeFormat("es-GT", {
+    dateStyle: "short",
+    timeStyle: "medium",
+  }).format(progress.updatedAtTimestamp);
+}
+
+function DownloadProgressCard({
+  checkedAt,
+  result,
+}: {
+  checkedAt: number | null;
+  result: DownloadProgressReadResult | null;
+}) {
+  if (result === null) {
+    return (
+      <section
+        className="download-progress-card is-loading"
+        aria-label="Progreso de la descarga"
+        aria-busy="true"
+      >
+        <div className="download-progress-heading">
+          <Activity size={18} aria-hidden="true" />
+          <div>
+            <span>DESCARGA COMPLETA</span>
+            <strong>Leyendo progress.json…</strong>
+          </div>
+        </div>
+        <div className="download-progress-track is-indeterminate" aria-hidden="true">
+          <span />
+        </div>
+      </section>
+    );
+  }
+
+  if (result.kind !== "ready") {
+    return (
+      <section
+        className={`download-progress-card has-message ${result.kind === "missing" ? "" : "has-error"}`}
+        aria-label="Progreso de la descarga"
+        role="status"
+      >
+        <div className="download-progress-heading">
+          {result.kind === "missing" ? (
+            <Activity size={18} aria-hidden="true" />
+          ) : (
+            <AlertTriangle size={18} aria-hidden="true" />
+          )}
+          <div>
+            <span>DESCARGA COMPLETA</span>
+            <strong>
+              {result.kind === "missing"
+                ? "Esperando al descargador"
+                : "Progreso no disponible"}
+            </strong>
+          </div>
+        </div>
+        <p>{result.message}</p>
+      </section>
+    );
+  }
+
+  const progress = result.progress;
+  const statusMeta =
+    DOWNLOAD_STATUS_META[progress.status] ?? DOWNLOAD_STATUS_META.unknown;
+  const percent = progress.progressPercent;
+  const isIndeterminate = percent === null;
+  const percentText =
+    percent === null ? "Calculando…" : `${formatProgressPercent(percent)} %`;
+  const estimateLabel =
+    progress.progressKind === "dynamic"
+      ? "dinámico"
+      : progress.progressKind === "estimated" ||
+          progress.progressPercentSource === "derived"
+        ? "estimado"
+        : null;
+  const isStale =
+    progress.status === "running" &&
+    progress.updatedAtTimestamp !== null &&
+    checkedAt !== null &&
+    checkedAt - progress.updatedAtTimestamp > 20_000;
+  const httpErrors = progress.httpErrors.filter(
+    (item) => item.count > 0 && item.code !== "404",
+  );
+  const hasProblems =
+    Boolean(progress.reason) ||
+    progress.tilesCorrupt > 0 ||
+    progress.tilesFailed > 0 ||
+    httpErrors.length > 0;
+  const processedText =
+    progress.plannedRequests === null
+      ? `${progress.processedRequests.toLocaleString("es-GT")} solicitudes resueltas`
+      : `${progress.processedRequests.toLocaleString("es-GT")} de ${progress.plannedRequests.toLocaleString("es-GT")} solicitudes`;
+  const speedParts: string[] = [];
+  if (progress.tilesPerSecond !== null) {
+    speedParts.push(
+      `${progress.tilesPerSecond.toLocaleString("es-GT", {
+        maximumFractionDigits: 2,
+      })} tiles/s`,
+    );
+  } else if (progress.effectiveRequestsPerSecond !== null) {
+    speedParts.push(
+      `${progress.effectiveRequestsPerSecond.toLocaleString("es-GT", {
+        maximumFractionDigits: 2,
+      })} req/s`,
+    );
+  }
+  if (progress.megabytesPerSecond !== null) {
+    speedParts.push(
+      `${progress.megabytesPerSecond.toLocaleString("es-GT", {
+        maximumFractionDigits: 2,
+      })} MB/s`,
+    );
+  }
+  const speed = speedParts.join(" · ") || "—";
+
+  return (
+    <section
+      className="download-progress-card"
+      aria-labelledby="download-progress-title"
+    >
+      <div className="download-progress-heading">
+        <Activity size={18} aria-hidden="true" />
+        <div>
+          <span>DESCARGA COMPLETA</span>
+          <strong id="download-progress-title">Progreso del archivo</strong>
+        </div>
+        <span
+          className={`download-status ${statusMeta.tone}`}
+          role="status"
+          aria-live="polite"
+        >
+          {statusMeta.label}
+        </span>
+      </div>
+
+      <div className="download-progress-summary">
+        <strong>{percentText}</strong>
+        <span>
+          {processedText}
+          {estimateLabel ? ` · ${estimateLabel}` : ""}
+        </span>
+      </div>
+      <div
+        className={`download-progress-track ${isIndeterminate ? "is-indeterminate" : ""}`}
+        role="progressbar"
+        aria-label="Avance de la descarga completa"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent ?? undefined}
+        aria-valuetext={percentText}
+      >
+        <span style={percent === null ? undefined : { width: `${percent}%` }} />
+      </div>
+
+      <div className="download-progress-metrics">
+        <ProgressMetric
+          label="Completos"
+          value={progress.tilesCompleted.toLocaleString("es-GT")}
+        />
+        <ProgressMetric
+          label="Pendientes"
+          value={progress.tilesPending.toLocaleString("es-GT")}
+        />
+        <ProgressMetric label="Velocidad" value={speed} />
+        <ProgressMetric
+          label="Datos"
+          value={formatBytes(progress.downloadedBytes)}
+        />
+        <ProgressMetric label="ETA" value={formatDuration(progress.etaSeconds)} />
+        <ProgressMetric
+          label="Ausentes"
+          value={progress.tilesAbsent.toLocaleString("es-GT")}
+        />
+      </div>
+
+      <div className={`download-progress-updated ${isStale ? "is-stale" : ""}`}>
+        <span className="source-dot" />
+        <span>{isStale ? "Actualización atrasada" : "Actualizado"}</span>
+        <time dateTime={progress.updatedAt ?? undefined}>
+          {formatUpdatedAt(progress)}
+        </time>
+        <small>Se revisa cada 5 s</small>
+      </div>
+
+      {hasProblems && (
+        <div
+          className="download-progress-errors"
+          aria-label="Errores reportados"
+          role="status"
+        >
+          <AlertTriangle size={15} aria-hidden="true" />
+          <div>
+            {progress.reason && <p>{progress.reason}</p>}
+            {(progress.tilesCorrupt > 0 || progress.tilesFailed > 0) && (
+              <p>
+                Corruptos: {progress.tilesCorrupt.toLocaleString("es-GT")} ·
+                Fallidos: {progress.tilesFailed.toLocaleString("es-GT")}
+              </p>
+            )}
+            {httpErrors.length > 0 && (
+              <p>
+                HTTP{" "}
+                {httpErrors
+                  .map(
+                    ({ code, count }) =>
+                      `${code} × ${count.toLocaleString("es-GT")}`,
+                  )
+                  .join(" · ")}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ProgressMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <span>{label}</span>
+      <strong title={value}>{value}</strong>
+    </div>
   );
 }
 

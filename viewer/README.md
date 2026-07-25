@@ -71,6 +71,21 @@ La File System Access API usada para esto está disponible principalmente en
 Chrome y otros navegadores Chromium. Firefox y Safari pueden usar los tiles
 online, pero no el selector local compatible.
 
+### Progreso de la descarga
+
+Al conectar `2b2t_tiles`, el panel **Archivo** busca `progress.json` en esa
+misma carpeta y vuelve a leerlo cada cinco segundos. La tarjeta de progreso
+muestra estado, porcentaje, solicitudes resueltas, tiles completos y
+pendientes, velocidad, datos descargados, ETA, última actualización y errores
+reportados. La lectura es independiente del canvas: un archivo ausente,
+incompleto o temporalmente ilegible no bloquea la navegación del mapa.
+
+Las versiones nuevas del descargador publican `planned_requests`,
+`processed_requests` y `progress_percent`. Si se abre un archivo creado por una
+versión anterior, el visor deriva un porcentaje aproximado a partir de los
+contadores disponibles y lo marca como estimado. El archivo se solicita de
+nuevo en cada sondeo porque el descargador lo reemplaza atómicamente.
+
 ## Fuente local y respaldo online
 
 Con un archivo conectado, el orden es:

@@ -264,19 +264,28 @@ recorrer la cola completa. La tabla detallada aparece en consola y
 
 ### 3. Descarga completa
 
-Este es el comando actual para descargar solo el Overworld, aceptado
-literalmente por la CLI:
+Para descargar las tres dimensiones, las tres capas y todos los LOD:
 
 ```bash
 python download_all_2b2t.py \
   --all \
-  --dimensions overworld \
+  --dimensions overworld,nether,end \
   --layers base,overlay,newchunks \
   --lods all \
   --out ./2b2t_tiles \
   --workers 4 \
   --requests-per-second 2 \
-  --resume
+  --discovery-samples 25 \
+  --resume \
+  --no-fallback
+```
+
+En este equipo, `run_full_download_luisa.sh` monta el contenedor APFS alojado
+en la unidad `LuisA`, evita el desperdicio de ExFAT, mantiene el equipo
+despierto y ejecuta exactamente ese alcance:
+
+```bash
+./run_full_download_luisa.sh
 ```
 
 Valores predeterminados relevantes:
@@ -285,7 +294,7 @@ Valores predeterminados relevantes:
 - límite global de 2 solicitudes por segundo entre todos los workers;
 - timeout de 30 segundos;
 - 5 intentos por petición;
-- 3 muestras de descubrimiento por grupo;
+- 25 muestras de descubrimiento por grupo;
 - límite de 16 MiB por respuesta.
 
 Opciones útiles:
@@ -579,11 +588,12 @@ Las tablas adicionales son:
 Antes de la descarga completa, el programa:
 
 1. estima candidatos, presencia y tamaño por dimensión, capa y LOD;
-2. aplica un margen conservador de incertidumbre del 25 % a las muestras;
-3. descuenta datos completos que ya existen;
-4. calcula el tiempo mínimo según `--requests-per-second`;
-5. consulta el espacio libre del volumen;
-6. exige además un 20 % de espacio libre sobre la estimación conservadora.
+2. redondea cada tile a la unidad de asignación física del volumen de destino;
+3. aplica un margen conservador de incertidumbre del 25 % a las muestras;
+4. descuenta datos completos que ya existen;
+5. calcula el tiempo mínimo según `--requests-per-second`;
+6. consulta el espacio libre del volumen;
+7. exige además un 20 % de espacio libre sobre la estimación conservadora.
 
 Si la selección completa no cabe, no borra nada. Informa cuánto falta y, salvo
 que se use `--no-fallback`, intenta un plan reducido:
@@ -600,57 +610,39 @@ el espacio libre cae por debajo del piso seguro, que es el mayor entre 512 MiB
 y el 20 % del plan conservador. `estimate.json` conserva tanto el plan reducido
 como el comando para continuar la selección original más adelante.
 
-Como referencia, el preflight medido en la ejecución actual estimó
-aproximadamente 1,04 TiB conservadores para todos los LOD de `base/overworld`.
-Con el espacio disponible seleccionó el fallback contiguo LOD 10..3, estimado
-en unos 9,89 GiB, y exigió 11,87 GiB al sumar el margen libre del 20 %. Estas
-cifras no son constantes: cambian con las muestras del origen, los tiles ya
-descargados y el espacio libre del volumen, por lo que siempre debe prevalecer
-el `estimate.json` de cada ejecución.
+Las cifras cambian con las muestras del origen, los tiles ya descargados, la
+unidad de asignación y el espacio libre. Siempre debe prevalecer el
+`estimate.json` de cada ejecución. `--no-fallback` obliga a que un encargo de
+mapa completo se detenga si no cabe, en vez de declarar terminado un subconjunto.
 
 ## Estado actual de la descarga y espacio
 
-Esta sección es una instantánea tomada el **24 de julio de 2026 a las 02:07
-UTC−6**. Para el estado vivo, consulta siempre `2b2t_tiles/progress.json`,
-`2b2t_tiles/download.log` y `df -h .`.
+Instantánea del **24 de julio de 2026 a las 18:55 UTC−6**:
 
-En esa instantánea estaba activo el PID `36013`, con cuatro workers, un límite
-global de 2 solicitudes/s y el siguiente alcance efectivo:
+- `LuisA` está montada y tiene aproximadamente 1,3 TiB libres;
+- un sparsebundle alojado en `LuisA` está montado como `/Volumes/2b2t Tiles`;
+- el contenedor usa APFS con bloques de 4 KiB, frente a los 128 KiB de ExFAT;
+- se copiaron y verificaron 89 199 tiles: 89 199 válidos, 0 corruptos;
+- la sesión detached `obsidian_atlas_full` está activa;
+- el alcance solicitado es `overworld,nether,end × base,overlay,newchunks ×
+  LOD 0..10`;
+- `--no-fallback` impide sustituir silenciosamente el mapa completo por un plan
+  parcial;
+- el preflight de 99 grupos está en curso y publica su propia barra.
 
-- solo dimensión `overworld`;
-- solo capa `base`;
-- fallback contiguo LOD 10..3;
-- 2 285 tiles seleccionados completos, 230 ramas ausentes por 404 y cuatro
-  peticiones activas;
-- aproximadamente 3 % de las 83 836 solicitudes estimadas resueltas;
-- 1,98 tiles/s, unos 0,19 MiB/s y una ETA cercana a 11 h 26 min;
-- ningún tile corrupto, 403, 429 o error 5xx observado.
+Los datos viven en:
 
-El nombre `--lods all` del proceso original describe la selección solicitada,
-no lo que cabe. El preflight redujo automáticamente el trabajo a LOD 10..3.
-Los tiles LOD 0..2 que ya aparecen en SQLite son muestras o descargas de región
-y no significan que esos niveles estén cubiertos.
-
-En almacenamiento, el directorio ocupaba unos 259 MiB y el volumen tenía
-18,93 GiB libres, con 90 % de capacidad utilizada. El plan reducido estima
-9,89 GiB conservadores y dejaría alrededor de 9,26 GiB libres si ningún otro
-proceso consume espacio. El espacio había caído unos 2,49 GiB desde el
-preflight, mucho más que el crecimiento de esta descarga, por lo que conviene
-vigilar el volumen. El programa se detiene de forma recuperable si cae por
-debajo de su piso seguro, cercano a 1,98 GiB para este plan.
-
-Esto **no descarga todo el Overworld a máxima resolución**: todos los LOD de
-`base/overworld` se estimaron en aproximadamente 1,04 TiB, antes de sumar
-`overlay` y `newchunks`. No había un volumen externo montado. Para completar
-esa selección hará falta trasladar o reanudar el archivo en almacenamiento con
-capacidad suficiente; un volumen de 2 TB deja un margen práctico.
+```text
+/Volumes/2b2t Tiles/2b2t_tiles
+```
 
 ### Comprobar antes de reanudar
 
 No ejecutes dos descargadores sobre el mismo `tiles.sqlite3`. Primero comprueba
-si ya existe un proceso:
+la sesión y el proceso:
 
 ```bash
+screen -ls
 pgrep -af 'download_all_2b2t.py'
 ```
 
@@ -658,24 +650,25 @@ Si aparece un PID activo, **no ejecutes el comando de reanudación en paralelo**
 Observa su avance con:
 
 ```bash
-sed -n '1,200p' ./2b2t_tiles/progress.json
-tail -f ./2b2t_tiles/download.log
-df -h .
+screen -r obsidian_atlas_full
+tail -f '/Volumes/2b2t Tiles/2b2t_tiles/download.log'
+sed -n '1,220p' '/Volumes/2b2t Tiles/2b2t_tiles/progress.json'
+df -h '/Volumes/2b2t Tiles' /Volumes/LuisA
 ```
 
-Cuando no haya ningún descargador activo, el comando exacto guardado por la
-sesión auditada es:
+Para salir de `screen` sin detener la descarga, pulsa `Ctrl+A` y después `D`.
+Cuando no haya ningún descargador activo, el lanzador monta el contenedor y
+reanuda exactamente el alcance completo:
 
 ```bash
 cd /Users/luisalvarado/Documents/GitHub/2b2t_map
-/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 /Users/luisalvarado/Documents/GitHub/2b2t_map/download_all_2b2t.py --all --dimensions overworld --layers base --lods 10,9,8,7,6,5,4,3,2,1,0 --out /Users/luisalvarado/Documents/GitHub/2b2t_map/2b2t_tiles --workers 4 --requests-per-second 2.0 --timeout 30.0 --retries 5 --discovery-samples 25 --max-tile-bytes 16777216 --resume --skip-smoke-test
+./run_full_download_luisa.sh
 ```
 
 `--resume` devuelve a `pending` las filas interrumpidas y reutiliza los WebP
-válidos. El comando vuelve a ejecutar el preflight; con el espacio auditado
-volverá previsiblemente al fallback LOD 10..3. Para reanudar una copia movida a
-otro volumen, cambia únicamente `--out` por la nueva carpeta que contenga
-`tiles.sqlite3` y la estructura de tiles.
+válidos. No desconectes `LuisA` mientras el proceso esté activo. Tras una parada
+limpia, desmonta primero el contenedor con
+`hdiutil detach '/Volumes/2b2t Tiles'` y después expulsa la unidad física.
 
 ## Reanudación, integridad y progreso
 
@@ -687,8 +680,10 @@ otro volumen, cambia únicamente `--out` por la nueva carpeta que contenga
   sufijo `.corrupt.<timestamp>`.
 - SQLite usa WAL, `synchronous=FULL` y un timeout de bloqueo.
 - `progress.json` se reemplaza atómicamente.
-- La consola y `download.log` muestran completados, pendientes, tiles/s, MB/s,
-  bytes descargados, ETA y errores por código HTTP.
+- La consola y `download.log` muestran una barra ASCII, solicitudes,
+  completados, pendientes, tiles/s, MB/s, bytes, ETA y errores HTTP.
+- El panel **Archivo** de Obsidian Atlas lee `progress.json` cada cinco segundos
+  y muestra la misma barra con estado, alcance y métricas.
 
 Al pulsar Ctrl+C una vez, se solicita una parada limpia: no se programan más
 tiles, los workers activos terminan o devuelven su trabajo a `pending`, se
