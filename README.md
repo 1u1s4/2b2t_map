@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./viewer/public/og.png" alt="Obsidian Atlas — explorador del Overworld de 2b2t" width="100%">
+</p>
+
 # Obsidian Atlas y descargador offline de 2b2t.place
 
 Este proyecto descarga directamente los tiles WebP públicos usados por
