@@ -135,6 +135,23 @@ class TransitionJournal:
     launch_started_at: float | None = None
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class StorageStopJournal:
+    phase: str
+    identity: ProcessIdentity
+    process_percent: float
+    target_percent: float
+    armed_at: float
+    progress_written_after: float
+    committed_at: float | None = None
+    signal_sent_at: float | None = None
+    stopped_at: float | None = None
+
+
+class StorageStopTerminal(RuntimeError):
+    """A durable storage stop must never enter restart/recovery logic."""
+
+
 FULL_MAP_SCOPE = PlanScope(
     dimensions=FULL_MAP_DIMENSIONS,
     layers=FULL_MAP_LAYERS,
@@ -145,6 +162,8 @@ FULL_MAP_SCOPE = PlanScope(
 def configure_logging(output_dir: Path) -> logging.Logger:
     logger = logging.getLogger("obsidian_atlas_supervisor")
     logger.setLevel(logging.INFO)
+    for handler in logger.handlers:
+        handler.close()
     logger.handlers.clear()
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)s %(message)s"
@@ -729,6 +748,57 @@ def decide_restart_storage(
     )
 
 
+def decide_live_storage_stop(
+    observation: MarginObservation,
+    progress: ProgressObservation,
+    *,
+    process_percent: float,
+    maximum_heartbeat_age: float,
+    progress_is_post_launch: bool,
+) -> RestartDecision:
+    """Authorize a clean stop only when the live reserve truly no longer fits."""
+
+    if not observation.valid:
+        return RestartDecision("wait", observation.reason)
+    if (
+        observation.configured_percent is None
+        or not math.isclose(
+            observation.configured_percent,
+            process_percent,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        return RestartDecision(
+            "stop",
+            "el porcentaje del PID no coincide con estimate.json",
+        )
+    if margin_fits_percent(observation, process_percent):
+        return RestartDecision(
+            "complete",
+            f"la reserva vigente de {process_percent:g} % todavía cabe",
+        )
+    if not progress.valid or progress.status != "running":
+        return RestartDecision(
+            "wait",
+            f"estado de progreso no es running: {progress.status or 'inválido'}",
+        )
+    if not progress_is_post_launch:
+        return RestartDecision(
+            "wait",
+            "progress.json todavía es anterior al PID adoptado",
+        )
+    if (
+        progress.age_seconds is None
+        or progress.age_seconds > maximum_heartbeat_age
+    ):
+        return RestartDecision("wait", "el heartbeat no está fresco")
+    return RestartDecision(
+        "ready",
+        f"la reserva vigente de {process_percent:g} % ya no cabe",
+    )
+
+
 def transition_launch_percent(
     stationary: MarginObservation,
     *,
@@ -960,6 +1030,215 @@ def read_transition_journal(path: Path) -> TransitionJournal | None:
         )
         or not (
             prepared_fields_are_valid
+            or stopped_fields_are_valid
+        )
+    ):
+        return None
+    return journal
+
+
+def write_storage_stop_journal(
+    path: Path,
+    journal: StorageStopJournal,
+) -> bool:
+    """Atomically persist the terminal latch and fsync its directory."""
+
+    payload = dataclasses.asdict(journal)
+    payload["version"] = 1
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def remove_storage_stop_journal(path: Path) -> bool:
+    """Durably cancel only an armed latch, before it is committed."""
+
+    if not path.exists():
+        return True
+    journal = read_storage_stop_journal(path)
+    if journal is None or journal.phase != "armed":
+        return False
+    return remove_transition_journal(path)
+
+
+def read_storage_stop_journal(path: Path) -> StorageStopJournal | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        identity_payload = payload["identity"]
+        raw_required_numbers = (
+            identity_payload["headroom_percent"],
+            payload["process_percent"],
+            payload["target_percent"],
+            payload["armed_at"],
+            payload["progress_written_after"],
+        )
+        raw_optional_numbers = (
+            payload.get("committed_at"),
+            payload.get("signal_sent_at"),
+            payload.get("stopped_at"),
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            for value in raw_required_numbers
+        ) or any(
+            value is not None
+            and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+            )
+            for value in raw_optional_numbers
+        ):
+            return None
+        identity = ProcessIdentity(
+            pid=identity_payload["pid"],
+            started_at=identity_payload["started_at"],
+            arguments=identity_payload["arguments"],
+            headroom_percent=float(identity_payload["headroom_percent"]),
+        )
+        journal = StorageStopJournal(
+            phase=payload["phase"],
+            identity=identity,
+            process_percent=float(payload["process_percent"]),
+            target_percent=float(payload["target_percent"]),
+            armed_at=float(payload["armed_at"]),
+            progress_written_after=float(
+                payload["progress_written_after"]
+            ),
+            committed_at=(
+                None
+                if payload.get("committed_at") is None
+                else float(payload["committed_at"])
+            ),
+            signal_sent_at=(
+                None
+                if payload.get("signal_sent_at") is None
+                else float(payload["signal_sent_at"])
+            ),
+            stopped_at=(
+                None
+                if payload.get("stopped_at") is None
+                else float(payload["stopped_at"])
+            ),
+        )
+    except (
+        FileNotFoundError,
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    required_numbers = (
+        identity.headroom_percent,
+        journal.process_percent,
+        journal.target_percent,
+        journal.armed_at,
+        journal.progress_written_after,
+    )
+    optional_numbers = (
+        journal.committed_at,
+        journal.signal_sent_at,
+        journal.stopped_at,
+    )
+    armed_fields_are_valid = (
+        journal.phase == "armed"
+        and all(value is None for value in optional_numbers)
+    )
+    committed_fields_are_valid = (
+        journal.phase == "committed"
+        and journal.committed_at is not None
+        and journal.committed_at >= journal.armed_at
+        and journal.signal_sent_at is None
+        and journal.stopped_at is None
+    )
+    signal_fields_are_valid = (
+        journal.phase == "signal_sent"
+        and journal.committed_at is not None
+        and journal.signal_sent_at is not None
+        and journal.committed_at >= journal.armed_at
+        and journal.signal_sent_at >= journal.committed_at
+        and journal.stopped_at is None
+    )
+    stopped_fields_are_valid = (
+        journal.phase == "stopped_clean"
+        and journal.committed_at is not None
+        and journal.signal_sent_at is not None
+        and journal.stopped_at is not None
+        and journal.committed_at >= journal.armed_at
+        and journal.signal_sent_at >= journal.committed_at
+        and journal.stopped_at >= journal.signal_sent_at
+    )
+    process_percent_is_allowed = (
+        math.isclose(
+            journal.process_percent,
+            TEMPORARY_MIGRATION_HEADROOM_PERCENT,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or journal.process_percent >= REQUIRED_HEADROOM_PERCENT
+    )
+    if (
+        isinstance(payload.get("version"), bool)
+        or payload.get("version") != 1
+        or not isinstance(journal.phase, str)
+        or journal.phase
+        not in {"armed", "committed", "signal_sent", "stopped_clean"}
+        or isinstance(identity.pid, bool)
+        or not isinstance(identity.pid, int)
+        or identity.pid <= 0
+        or not isinstance(identity.started_at, str)
+        or not identity.started_at
+        or not isinstance(identity.arguments, str)
+        or not identity.arguments
+        or any(
+            not math.isfinite(value) or value < 0
+            for value in required_numbers
+        )
+        or any(
+            value is not None
+            and (not math.isfinite(value) or value < 0)
+            for value in optional_numbers
+        )
+        or journal.progress_written_after > journal.armed_at
+        or not math.isclose(
+            identity.headroom_percent,
+            journal.process_percent,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or not process_percent_is_allowed
+        or not math.isclose(
+            journal.target_percent,
+            REQUIRED_HEADROOM_PERCENT,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or not (
+            armed_fields_are_valid
+            or committed_fields_are_valid
+            or signal_fields_are_valid
             or stopped_fields_are_valid
         )
     ):
@@ -1460,6 +1739,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     database_path = output_dir / "tiles.sqlite3"
     margin_path = output_dir / "margin_upgrade.json"
     transition_path = output_dir / "margin_transition.json"
+    storage_stop_path = output_dir / "storage_stop.json"
     download_lock = output_dir / ".download.lock"
     logger = configure_logging(output_dir)
     try:
@@ -1481,6 +1761,10 @@ def run(argv: Sequence[str] | None = None) -> int:
     def launch_and_wait(
         headroom_percent: float,
     ) -> tuple[ProcessIdentity | None, str | None]:
+        if storage_stop_path.exists():
+            raise StorageStopTerminal(
+                "storage_stop.json existe; se prohíbe cualquier relanzamiento"
+            )
         environment = os.environ.copy()
         environment["SPACE_HEADROOM_PERCENT"] = f"{headroom_percent:g}"
         environment.pop("ALLOW_TEMPORARY_HEADROOM_MIGRATION", None)
@@ -1595,6 +1879,275 @@ def run(argv: Sequence[str] | None = None) -> int:
             "ni se retiró el bloqueo",
         )
 
+    def exact_live_identity(identity: ProcessIdentity) -> bool:
+        return (
+            find_download_processes(script_path, output_dir)
+            == [identity.pid]
+            and read_process_identity(
+                identity.pid,
+                script_path,
+                output_dir,
+            )
+            == identity
+            and owner_pid(download_lock) == identity.pid
+        )
+
+    def clear_stale_lock_if_storage_allows(expected_pid: int) -> bool:
+        if storage_stop_path.exists():
+            raise StorageStopTerminal(
+                "storage_stop.json existe; no se retirará ningún lock"
+            )
+        return clear_stale_download_lock(download_lock, expected_pid)
+
+    def commit_and_stop_for_storage(
+        expected_identity: ProcessIdentity,
+        *,
+        progress_written_after: float,
+        armed_journal: StorageStopJournal | None = None,
+    ) -> bool:
+        """Cancel an armed false alarm or commit one terminal clean stop."""
+
+        process_percent = expected_identity.headroom_percent
+        if armed_journal is None:
+            armed_journal = StorageStopJournal(
+                phase="armed",
+                identity=expected_identity,
+                process_percent=process_percent,
+                target_percent=float(
+                    args.target_space_headroom_percent
+                ),
+                armed_at=time.time(),
+                progress_written_after=progress_written_after,
+            )
+            if not write_storage_stop_journal(
+                storage_stop_path,
+                armed_journal,
+            ):
+                raise StorageStopTerminal(
+                    "no se pudo persistir el latch armado; no se envió señal"
+                )
+        elif (
+            armed_journal.phase != "armed"
+            or armed_journal.identity != expected_identity
+            or not math.isclose(
+                armed_journal.process_percent,
+                process_percent,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                armed_journal.progress_written_after,
+                progress_written_after,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise StorageStopTerminal(
+                "el latch armado no coincide con el proceso esperado"
+            )
+
+        def final_gate() -> tuple[MarginObservation, RestartDecision, bool]:
+            margin = read_margin_observation(
+                estimate_path=estimate_path,
+                database_path=database_path,
+                output_dir=output_dir,
+                backing_volume=backing_volume,
+                target_percent=args.target_space_headroom_percent,
+                expected_scope=FULL_MAP_SCOPE,
+            )
+            write_margin_observation(margin_path, margin)
+            progress = read_progress(progress_path)
+            try:
+                progress_is_post_launch = (
+                    progress_path.stat().st_mtime
+                    >= progress_written_after
+                )
+            except OSError:
+                progress_is_post_launch = False
+            decision = decide_live_storage_stop(
+                margin,
+                progress,
+                process_percent=process_percent,
+                maximum_heartbeat_age=args.maximum_heartbeat_age,
+                progress_is_post_launch=progress_is_post_launch,
+            )
+            return margin, decision, exact_live_identity(expected_identity)
+
+        _margin, decision, identity_is_safe = final_gate()
+        if decision.action == "complete" and identity_is_safe:
+            if not remove_storage_stop_journal(storage_stop_path):
+                raise StorageStopTerminal(
+                    "el espacio se recuperó, pero el latch armado no pudo "
+                    "cancelarse durablemente"
+                )
+            logger.info(
+                "El gate final confirmó que %.0f %% vuelve a caber; "
+                "storage_stop.json se canceló sin señal.",
+                process_percent,
+            )
+            return False
+        if decision.action != "ready" or not identity_is_safe:
+            raise StorageStopTerminal(
+                "el gate armado quedó incierto sin enviar señal: "
+                + (
+                    "cambió la identidad o el bloqueo"
+                    if not identity_is_safe
+                    else decision.reason
+                )
+            )
+
+        committed_at = time.time()
+        committed = dataclasses.replace(
+            armed_journal,
+            phase="committed",
+            committed_at=committed_at,
+        )
+        if not write_storage_stop_journal(storage_stop_path, committed):
+            raise StorageStopTerminal(
+                "no se pudo comprometer durablemente el freno; "
+                "no se envió señal"
+            )
+
+        _margin, committed_decision, committed_identity_is_safe = final_gate()
+        if (
+            committed_decision.action != "ready"
+            or not committed_identity_is_safe
+        ):
+            raise StorageStopTerminal(
+                "el gate cambió después del commit; el latch queda terminal "
+                "sin señal: "
+                + (
+                    "cambió la identidad o el bloqueo"
+                    if not committed_identity_is_safe
+                    else committed_decision.reason
+                )
+            )
+
+        signal_sent_at = time.time()
+        try:
+            os.kill(expected_identity.pid, signal.SIGINT)
+        except (ProcessLookupError, PermissionError) as exc:
+            raise StorageStopTerminal(
+                f"el latch quedó comprometido y SIGINT no pudo enviarse: {exc}"
+            ) from exc
+
+        signalled = dataclasses.replace(
+            committed,
+            phase="signal_sent",
+            signal_sent_at=signal_sent_at,
+        )
+        if not write_storage_stop_journal(storage_stop_path, signalled):
+            logger.error(
+                "SIGINT fue enviado, pero el latch durable permanece en "
+                "committed; una recuperación no volverá a señalizar."
+            )
+        logger.critical(
+            "Se envió como máximo un SIGINT porque la reserva vigente de "
+            "%.0f %% dejó de caber.",
+            process_percent,
+        )
+        stationary, stop_error = wait_for_clean_planned_stop(
+            expected_identity,
+            signalled_at=signal_sent_at,
+        )
+        if stationary is None:
+            raise StorageStopTerminal(
+                "el freno comprometido no confirmó una parada limpia: "
+                f"{stop_error}"
+            )
+
+        stopped = dataclasses.replace(
+            signalled,
+            phase="stopped_clean",
+            stopped_at=max(time.time(), signal_sent_at),
+        )
+        if not write_storage_stop_journal(storage_stop_path, stopped):
+            logger.error(
+                "La parada fue limpia, pero el latch no pudo registrar "
+                "stopped_clean; sigue siendo terminal."
+            )
+        raise StorageStopTerminal(
+            "descarga detenida limpiamente para conservar espacio"
+        )
+
+    def reconcile_committed_storage_stop(
+        journal: StorageStopJournal,
+    ) -> None:
+        """Observe a prior committed stop without signalling or relaunching."""
+
+        if journal.phase == "stopped_clean":
+            raise StorageStopTerminal(
+                "storage_stop.json ya confirma una parada limpia"
+            )
+        if journal.phase not in {"committed", "signal_sent"}:
+            raise StorageStopTerminal(
+                "la reconciliación solo acepta un latch comprometido"
+            )
+        processes = find_download_processes(script_path, output_dir)
+        if processes:
+            raise StorageStopTerminal(
+                "el latch comprometido conserva un descargador presente; "
+                "no se volverá a señalizar"
+            )
+        progress = read_progress(progress_path)
+        try:
+            progress_is_post_commit = (
+                journal.committed_at is not None
+                and progress_path.stat().st_mtime >= journal.committed_at
+            )
+        except OSError:
+            progress_is_post_commit = False
+        clean = clean_planned_stop(progress)
+        if not progress_is_post_commit or clean.action != "ready":
+            raise StorageStopTerminal(
+                "el latch comprometido no tiene evidencia nueva de una "
+                "parada limpia"
+            )
+        stationary = read_margin_observation(
+            estimate_path=estimate_path,
+            database_path=database_path,
+            output_dir=output_dir,
+            backing_volume=backing_volume,
+            target_percent=args.target_space_headroom_percent,
+            require_quick_check=True,
+            expected_scope=FULL_MAP_SCOPE,
+        )
+        if (
+            not stationary.valid
+            or stationary.downloading_rows != 0
+            or stationary.quick_check_ok is not True
+        ):
+            raise StorageStopTerminal(
+                "la parada observada no tiene DB inmóvil e íntegra"
+            )
+        if find_download_processes(script_path, output_dir):
+            raise StorageStopTerminal(
+                "apareció un descargador durante la reconciliación; "
+                "no se modificará el latch"
+            )
+        signal_lower_bound = (
+            journal.signal_sent_at
+            if journal.signal_sent_at is not None
+            else journal.committed_at
+        )
+        if signal_lower_bound is None:
+            raise StorageStopTerminal(
+                "el latch comprometido no contiene un timestamp válido"
+            )
+        stopped = dataclasses.replace(
+            journal,
+            phase="stopped_clean",
+            signal_sent_at=signal_lower_bound,
+            stopped_at=max(time.time(), signal_lower_bound),
+        )
+        if not write_storage_stop_journal(storage_stop_path, stopped):
+            raise StorageStopTerminal(
+                "la parada es limpia, pero no pudo reconciliarse durablemente"
+            )
+        raise StorageStopTerminal(
+            "parada limpia reconciliada sin reenviar señal"
+        )
+
     def wait_for_target_validation(
         expected_identity: ProcessIdentity,
         *,
@@ -1602,6 +2155,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         target_percent: float,
     ) -> str | None:
         deadline = time.monotonic() + args.target_validation_timeout
+        storage_stop_checks = 0
+        last_storage_check = 0.0
         while time.monotonic() < deadline:
             processes = find_download_processes(script_path, output_dir)
             if processes != [expected_identity.pid]:
@@ -1624,20 +2179,62 @@ def run(argv: Sequence[str] | None = None) -> int:
                 )
             except OSError:
                 progress_is_new = False
+            now = time.monotonic()
+            if now - last_storage_check >= args.margin_check_seconds:
+                storage_margin = read_margin_observation(
+                    estimate_path=estimate_path,
+                    database_path=database_path,
+                    output_dir=output_dir,
+                    backing_volume=backing_volume,
+                    target_percent=target_percent,
+                    expected_scope=FULL_MAP_SCOPE,
+                )
+                write_margin_observation(margin_path, storage_margin)
+                storage_decision = decide_live_storage_stop(
+                    storage_margin,
+                    progress,
+                    process_percent=expected_identity.headroom_percent,
+                    maximum_heartbeat_age=args.maximum_heartbeat_age,
+                    progress_is_post_launch=progress_is_new,
+                )
+                storage_stop_checks = next_margin_confirmation(
+                    storage_stop_checks,
+                    storage_decision,
+                )
+                last_storage_check = now
+                if storage_decision.action == "ready":
+                    logger.error(
+                        "La reserva del reemplazo %.0f %% no cabe durante "
+                        "validación: confirmación %d/%d.",
+                        expected_identity.headroom_percent,
+                        storage_stop_checks,
+                        args.margin_confirmations,
+                    )
+                if storage_stop_checks >= args.margin_confirmations:
+                    commit_and_stop_for_storage(
+                        expected_identity,
+                        progress_written_after=launched_after,
+                    )
+                    storage_stop_checks = 0
             if progress_is_new:
-                signal_reason = safety_signal(progress)
-                if signal_reason:
-                    return signal_reason
+                # http_errors is cumulative SQLite history. Repeated current
+                # 403/429 responses finalize as status=protection below.
                 if (
                     progress.valid
                     and progress.status in ACTIVE_STATUSES
                     and progress.age_seconds is not None
                     and progress.age_seconds <= args.maximum_heartbeat_age
                 ):
+                    healthy_extension = args.target_validation_timeout
+                    if storage_stop_checks > 0:
+                        healthy_extension = max(
+                            healthy_extension,
+                            args.margin_check_seconds
+                            + args.maximum_heartbeat_age,
+                        )
                     deadline = max(
                         deadline,
-                        time.monotonic()
-                        + args.target_validation_timeout,
+                        time.monotonic() + healthy_extension,
                     )
             if (
                 progress_is_new
@@ -1693,6 +2290,9 @@ def run(argv: Sequence[str] | None = None) -> int:
         launched_after: float,
     ) -> str | None:
         deadline = time.monotonic() + args.target_validation_timeout
+        storage_stop_checks = 0
+        last_storage_check = 0.0
+        storage_gate_is_safe = False
         while time.monotonic() < deadline:
             if (
                 find_download_processes(script_path, output_dir)
@@ -1713,16 +2313,65 @@ def run(argv: Sequence[str] | None = None) -> int:
                 )
             except OSError:
                 progress_is_new = False
+            now = time.monotonic()
+            if now - last_storage_check >= args.margin_check_seconds:
+                storage_margin = read_margin_observation(
+                    estimate_path=estimate_path,
+                    database_path=database_path,
+                    output_dir=output_dir,
+                    backing_volume=backing_volume,
+                    target_percent=args.target_space_headroom_percent,
+                    expected_scope=FULL_MAP_SCOPE,
+                )
+                write_margin_observation(margin_path, storage_margin)
+                storage_decision = decide_live_storage_stop(
+                    storage_margin,
+                    progress,
+                    process_percent=expected_identity.headroom_percent,
+                    maximum_heartbeat_age=args.maximum_heartbeat_age,
+                    progress_is_post_launch=progress_is_new,
+                )
+                storage_stop_checks = next_margin_confirmation(
+                    storage_stop_checks,
+                    storage_decision,
+                )
+                storage_gate_is_safe = (
+                    storage_decision.action == "complete"
+                )
+                last_storage_check = now
+                if storage_decision.action == "ready":
+                    logger.error(
+                        "La reserva del reemplazo temporal %.0f %% no cabe: "
+                        "confirmación %d/%d.",
+                        expected_identity.headroom_percent,
+                        storage_stop_checks,
+                        args.margin_confirmations,
+                    )
+                if storage_stop_checks >= args.margin_confirmations:
+                    commit_and_stop_for_storage(
+                        expected_identity,
+                        progress_written_after=launched_after,
+                    )
+                    storage_stop_checks = 0
+                    storage_gate_is_safe = False
             if progress_is_new:
-                signal_reason = safety_signal(progress)
-                if signal_reason:
-                    return signal_reason
-                if (
+                # Historical HTTP counters do not make a fresh active
+                # heartbeat unsafe; repeated live protection does change
+                # the status to protection and is rejected below.
+                heartbeat_is_healthy = (
                     progress.valid
                     and progress.status in ACTIVE_STATUSES
                     and progress.age_seconds is not None
                     and progress.age_seconds <= args.maximum_heartbeat_age
-                ):
+                )
+                if heartbeat_is_healthy and storage_stop_checks > 0:
+                    deadline = max(
+                        deadline,
+                        time.monotonic()
+                        + args.margin_check_seconds
+                        + args.maximum_heartbeat_age,
+                    )
+                if heartbeat_is_healthy and storage_gate_is_safe:
                     return None
                 if progress.valid and progress.status in STOP_STATUSES:
                     return (
@@ -1740,6 +2389,10 @@ def run(argv: Sequence[str] | None = None) -> int:
         bool,
         str | None,
     ]:
+        if storage_stop_path.exists():
+            raise StorageStopTerminal(
+                "storage_stop.json domina la recuperación de margen"
+            )
         if (
             process_identity_from_fields(
                 journal.old_identity.pid,
@@ -1932,10 +2585,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             return None, None, False, (
                 "no se pudo persistir la parada limpia recuperada"
             )
-        if not clear_stale_download_lock(
-            download_lock,
-            lock_pid_to_clear,
-        ):
+        if not clear_stale_lock_if_storage_allows(lock_pid_to_clear):
             return None, None, False, (
                 "no se pudo retirar el bloqueo stale durante la recuperación"
             )
@@ -2033,6 +2683,53 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
 
     try:
+        if storage_stop_path.exists():
+            storage_journal = read_storage_stop_journal(storage_stop_path)
+            if storage_journal is None:
+                raise StorageStopTerminal(
+                    "storage_stop.json existe pero no es válido"
+                )
+            if (
+                process_identity_from_fields(
+                    storage_journal.identity.pid,
+                    storage_journal.identity.started_at,
+                    storage_journal.identity.arguments,
+                    script_path,
+                    output_dir,
+                )
+                != storage_journal.identity
+            ):
+                raise StorageStopTerminal(
+                    "storage_stop.json no contiene una identidad canónica"
+                )
+            if not math.isclose(
+                storage_journal.target_percent,
+                float(args.target_space_headroom_percent),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise StorageStopTerminal(
+                    "el objetivo de storage_stop.json no coincide"
+                )
+            if storage_journal.phase != "armed":
+                reconcile_committed_storage_stop(storage_journal)
+            if not exact_live_identity(storage_journal.identity):
+                raise StorageStopTerminal(
+                    "el latch armado no conserva el PID, identidad y lock "
+                    "exactos; no se actuará"
+                )
+            commit_and_stop_for_storage(
+                storage_journal.identity,
+                progress_written_after=(
+                    storage_journal.progress_written_after
+                ),
+                armed_journal=storage_journal,
+            )
+            logger.info(
+                "El latch armado fue cancelado porque la reserva vuelve "
+                "a caber; se continúa la adopción normal."
+            )
+
         recovered_upgrade_confirmed = False
         if transition_path.exists():
             journal = read_transition_journal(transition_path)
@@ -2168,6 +2865,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         last_log = 0.0
         last_margin_check = 0.0
         margin_fit_checks = 0
+        storage_stop_checks = 0
         margin_cooldown_until = 0.0
         margin_upgrade_confirmed = recovered_upgrade_confirmed
         margin_progress_written_after = time.time()
@@ -2206,9 +2904,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     )
                     last_log = now
                 if (
-                    now >= margin_cooldown_until
-                    and now - last_margin_check
-                    >= args.margin_check_seconds
+                    now - last_margin_check >= args.margin_check_seconds
                 ):
                     margin = read_margin_observation(
                         estimate_path=estimate_path,
@@ -2232,6 +2928,24 @@ def run(argv: Sequence[str] | None = None) -> int:
                         except OSError:
                             progress_is_post_launch = False
                     process_percent = adopted_identity.headroom_percent
+                    storage_stop_decision = (
+                        decide_live_storage_stop(
+                            margin,
+                            progress,
+                            process_percent=process_percent,
+                            maximum_heartbeat_age=(
+                                args.maximum_heartbeat_age
+                            ),
+                            progress_is_post_launch=(
+                                progress_is_post_launch
+                            ),
+                        )
+                        if owner_pid(download_lock) == adopted_pid
+                        else RestartDecision(
+                            "stop",
+                            "el lock ya no pertenece al PID adoptado",
+                        )
+                    )
                     margin_decision = decide_margin_transition(
                         margin,
                         progress,
@@ -2242,6 +2956,32 @@ def run(argv: Sequence[str] | None = None) -> int:
                         progress_is_post_launch=progress_is_post_launch,
                     )
                     last_margin_check = now
+                    if storage_stop_decision.action == "ready":
+                        storage_stop_checks = next_margin_confirmation(
+                            storage_stop_checks,
+                            storage_stop_decision,
+                        )
+                        logger.error(
+                            "La reserva vigente de %.0f %% no cabe: "
+                            "confirmación de freno %d/%d.",
+                            process_percent,
+                            storage_stop_checks,
+                            args.margin_confirmations,
+                        )
+                    else:
+                        if storage_stop_checks:
+                            logger.info(
+                                "Se reinician las confirmaciones del freno "
+                                "de almacenamiento: %s.",
+                                storage_stop_decision.reason,
+                            )
+                        storage_stop_checks = 0
+                        if storage_stop_decision.action == "stop":
+                            logger.error(
+                                "No se evaluará el freno automático: %s.",
+                                storage_stop_decision.reason,
+                            )
+
                     if margin_decision.action == "complete":
                         margin_fit_checks = 0
                         margin_upgrade_confirmed = True
@@ -2253,7 +2993,10 @@ def run(argv: Sequence[str] | None = None) -> int:
                             "Reserva independiente ya validada al %.2f %%.",
                             validated_restart_percent,
                         )
-                    elif margin_decision.action == "ready":
+                    elif (
+                        margin_decision.action == "ready"
+                        and now >= margin_cooldown_until
+                    ):
                         margin_upgrade_confirmed = False
                         margin_fit_checks = next_margin_confirmation(
                             margin_fit_checks,
@@ -2266,6 +3009,13 @@ def run(argv: Sequence[str] | None = None) -> int:
                             margin_fit_checks,
                             args.margin_confirmations,
                         )
+                    elif margin_decision.action == "ready":
+                        if margin_fit_checks:
+                            logger.info(
+                                "Se reinician las confirmaciones del margen "
+                                "durante el cooldown."
+                            )
+                        margin_fit_checks = 0
                     else:
                         if (
                             process_percent
@@ -2305,6 +3055,22 @@ def run(argv: Sequence[str] | None = None) -> int:
                                 "No se intentará la transición: %s.",
                                 margin_decision.reason,
                             )
+
+                    if (
+                        storage_stop_decision.action == "ready"
+                        and storage_stop_checks
+                        >= args.margin_confirmations
+                    ):
+                        commit_and_stop_for_storage(
+                            adopted_identity,
+                            progress_written_after=(
+                                margin_progress_written_after
+                            ),
+                        )
+                        storage_stop_checks = 0
+                        last_margin_check = time.monotonic()
+                        time.sleep(args.poll_seconds)
+                        continue
 
                     if (
                         margin_decision.action == "ready"
@@ -2494,6 +3260,11 @@ def run(argv: Sequence[str] | None = None) -> int:
                                 "de persistir el journal; no se enviará señal."
                             )
                             return 9
+                        if storage_stop_path.exists():
+                            raise StorageStopTerminal(
+                                "storage_stop.json apareció antes de la "
+                                "transición; no se enviará señal"
+                            )
                         try:
                             os.kill(adopted_pid, signal.SIGINT)
                         except (ProcessLookupError, PermissionError) as exc:
@@ -2574,9 +3345,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                                 "reanudará %.2f %% y se reintentará después.",
                                 launch_percent,
                             )
-                        if not clear_stale_download_lock(
-                            download_lock, adopted_pid
-                        ):
+                        if not clear_stale_lock_if_storage_allows(adopted_pid):
                             logger.error(
                                 "No se retiró el bloqueo tras la parada "
                                 "limpia; no se relanzará."
@@ -2609,6 +3378,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                         adopted_pid = replacement_identity.pid
                         missing_checks = 0
                         margin_fit_checks = 0
+                        storage_stop_checks = 0
                         last_margin_check = time.monotonic()
                         margin_progress_written_after = launched_at
                         if launch_percent >= target_percent:
@@ -2655,6 +3425,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                                 validated_restart_percent = recovered_percent
                                 margin_upgrade_confirmed = recovered_confirmed
                                 margin_fit_checks = 0
+                                storage_stop_checks = 0
                                 last_margin_check = time.monotonic()
                                 margin_progress_written_after = time.time()
                                 logger.info(
@@ -2713,6 +3484,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                                 validated_restart_percent = recovered_percent
                                 margin_upgrade_confirmed = recovered_confirmed
                                 margin_fit_checks = 0
+                                storage_stop_checks = 0
                                 last_margin_check = time.monotonic()
                                 margin_progress_written_after = time.time()
                                 logger.info(
@@ -2818,7 +3590,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     restart_storage_decision.reason,
                 )
                 return 6
-            if not clear_stale_download_lock(download_lock, adopted_pid):
+            if not clear_stale_lock_if_storage_allows(adopted_pid):
                 logger.error(
                     "No se pudo retirar el bloqueo del PID desaparecido %d.",
                     adopted_pid,
@@ -2851,12 +3623,20 @@ def run(argv: Sequence[str] | None = None) -> int:
             adopted_pid = replacement_identity.pid
             missing_checks = 0
             margin_fit_checks = 0
+            storage_stop_checks = 0
             last_margin_check = time.monotonic()
             margin_upgrade_confirmed = False
             margin_progress_written_after = restart_launched_at
             logger.info("Descarga reanudada y PID %d adoptado.", adopted_pid)
         logger.info("Supervisor detenido; el descargador no recibió señales.")
         return 0
+    except StorageStopTerminal as exc:
+        logger.critical(
+            "Freno de almacenamiento terminal: %s. No se limpiará el "
+            "bloqueo, no se enviará otra señal y no se relanzará.",
+            exc,
+        )
+        return 12
     finally:
         supervisor_lock.close()
 

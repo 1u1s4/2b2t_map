@@ -505,6 +505,143 @@ class MarginDecisionTests(unittest.TestCase):
             "stop",
         )
 
+    def test_live_storage_stop_requires_current_margin_failure(self) -> None:
+        progress = supervisor.dataclasses.replace(
+            observation("running"),
+            age_seconds=1,
+        )
+        target_short_but_current_safe = supervisor.dataclasses.replace(
+            margin_observation(fits=False, shortfall_bytes=18),
+            tile_free_bytes=1_062,
+            backing_free_bytes=1_062,
+        )
+        self.assertEqual(
+            supervisor.decide_live_storage_stop(
+                target_short_but_current_safe,
+                progress,
+                process_percent=18,
+                maximum_heartbeat_age=30,
+                progress_is_post_launch=True,
+            ).action,
+            "complete",
+        )
+        historical_429 = supervisor.dataclasses.replace(
+            progress,
+            http_errors={"429": 1},
+        )
+        self.assertEqual(
+            supervisor.decide_live_storage_stop(
+                target_short_but_current_safe,
+                historical_429,
+                process_percent=18,
+                maximum_heartbeat_age=30,
+                progress_is_post_launch=True,
+            ).action,
+            "complete",
+        )
+
+        current_is_short = supervisor.dataclasses.replace(
+            target_short_but_current_safe,
+            tile_free_bytes=1_061,
+            backing_free_bytes=1_061,
+        )
+        self.assertEqual(
+            supervisor.decide_live_storage_stop(
+                current_is_short,
+                progress,
+                process_percent=18,
+                maximum_heartbeat_age=30,
+                progress_is_post_launch=True,
+            ).action,
+            "ready",
+        )
+
+        unsafe_progress = (
+            (observation("discovering"), True, "wait"),
+            (observation("protection", errors={"429": 5}), True, "wait"),
+            (
+                supervisor.dataclasses.replace(
+                    observation("running", errors={"429": 1}),
+                    age_seconds=1,
+                ),
+                True,
+                "ready",
+            ),
+            (progress, False, "wait"),
+            (
+                supervisor.dataclasses.replace(progress, age_seconds=31),
+                True,
+                "wait",
+            ),
+        )
+        for progress_value, is_post_launch, expected in unsafe_progress:
+            with self.subTest(
+                progress=progress_value,
+                is_post_launch=is_post_launch,
+            ):
+                self.assertEqual(
+                    supervisor.decide_live_storage_stop(
+                        current_is_short,
+                        progress_value,
+                        process_percent=18,
+                        maximum_heartbeat_age=30,
+                        progress_is_post_launch=is_post_launch,
+                    ).action,
+                    expected,
+                )
+
+        configured_mismatch = supervisor.dataclasses.replace(
+            current_is_short,
+            configured_percent=20,
+        )
+        self.assertEqual(
+            supervisor.decide_live_storage_stop(
+                configured_mismatch,
+                progress,
+                process_percent=18,
+                maximum_heartbeat_age=30,
+                progress_is_post_launch=True,
+            ).action,
+            "stop",
+        )
+
+        target_current_is_short = supervisor.dataclasses.replace(
+            margin_observation(
+                configured_percent=20,
+                target_percent=20,
+                fits=False,
+                shortfall_bytes=1,
+            ),
+            tile_free_bytes=1_079,
+            backing_free_bytes=1_079,
+        )
+        self.assertEqual(
+            supervisor.decide_live_storage_stop(
+                target_current_is_short,
+                progress,
+                process_percent=20,
+                maximum_heartbeat_age=30,
+                progress_is_post_launch=True,
+            ).action,
+            "ready",
+        )
+        self.assertEqual(
+            supervisor.decide_live_storage_stop(
+                supervisor.dataclasses.replace(
+                    target_current_is_short,
+                    tile_free_bytes=1_080,
+                    backing_free_bytes=1_080,
+                    fits=True,
+                    shortfall_bytes=0,
+                ),
+                progress,
+                process_percent=20,
+                maximum_heartbeat_age=30,
+                progress_is_post_launch=True,
+            ).action,
+            "complete",
+        )
+
 
 class MarginObservationTests(unittest.TestCase):
     def _fixture(
@@ -788,6 +925,768 @@ class TransitionJournalTests(unittest.TestCase):
                     self.assertIsNone(
                         supervisor.read_transition_journal(path)
                     )
+
+
+class StorageStopJournalTests(unittest.TestCase):
+    def _identity(self) -> supervisor.ProcessIdentity:
+        return supervisor.ProcessIdentity(
+            pid=123,
+            started_at="Fri Jul 24 19:00:00 2026",
+            arguments="python download_all_2b2t.py --all",
+            headroom_percent=18,
+        )
+
+    def test_armed_latch_can_be_durably_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "storage_stop.json"
+            armed = supervisor.StorageStopJournal(
+                phase="armed",
+                identity=self._identity(),
+                process_percent=18,
+                target_percent=20,
+                armed_at=100,
+                progress_written_after=99,
+            )
+            self.assertTrue(
+                supervisor.write_storage_stop_journal(path, armed)
+            )
+            self.assertTrue(
+                supervisor.remove_storage_stop_journal(path)
+            )
+            self.assertFalse(path.exists())
+            self.assertTrue(
+                supervisor.remove_storage_stop_journal(path)
+            )
+            committed = supervisor.dataclasses.replace(
+                armed,
+                phase="committed",
+                committed_at=101,
+            )
+            self.assertTrue(
+                supervisor.write_storage_stop_journal(path, committed)
+            )
+            self.assertFalse(
+                supervisor.remove_storage_stop_journal(path)
+            )
+            self.assertTrue(path.exists())
+
+    def test_storage_stop_latch_round_trips_every_phase(self) -> None:
+        armed = supervisor.StorageStopJournal(
+            phase="armed",
+            identity=self._identity(),
+            process_percent=18,
+            target_percent=20,
+            armed_at=100,
+            progress_written_after=99,
+        )
+        committed = supervisor.dataclasses.replace(
+            armed,
+            phase="committed",
+            committed_at=101,
+        )
+        signalled = supervisor.dataclasses.replace(
+            committed,
+            phase="signal_sent",
+            signal_sent_at=102,
+        )
+        stopped = supervisor.dataclasses.replace(
+            signalled,
+            phase="stopped_clean",
+            stopped_at=103,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "storage_stop.json"
+            for journal in (armed, committed, signalled, stopped):
+                with self.subTest(phase=journal.phase):
+                    self.assertTrue(
+                        supervisor.write_storage_stop_journal(
+                            path,
+                            journal,
+                        )
+                    )
+                    self.assertEqual(
+                        supervisor.read_storage_stop_journal(path),
+                        journal,
+                    )
+
+    def test_storage_stop_latch_rejects_inconsistent_payloads(self) -> None:
+        valid = supervisor.StorageStopJournal(
+            phase="stopped_clean",
+            identity=self._identity(),
+            process_percent=18,
+            target_percent=20,
+            armed_at=100,
+            progress_written_after=99,
+            committed_at=101,
+            signal_sent_at=102,
+            stopped_at=103,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "storage_stop.json"
+            self.assertTrue(
+                supervisor.write_storage_stop_journal(path, valid)
+            )
+            valid_payload = json.loads(path.read_text(encoding="utf-8"))
+            invalid_payloads = []
+            for key, value in (
+                ("version", 2),
+                ("phase", "unknown"),
+                ("phase", ["armed"]),
+                ("process_percent", 19),
+                ("armed_at", True),
+                ("armed_at", "100"),
+                ("armed_at", float("nan")),
+                ("target_percent", 21),
+                ("progress_written_after", 104),
+                ("committed_at", 98),
+                ("signal_sent_at", 100),
+                ("stopped_at", 101),
+            ):
+                payload = json.loads(json.dumps(valid_payload))
+                payload[key] = value
+                invalid_payloads.append(payload)
+            mismatched_identity = json.loads(json.dumps(valid_payload))
+            mismatched_identity["identity"]["headroom_percent"] = 20
+            invalid_payloads.append(mismatched_identity)
+            armed_with_commit = json.loads(json.dumps(valid_payload))
+            armed_with_commit["phase"] = "armed"
+            invalid_payloads.append(armed_with_commit)
+            committed_with_signal = json.loads(json.dumps(valid_payload))
+            committed_with_signal["phase"] = "committed"
+            invalid_payloads.append(committed_with_signal)
+
+            for payload in invalid_payloads:
+                with self.subTest(payload=payload):
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    self.assertIsNone(
+                        supervisor.read_storage_stop_journal(path)
+                    )
+
+
+class StorageStopRunTests(unittest.TestCase):
+    def _identity(self) -> supervisor.ProcessIdentity:
+        return supervisor.ProcessIdentity(
+            pid=123,
+            started_at="Fri Jul 24 19:00:00 2026",
+            arguments="python download_all_2b2t.py --all",
+            headroom_percent=18,
+        )
+
+    def _run_args(self, root: Path, output: Path) -> list[str]:
+        return [
+            "--project-dir",
+            str(root),
+            "--output",
+            str(output),
+            "--once",
+        ]
+
+    def test_committed_latch_dominates_without_signal_or_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            identity = self._identity()
+            journal = supervisor.StorageStopJournal(
+                phase="committed",
+                identity=identity,
+                process_percent=18,
+                target_percent=20,
+                armed_at=100,
+                progress_written_after=99,
+                committed_at=101,
+            )
+            self.assertTrue(
+                supervisor.write_storage_stop_journal(
+                    output / "storage_stop.json",
+                    journal,
+                )
+            )
+            (output / "margin_transition.json").write_text(
+                "{invalid",
+                encoding="utf-8",
+            )
+            lock_handle = mock.Mock()
+            with (
+                mock.patch.object(
+                    supervisor,
+                    "acquire_supervisor_lock",
+                    return_value=lock_handle,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "process_identity_from_fields",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_transition_journal",
+                ) as read_transition,
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    return_value=[identity.pid],
+                ),
+                mock.patch.object(supervisor.subprocess, "Popen") as popen,
+                mock.patch.object(
+                    supervisor,
+                    "clear_stale_download_lock",
+                ) as clear_lock,
+                mock.patch.object(supervisor.os, "kill") as send_signal,
+            ):
+                result = supervisor.run(self._run_args(root, output))
+            self.assertEqual(result, 12)
+            popen.assert_not_called()
+            clear_lock.assert_not_called()
+            send_signal.assert_not_called()
+            read_transition.assert_not_called()
+            lock_handle.close.assert_called_once_with()
+            self.assertTrue((output / "storage_stop.json").exists())
+
+    def test_committed_latch_reconciles_clean_stop_without_resignal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            identity = self._identity()
+            latch = output / "storage_stop.json"
+            journal = supervisor.StorageStopJournal(
+                phase="committed",
+                identity=identity,
+                process_percent=18,
+                target_percent=20,
+                armed_at=100,
+                progress_written_after=99,
+                committed_at=101,
+            )
+            self.assertTrue(
+                supervisor.write_storage_stop_journal(latch, journal)
+            )
+            (output / "progress.json").write_text(
+                json.dumps(
+                    {
+                        "status": "stopped",
+                        "reason": "interrumpido",
+                        "http_errors": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stationary = margin_observation(
+                downloading_rows=0,
+                quick_check_ok=True,
+            )
+            lock_handle = mock.Mock()
+            with (
+                mock.patch.object(
+                    supervisor,
+                    "acquire_supervisor_lock",
+                    return_value=lock_handle,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "process_identity_from_fields",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_margin_observation",
+                    return_value=stationary,
+                ),
+                mock.patch.object(supervisor.subprocess, "Popen") as popen,
+                mock.patch.object(
+                    supervisor,
+                    "clear_stale_download_lock",
+                ) as clear_lock,
+                mock.patch.object(supervisor.os, "kill") as send_signal,
+            ):
+                result = supervisor.run(self._run_args(root, output))
+            self.assertEqual(result, 12)
+            reconciled = supervisor.read_storage_stop_journal(latch)
+            self.assertIsNotNone(reconciled)
+            assert reconciled is not None
+            self.assertEqual(reconciled.phase, "stopped_clean")
+            self.assertEqual(reconciled.signal_sent_at, 101)
+            popen.assert_not_called()
+            clear_lock.assert_not_called()
+            send_signal.assert_not_called()
+
+    def test_armed_latch_is_cancelled_only_when_current_margin_fits(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            identity = self._identity()
+            journal = supervisor.StorageStopJournal(
+                phase="armed",
+                identity=identity,
+                process_percent=18,
+                target_percent=20,
+                armed_at=100,
+                progress_written_after=99,
+            )
+            latch = output / "storage_stop.json"
+            self.assertTrue(
+                supervisor.write_storage_stop_journal(latch, journal)
+            )
+            current_safe = supervisor.dataclasses.replace(
+                margin_observation(fits=False, shortfall_bytes=18),
+                tile_free_bytes=1_062,
+                backing_free_bytes=1_062,
+            )
+            progress = supervisor.dataclasses.replace(
+                observation("running"),
+                age_seconds=1,
+            )
+            lock_handle = mock.Mock()
+            with (
+                mock.patch.object(
+                    supervisor,
+                    "acquire_supervisor_lock",
+                    return_value=lock_handle,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "process_identity_from_fields",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    return_value=[identity.pid],
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_process_identity",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "owner_pid",
+                    return_value=identity.pid,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_margin_observation",
+                    return_value=current_safe,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "write_margin_observation",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_progress",
+                    return_value=progress,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "ensure_download_lock",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_configured_headroom_percent",
+                    return_value=18,
+                ),
+                mock.patch("builtins.print"),
+                mock.patch.object(supervisor.subprocess, "Popen") as popen,
+                mock.patch.object(supervisor.os, "kill") as send_signal,
+            ):
+                result = supervisor.run(self._run_args(root, output))
+            self.assertEqual(result, 0)
+            self.assertFalse(latch.exists())
+            popen.assert_not_called()
+            send_signal.assert_not_called()
+            lock_handle.close.assert_called_once_with()
+
+    def test_armed_latch_is_preserved_when_identity_changes_at_cancel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            identity = self._identity()
+            journal = supervisor.StorageStopJournal(
+                phase="armed",
+                identity=identity,
+                process_percent=18,
+                target_percent=20,
+                armed_at=100,
+                progress_written_after=99,
+            )
+            latch = output / "storage_stop.json"
+            self.assertTrue(
+                supervisor.write_storage_stop_journal(latch, journal)
+            )
+            current_safe = supervisor.dataclasses.replace(
+                margin_observation(fits=False, shortfall_bytes=18),
+                tile_free_bytes=1_062,
+                backing_free_bytes=1_062,
+            )
+            lock_handle = mock.Mock()
+            with (
+                mock.patch.object(
+                    supervisor,
+                    "acquire_supervisor_lock",
+                    return_value=lock_handle,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "process_identity_from_fields",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    return_value=[identity.pid],
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_process_identity",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "owner_pid",
+                    side_effect=[identity.pid, 999],
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_margin_observation",
+                    return_value=current_safe,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "write_margin_observation",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_progress",
+                    return_value=observation("running"),
+                ),
+                mock.patch.object(supervisor.subprocess, "Popen") as popen,
+                mock.patch.object(supervisor.os, "kill") as send_signal,
+            ):
+                result = supervisor.run(self._run_args(root, output))
+            self.assertEqual(result, 12)
+            self.assertTrue(latch.exists())
+            self.assertEqual(
+                supervisor.read_storage_stop_journal(latch),
+                journal,
+            )
+            popen.assert_not_called()
+            send_signal.assert_not_called()
+
+    def test_validation_storage_stop_is_terminal_without_recovery_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            old_identity = self._identity()
+            replacement = supervisor.ProcessIdentity(
+                pid=456,
+                started_at="Fri Jul 24 20:00:00 2026",
+                arguments="python download_all_2b2t.py --all",
+                headroom_percent=20,
+            )
+            transition = supervisor.TransitionJournal(
+                phase="stopped_clean",
+                old_identity=old_identity,
+                current_percent=18,
+                target_percent=20,
+                signalled_at=90,
+                selected_percent=20,
+                launch_started_at=100,
+            )
+            transition_path = output / "margin_transition.json"
+            self.assertTrue(
+                supervisor.write_transition_journal(
+                    transition_path,
+                    transition,
+                )
+            )
+            (output / "progress.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "reason": None,
+                        "http_errors": {"429": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            current_short = supervisor.dataclasses.replace(
+                margin_observation(
+                    configured_percent=20,
+                    target_percent=20,
+                    fits=False,
+                    shortfall_bytes=1,
+                ),
+                tile_free_bytes=1_079,
+                backing_free_bytes=1_079,
+            )
+            original_read_transition = (
+                supervisor.read_transition_journal
+            )
+            lock_handle = mock.Mock()
+            with (
+                mock.patch.object(
+                    supervisor,
+                    "acquire_supervisor_lock",
+                    return_value=lock_handle,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "process_identity_from_fields",
+                    return_value=old_identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    return_value=[replacement.pid],
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_process_identity",
+                    return_value=replacement,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "owner_pid",
+                    return_value=replacement.pid,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_margin_observation",
+                    return_value=current_short,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "write_margin_observation",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_transition_journal",
+                    wraps=original_read_transition,
+                ) as read_transition,
+                mock.patch.object(supervisor.subprocess, "Popen") as popen,
+                mock.patch.object(
+                    supervisor,
+                    "clear_stale_download_lock",
+                ) as clear_lock,
+                mock.patch.object(
+                    supervisor.os,
+                    "kill",
+                    side_effect=PermissionError("test"),
+                ) as send_signal,
+            ):
+                result = supervisor.run(
+                    self._run_args(root, output)
+                    + [
+                        "--margin-confirmations",
+                        "1",
+                        "--margin-check-seconds",
+                        "0.001",
+                        "--poll-seconds",
+                        "0.001",
+                        "--target-validation-timeout",
+                        "1",
+                    ]
+                )
+            self.assertEqual(result, 12)
+            self.assertEqual(read_transition.call_count, 1)
+            popen.assert_not_called()
+            clear_lock.assert_not_called()
+            send_signal.assert_called_once_with(
+                replacement.pid,
+                supervisor.signal.SIGINT,
+            )
+            latch = supervisor.read_storage_stop_journal(
+                output / "storage_stop.json"
+            )
+            self.assertIsNotNone(latch)
+            assert latch is not None
+            self.assertEqual(latch.phase, "committed")
+            self.assertTrue(transition_path.exists())
+
+    def test_immediate_clean_stop_uses_pre_signal_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            old_identity = self._identity()
+            replacement = supervisor.ProcessIdentity(
+                pid=456,
+                started_at="Fri Jul 24 20:00:00 2026",
+                arguments="python download_all_2b2t.py --all",
+                headroom_percent=20,
+            )
+            transition = supervisor.TransitionJournal(
+                phase="stopped_clean",
+                old_identity=old_identity,
+                current_percent=18,
+                target_percent=20,
+                signalled_at=90,
+                selected_percent=20,
+                launch_started_at=100,
+            )
+            transition_path = output / "margin_transition.json"
+            self.assertTrue(
+                supervisor.write_transition_journal(
+                    transition_path,
+                    transition,
+                )
+            )
+            progress_path = output / "progress.json"
+            progress_path.write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "reason": None,
+                        "http_errors": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            current_short = supervisor.dataclasses.replace(
+                margin_observation(
+                    configured_percent=20,
+                    target_percent=20,
+                    fits=False,
+                    shortfall_bytes=1,
+                ),
+                tile_free_bytes=1_079,
+                backing_free_bytes=1_079,
+            )
+            stationary = supervisor.dataclasses.replace(
+                current_short,
+                downloading_rows=0,
+                quick_check_ok=True,
+            )
+            alive = {"value": True}
+
+            def processes(
+                _script: Path,
+                _output: Path,
+            ) -> list[int]:
+                return [replacement.pid] if alive["value"] else []
+
+            def margin(**_kwargs: object) -> supervisor.MarginObservation:
+                return current_short if alive["value"] else stationary
+
+            def immediate_stop(_pid: int, _signal: int) -> None:
+                alive["value"] = False
+                progress_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "stopped",
+                            "reason": "interrumpido",
+                            "http_errors": {},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            original_read_transition = (
+                supervisor.read_transition_journal
+            )
+            lock_handle = mock.Mock()
+            with (
+                mock.patch.object(
+                    supervisor,
+                    "acquire_supervisor_lock",
+                    return_value=lock_handle,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "process_identity_from_fields",
+                    return_value=old_identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    side_effect=processes,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_process_identity",
+                    return_value=replacement,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "owner_pid",
+                    return_value=replacement.pid,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_margin_observation",
+                    side_effect=margin,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "write_margin_observation",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_transition_journal",
+                    wraps=original_read_transition,
+                ) as read_transition,
+                mock.patch.object(supervisor.subprocess, "Popen") as popen,
+                mock.patch.object(
+                    supervisor,
+                    "clear_stale_download_lock",
+                ) as clear_lock,
+                mock.patch.object(
+                    supervisor.os,
+                    "kill",
+                    side_effect=immediate_stop,
+                ) as send_signal,
+            ):
+                result = supervisor.run(
+                    self._run_args(root, output)
+                    + [
+                        "--margin-confirmations",
+                        "1",
+                        "--margin-check-seconds",
+                        "0.001",
+                        "--poll-seconds",
+                        "0.001",
+                        "--target-validation-timeout",
+                        "1",
+                    ]
+                )
+            self.assertEqual(result, 12)
+            self.assertEqual(read_transition.call_count, 1)
+            popen.assert_not_called()
+            clear_lock.assert_not_called()
+            send_signal.assert_called_once_with(
+                replacement.pid,
+                supervisor.signal.SIGINT,
+            )
+            latch = supervisor.read_storage_stop_journal(
+                output / "storage_stop.json"
+            )
+            self.assertIsNotNone(latch)
+            assert latch is not None
+            self.assertEqual(latch.phase, "stopped_clean")
+            self.assertTrue(transition_path.exists())
 
 
 class ProcessDetectionTests(unittest.TestCase):

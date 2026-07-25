@@ -643,12 +643,12 @@ mapa completo se detenga si no cabe, en vez de declarar terminado un subconjunto
 
 ## Estado actual de la descarga y espacio
 
-Instantánea del **24 de julio de 2026 a las 20:37 UTC−6**:
+Instantánea del **24 de julio de 2026 a las 21:02 UTC−6**:
 
 - `LuisA` está montada y tiene 1,34 TiB libres;
 - un sparsebundle alojado en `LuisA` está montado como `/Volumes/2b2t Tiles`;
 - el contenedor usa APFS con bloques de 4 KiB, frente a los 128 KiB de ExFAT;
-- hay 97 796 tiles completos, 3 247 ausentes y 0 corruptos;
+- hay 100 389 tiles completos, 3 638 ausentes y 0 corruptos;
 - la sesión detached `obsidian_atlas_full` está activa;
 - el alcance solicitado es `overworld,nether,end × base,overlay,newchunks ×
   LOD 0..10`;
@@ -657,11 +657,11 @@ Instantánea del **24 de julio de 2026 a las 20:37 UTC−6**:
 - el preflight de 99 grupos aprobó temporalmente el alcance completo al 18 %;
   esto no se presenta como cumplimiento del requisito independiente del 20 %;
 - el proceso histórico sigue al 18 % mientras descarga; el cálculo estricto
-  para 20 % todavía tiene un faltante de 10,33 GiB en el volumen limitante;
+  para 20 % todavía tiene un faltante de 10,34 GiB en el volumen limitante;
 - `margin_upgrade.json` publica ese cálculo contra el APFS y contra `LuisA`;
   cuando ambos pasen la desigualdad estable, el supervisor migrará al 20 %;
 - la cola estimada contiene 17 157 504 solicitudes y publica su barra cada
-  cinco segundos; lleva 101 044 procesadas (0,589 %) y la velocidad observada
+  cinco segundos; lleva 104 028 procesadas (0,606 %) y la velocidad observada
   ronda 1,96 tiles/s;
 - el watchdog automático final está activo y adoptó el mismo PID histórico sin
   interrumpirlo.
@@ -736,6 +736,25 @@ heartbeat posterior al PID nuevo.
 El journal permite recuperar una caída del supervisor entre la señal y el
 relanzamiento sin usar `SIGKILL`, sin borrar un lock vivo y sin hacer downgrade
 después de validar el 20 %.
+
+La reserva vigente del proceso también se vigila aunque la migración esté en
+cooldown o se use `--no-auto-margin-upgrade`. Si ese 18 % o 20 % deja de caber,
+el supervisor exige tres lecturas consecutivas, frescas y ligadas al mismo PID,
+identidad y lock. El mismo guard permanece activo mientras valida un
+reemplazo, de modo que una falta de espacio nunca se convierte en un error
+recuperable que relance el proceso.
+
+Antes del único `SIGINT` de este freno se persiste y sincroniza
+`storage_stop.json`. Sus fases `armed`, `committed`, `signal_sent` y
+`stopped_clean` forman un latch terminal separado de
+`margin_transition.json`: desde `committed` jamás se vuelve a señalizar, borrar
+el lock ni relanzar automáticamente. Tras un crash puede reconciliar una parada
+limpia sin reenviar la señal; si el resultado es ambiguo conserva el latch y
+prefiere detener el supervisor. Los contadores HTTP históricos no bloquean
+este freno de disco cuando el heartbeat actual sigue `running`; un estado
+actual `protection`, `error` o cualquier otro cierre continúa siendo terminal.
+No borres manualmente `storage_stop.json` sin investigar primero el proceso,
+el lock, `progress.json`, SQLite y el espacio de ambos volúmenes.
 
 ```bash
 screen -dmS obsidian_atlas_watchdog /bin/zsh -lc \
