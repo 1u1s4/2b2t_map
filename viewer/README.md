@@ -139,8 +139,10 @@ denominador; nunca se cuenta como revisada.
 bitsets base64url —revisadas y sin datos—, no listas extensas de coordenadas.
 **Importar** valida versión, dimensión, límites alineados, escala, LOD, índice y
 contadores.
-**Pausar sesión** la conserva y permite abrir otra región sin perder progreso.
-También se puede elegir directamente cualquier celda visible con un clic.
+Al pulsar **Explorar esta región**, la sesión activa se guarda automáticamente
+y la selección nueva se abre de inmediato. **Pausar sesión** sigue disponible
+para cerrar el recorrido sin iniciar otro. También se puede elegir directamente
+cualquier celda visible con un clic.
 
 Las sesiones creadas por versiones anteriores conservan su LOD, escala, celda
 actual y progreso al restaurarlas o importarlas. Un LOD heredado queda en solo

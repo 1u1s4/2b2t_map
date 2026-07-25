@@ -106,8 +106,8 @@ PYTHON_BIN='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
    o **Por explorar**.
 3. Haz clic en un sector o arrastra sobre varios. El panel muestra sus límites
    X/Z y la cantidad de filas y columnas LOD 0.
-4. Pulsa **Explorar en máximo detalle** o **Iniciar exploración LOD 0**. La
-   primera celda se abre directamente a 512×512 bloques.
+4. Pulsa **Explorar esta región** o **Iniciar en LOD 0**. La primera celda se
+   abre directamente a 512×512 bloques.
 5. Recorre la región con la cruceta norte/sur/este/oeste, las flechas del
    teclado o un clic en otra celda.
 6. Acerca, aleja o arrastra el mapa cuando necesites inspeccionar una
@@ -123,6 +123,10 @@ El progreso de revisión y la presencia del tile son conceptos distintos.
 Descargar una celda no la marca como revisada, y navegar no inicia solicitudes
 en segundo plano. Una ausencia `404` tampoco se disfraza de revisión: se guarda
 en su propio bitset y se excluye del total revisable.
+
+No necesitas pausar manualmente para cambiar de zona: al pulsar **Explorar esta
+región**, la sesión activa se guarda en el workspace y la selección nueva se
+abre directamente.
 
 El Atlas se puede abrir mientras una sesión está activa. La cámara y el zoom
 regionales se conservan y se restauran al volver. Un toque o clic selecciona el

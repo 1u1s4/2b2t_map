@@ -3008,13 +3008,12 @@ export function MapViewer() {
 
   const startMaxDetailExploration = useCallback(
     (bounds: WorldBounds, name: string) => {
-      if (explorationState) {
-        notify("Pausa la sesión activa antes de iniciar otra región");
-        return;
-      }
       const knownExplorationIds = new Set(
         savedExplorations.map((exploration) => exploration.id),
       );
+      if (explorationState) {
+        knownExplorationIds.add(explorationState.region.id);
+      }
       if (knownExplorationIds.size >= MAX_WORKSPACE_EXPLORATIONS) {
         notify(
           "El workspace alcanzó el límite de 128 sesiones; exporta una antes de crear otra",
@@ -3027,8 +3026,11 @@ export function MapViewer() {
           name: name.trim() || "Región de análisis",
           bounds,
         });
+        const replacedActiveExploration = explorationState !== null;
+        if (explorationState) archiveExploration(explorationState);
         setExplorationState(next);
         focusExploration(next);
+        setConfirmCloseExploration(false);
         setMarkMode(null);
         atlasReturnViewRef.current = null;
         clearTileCache();
@@ -3038,7 +3040,9 @@ export function MapViewer() {
             : "exploration",
         );
         notify(
-          `${next.region.cellCount.toLocaleString("es-GT")} celdas · LOD 0 · usa las flechas`,
+          replacedActiveExploration
+            ? `${next.region.cellCount.toLocaleString("es-GT")} celdas · sesión anterior guardada`
+            : `${next.region.cellCount.toLocaleString("es-GT")} celdas · LOD 0 · usa las flechas`,
         );
       } catch (error) {
         notify(
@@ -3047,6 +3051,7 @@ export function MapViewer() {
       }
     },
     [
+      archiveExploration,
       clearTileCache,
       explorationState,
       focusExploration,
@@ -4360,23 +4365,18 @@ export function MapViewer() {
                   </div>
                   <button
                     type="button"
-                    disabled={!explorationState && coverageSelectionTooLarge}
+                    disabled={coverageSelectionTooLarge}
                     title={
-                      explorationState
-                        ? "Volver a la sesión activa"
-                        : coverageSelectionTooLarge
-                          ? "Reduce la región para mantener una sesión segura"
+                      coverageSelectionTooLarge
+                        ? "Reduce la región para mantener una sesión segura"
+                        : explorationState
+                          ? "Guardar la sesión actual e iniciar esta región"
                           : "Iniciar la región en máximo detalle"
                     }
-                    onClick={() => {
-                      if (explorationState) closeAtlas("exploration");
-                      else startCoverageSelection();
-                    }}
+                    onClick={startCoverageSelection}
                   >
                     <ScanSearch size={15} />
-                    {explorationState
-                      ? "Volver a la sesión"
-                      : "Explorar en máximo detalle"}
+                    Explorar esta región
                   </button>
                   {coverageSelectionTooLarge ? (
                     <small className="atlas-selection-warning">
@@ -4385,9 +4385,7 @@ export function MapViewer() {
                       Reduce la selección.
                     </small>
                   ) : explorationState ? (
-                    <small>
-                      Pausa la sesión activa antes de iniciar otra región.
-                    </small>
+                    <small>La sesión actual se guardará automáticamente.</small>
                   ) : null}
                 </section>
               ) : null}
@@ -4940,33 +4938,25 @@ export function MapViewer() {
                       <button
                         type="button"
                         data-primary="true"
-                        disabled={!explorationState && coverageSelectionTooLarge}
+                        disabled={coverageSelectionTooLarge}
                         title={
-                          explorationState
-                            ? "Volver a la sesión activa"
-                            : coverageSelectionTooLarge
-                              ? "Reduce la selección para iniciar LOD 0"
+                          coverageSelectionTooLarge
+                            ? "Reduce la selección para iniciar LOD 0"
+                            : explorationState
+                              ? "Guardar la sesión actual e iniciar esta región"
                               : "Crear una sesión LOD 0 y abrir su primera celda"
                         }
-                        onClick={() => {
-                          if (explorationState) {
-                            setDrawer(
-                              window.matchMedia("(max-width: 720px)").matches
-                                ? null
-                                : "exploration",
-                            );
-                            focusExploration(explorationState);
-                          } else {
-                            startCoverageSelection();
-                          }
-                        }}
+                        onClick={startCoverageSelection}
                       >
                         <ScanSearch size={15} />
-                        {explorationState
-                          ? "Volver a la sesión activa"
-                          : "Iniciar exploración LOD 0"}
+                        Explorar esta región
                       </button>
                     </div>
+                    {explorationState && !coverageSelectionTooLarge ? (
+                      <p className="coverage-selection-hint">
+                        La sesión actual se guardará automáticamente.
+                      </p>
+                    ) : null}
                     {coverageSelectionTooLarge ? (
                       <p className="coverage-selection-warning" role="alert">
                         La región supera el máximo seguro de{" "}
