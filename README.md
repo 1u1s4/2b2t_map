@@ -53,6 +53,18 @@ npm run dev
 
 Abre en Chrome la dirección local que imprima el comando. `localhost` se
 considera un contexto seguro y permite usar la File System Access API. Para
+mostrar automáticamente la barra de la descarga activa, sin elegir primero la
+carpeta, inicia el visor local así:
+
+```bash
+cd viewer
+OBSIDIAN_ATLAS_PROGRESS_FILE='/Volumes/2b2t Tiles/2b2t_tiles/progress.json' \
+  npm run dev
+```
+
+El bridge solo existe en el servidor de desarrollo local, lee ese archivo
+exacto y no publica la ruta ni los tiles. La versión alojada continúa
+requiriendo el permiso explícito de Chrome. Para
 verificar una versión de producción:
 
 ```bash

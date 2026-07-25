@@ -44,6 +44,7 @@ import {
 import {
   isDownloadProgressStale,
   readDownloadProgress,
+  readServedDownloadProgress,
   type DownloadProgressReadResult,
   type DownloadProgressSnapshot,
 } from "./lib/download-progress";
@@ -114,7 +115,7 @@ type TileStats = {
 };
 
 type DownloadProgressState = {
-  source: LocalTileSource;
+  source: LocalTileSource | "server";
   result: DownloadProgressReadResult;
   checkedAt: number;
 };
@@ -376,6 +377,11 @@ export function MapViewer() {
   const selectedHighlight = highlights.find(
     (highlight) => highlight.id === selectedHighlightId,
   );
+  const progressMatchesCurrentSource =
+    (localSource !== null && downloadProgress?.source === localSource) ||
+    (localSource === null && downloadProgress?.source === "server");
+  const showDownloadProgress =
+    localSource !== null || downloadProgress?.source === "server";
 
   const notify = useCallback((message: string) => {
     setToast(message);
@@ -507,6 +513,59 @@ export function MapViewer() {
     return () => {
       cancelled = true;
       window.clearInterval(interval);
+    };
+  }, [localSource]);
+
+  useEffect(() => {
+    if (localSource) return;
+
+    let cancelled = false;
+    let reading = false;
+    let interval: number | null = null;
+    let activeController: AbortController | null = null;
+    const refresh = async () => {
+      if (reading) return;
+      reading = true;
+      const controller = new AbortController();
+      activeController = controller;
+      const abortTimeout = window.setTimeout(() => controller.abort(), 10_000);
+      let keepPolling = true;
+      try {
+        const result = await readServedDownloadProgress(
+          fetch,
+          controller.signal,
+        );
+        if (cancelled) return;
+        if (result === null) {
+          keepPolling = false;
+          setDownloadProgress((current) =>
+            current?.source === "server" ? null : current,
+          );
+          return;
+        }
+        setDownloadProgress({
+          source: "server",
+          result,
+          checkedAt: Date.now(),
+        });
+      } finally {
+        window.clearTimeout(abortTimeout);
+        if (activeController === controller) activeController = null;
+        reading = false;
+        if (!cancelled && keepPolling) {
+          interval = window.setTimeout(() => {
+            void refresh();
+          }, 5_000);
+        }
+      }
+    };
+
+    void refresh();
+
+    return () => {
+      cancelled = true;
+      activeController?.abort();
+      if (interval !== null) window.clearTimeout(interval);
     };
   }, [localSource]);
 
@@ -1594,6 +1653,8 @@ export function MapViewer() {
                   <p>
                     {localSource
                       ? "Los tiles locales tienen prioridad."
+                      : downloadProgress?.source === "server"
+                        ? "El progreso local se actualiza automáticamente."
                       : "Chrome puede leer tu archivo sin subirlo."}
                   </p>
                 </div>
@@ -1625,16 +1686,16 @@ export function MapViewer() {
                 </span>
                 <span className={`switch ${onlineFallback ? "on" : ""}`} />
               </button>
-              {localSource && (
+              {showDownloadProgress && (
                 <DownloadProgressCard
                   result={
-                    downloadProgress?.source === localSource
-                      ? downloadProgress.result
+                    progressMatchesCurrentSource
+                      ? (downloadProgress?.result ?? null)
                       : null
                   }
                   checkedAt={
-                    downloadProgress?.source === localSource
-                      ? downloadProgress.checkedAt
+                    progressMatchesCurrentSource
+                      ? (downloadProgress?.checkedAt ?? null)
                       : null
                   }
                 />

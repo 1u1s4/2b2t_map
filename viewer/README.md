@@ -29,6 +29,17 @@ npm run dev
 
 Abre en Chrome la URL local que imprima el comando. La aplicación necesita un
 contexto seguro para el selector de carpetas; `localhost` cuenta como seguro.
+Para vincular automáticamente la tarjeta de progreso a la descarga activa:
+
+```bash
+OBSIDIAN_ATLAS_PROGRESS_FILE='/Volumes/2b2t Tiles/2b2t_tiles/progress.json' \
+  npm run dev
+```
+
+Este bridge se habilita únicamente durante desarrollo, sirve un solo
+`progress.json` con caché desactivada y no expone el resto del archivo. Sin la
+variable, y en el sitio publicado, la ruta responde sin contenido y se mantiene
+el flujo normal de permiso explícito de Chrome.
 
 Comandos de comprobación:
 

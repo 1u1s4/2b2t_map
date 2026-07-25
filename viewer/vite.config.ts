@@ -1,10 +1,13 @@
+import { fileURLToPath } from "node:url";
 import vinext from "vinext";
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import hostingConfig from "./.openai/hosting.json";
+import { localProgress } from "./build/local-progress-vite-plugin";
 import { sites } from "./build/sites-vite-plugin";
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   "00000000-0000-4000-8000-000000000000";
+const CONFIG_DIRECTORY = fileURLToPath(new URL(".", import.meta.url));
 
 const { d1, r2 } = hostingConfig;
 
@@ -33,7 +36,7 @@ const localBindingConfig = {
     : [],
 };
 
-export default defineConfig(async () => {
+export default defineConfig(async ({ mode }) => {
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
   // settings; application environment belongs in ignored `.env*` files.
   process.env.WRANGLER_WRITE_LOGS ??= "false";
@@ -42,12 +45,28 @@ export default defineConfig(async () => {
 
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import("@cloudflare/vite-plugin");
+  const atlasEnvironment = loadEnv(
+    mode,
+    CONFIG_DIRECTORY,
+    "OBSIDIAN_ATLAS_",
+  );
+  const progressFile = atlasEnvironment.OBSIDIAN_ATLAS_PROGRESS_FILE;
+  const serverOptions = {
+    ...(isCodexSeatbeltSandbox
+      ? { watch: { useFsEvents: false, usePolling: true } }
+      : {}),
+    // Vinext enables Vite's console-forwarding client without its matching
+    // transport in this multi-environment setup. One rejected promise then
+    // recursively fills the error overlay; local Chrome already has DevTools.
+    ...(progressFile ? { forwardConsole: false } : {}),
+  };
 
   return {
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
+    server: Object.keys(serverOptions).length > 0 ? serverOptions : undefined,
     plugins: [
+      localProgress({
+        progressFile,
+      }),
       vinext(),
       sites(),
       cloudflare({

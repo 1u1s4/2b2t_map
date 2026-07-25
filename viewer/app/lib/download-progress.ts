@@ -230,6 +230,30 @@ export function isDownloadProgressStale(
   );
 }
 
+function parseProgressDocument(text: string): DownloadProgressReadResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return {
+      kind: "invalid",
+      message: "progress.json no contiene JSON válido",
+    };
+  }
+
+  try {
+    return { kind: "ready", progress: parseDownloadProgress(parsed) };
+  } catch (error) {
+    return {
+      kind: "invalid",
+      message:
+        error instanceof Error
+          ? error.message
+          : "progress.json tiene un formato incompatible",
+    };
+  }
+}
+
 function errorName(error: unknown): string | null {
   if (
     typeof error === "object" &&
@@ -261,27 +285,7 @@ export async function readDownloadProgress(
       };
     }
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(await file.text()) as unknown;
-    } catch {
-      return {
-        kind: "invalid",
-        message: "progress.json no contiene JSON válido",
-      };
-    }
-
-    try {
-      return { kind: "ready", progress: parseDownloadProgress(parsed) };
-    } catch (error) {
-      return {
-        kind: "invalid",
-        message:
-          error instanceof Error
-            ? error.message
-            : "progress.json tiene un formato incompatible",
-      };
-    }
+    return parseProgressDocument(await file.text());
   } catch (error) {
     const name = errorName(error);
     if (name === "NotFoundError") {
@@ -299,6 +303,68 @@ export async function readDownloadProgress(
     return {
       kind: "unavailable",
       message: "No se pudo leer progress.json; el mapa seguirá funcionando",
+    };
+  }
+}
+
+/**
+ * Reads the optional Vite-only progress bridge. The deployed route returns
+ * 204, so production keeps using Chrome's explicit directory permission.
+ */
+export async function readServedDownloadProgress(
+  request: typeof fetch = fetch,
+  signal?: AbortSignal,
+): Promise<DownloadProgressReadResult | null> {
+  try {
+    const response = await request("/api/local-progress", {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      signal,
+    });
+    if (response.status === 204) return null;
+    if (response.status === 404) {
+      return {
+        kind: "missing",
+        message: "La descarga todavía no ha creado progress.json",
+      };
+    }
+    if (response.status === 413) {
+      return {
+        kind: "invalid",
+        message: "progress.json supera el tamaño máximo permitido",
+      };
+    }
+    if (!response.ok) {
+      return {
+        kind: "unavailable",
+        message: "No se pudo leer el progreso servido localmente",
+      };
+    }
+
+    const declaredLength = Number(
+      response.headers.get("Content-Length") ?? "0",
+    );
+    if (
+      Number.isFinite(declaredLength) &&
+      declaredLength > MAX_PROGRESS_FILE_BYTES
+    ) {
+      return {
+        kind: "invalid",
+        message: "progress.json supera el tamaño máximo permitido",
+      };
+    }
+    const body = await response.arrayBuffer();
+    if (body.byteLength > MAX_PROGRESS_FILE_BYTES) {
+      return {
+        kind: "invalid",
+        message: "progress.json supera el tamaño máximo permitido",
+      };
+    }
+    return parseProgressDocument(new TextDecoder().decode(body));
+  } catch {
+    return {
+      kind: "unavailable",
+      message: "No se pudo contactar el visor local de progreso",
     };
   }
 }

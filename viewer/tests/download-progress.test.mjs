@@ -5,6 +5,7 @@ import {
   isDownloadProgressStale,
   parseDownloadProgress,
   readDownloadProgress,
+  readServedDownloadProgress,
 } from "../app/lib/download-progress.ts";
 
 test("progress parser prefers explicit counters and percentage", () => {
@@ -187,4 +188,44 @@ test("progress reader handles ready, missing, malformed, and oversized files", a
     },
   });
   assert.equal(oversized.kind, "invalid");
+});
+
+test("optional local progress bridge distinguishes production and live data", async () => {
+  const controller = new AbortController();
+  const disabled = await readServedDownloadProgress(async (url, options) => {
+    assert.equal(url, "/api/local-progress");
+    assert.equal(options.cache, "no-store");
+    assert.equal(options.signal, controller.signal);
+    return new Response(null, { status: 204 });
+  }, controller.signal);
+  assert.equal(disabled, null);
+
+  const ready = await readServedDownloadProgress(async () =>
+    Response.json({
+      status: "running",
+      planned_requests: 100,
+      processed_requests: 25,
+      progress_percent: 25,
+    }),
+  );
+  assert.equal(ready.kind, "ready");
+  assert.equal(ready.progress.progressPercent, 25);
+
+  const missing = await readServedDownloadProgress(async () =>
+    Response.json({ error: "missing" }, { status: 404 }),
+  );
+  assert.equal(missing.kind, "missing");
+
+  const oversized = await readServedDownloadProgress(async () =>
+    new Response("{}", {
+      status: 200,
+      headers: { "Content-Length": "1000001" },
+    }),
+  );
+  assert.equal(oversized.kind, "invalid");
+
+  const unavailable = await readServedDownloadProgress(async () => {
+    throw new TypeError("offline");
+  });
+  assert.equal(unavailable.kind, "unavailable");
 });
