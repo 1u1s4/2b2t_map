@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  isDownloadProgressStale,
   parseDownloadProgress,
   readDownloadProgress,
 } from "../app/lib/download-progress.ts";
@@ -90,6 +91,44 @@ test("progress parser ignores unsafe optional fields without breaking the map", 
   assert.throws(
     () => parseDownloadProgress(["not", "an", "object"]),
     /objeto JSON/,
+  );
+});
+
+test("stale heartbeat detection covers both active phases only", () => {
+  const checkedAt = Date.parse("2026-07-24T12:35:30Z");
+  const staleTimestamp = checkedAt - 20_001;
+  const freshTimestamp = checkedAt - 20_000;
+
+  for (const status of ["running", "discovering"]) {
+    assert.equal(
+      isDownloadProgressStale(
+        { status, updatedAtTimestamp: staleTimestamp },
+        checkedAt,
+      ),
+      true,
+    );
+    assert.equal(
+      isDownloadProgressStale(
+        { status, updatedAtTimestamp: freshTimestamp },
+        checkedAt,
+      ),
+      false,
+    );
+  }
+
+  assert.equal(
+    isDownloadProgressStale(
+      { status: "complete", updatedAtTimestamp: staleTimestamp },
+      checkedAt,
+    ),
+    false,
+  );
+  assert.equal(
+    isDownloadProgressStale(
+      { status: "running", updatedAtTimestamp: null },
+      checkedAt,
+    ),
+    false,
   );
 });
 

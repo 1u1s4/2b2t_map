@@ -42,6 +42,7 @@ import {
   type TileLayer,
 } from "./lib/local-tile-source";
 import {
+  isDownloadProgressStale,
   readDownloadProgress,
   type DownloadProgressReadResult,
   type DownloadProgressSnapshot,
@@ -2183,11 +2184,7 @@ function DownloadProgressCard({
           progress.progressPercentSource === "derived"
         ? "estimado"
         : null;
-  const isStale =
-    progress.status === "running" &&
-    progress.updatedAtTimestamp !== null &&
-    checkedAt !== null &&
-    checkedAt - progress.updatedAtTimestamp > 20_000;
+  const isStale = isDownloadProgressStale(progress, checkedAt);
   const httpErrors = progress.httpErrors.filter(
     (item) => item.count > 0 && item.code !== "404",
   );

@@ -7,6 +7,7 @@ image_path="${backing_volume}/2b2t_map/2b2t_tiles.sparsebundle"
 map_volume="/Volumes/2b2t Tiles"
 output_dir="${map_volume}/2b2t_tiles"
 python_bin="${PYTHON_BIN:-$(command -v python3)}"
+lock_dir="${output_dir}/.download.lock"
 
 if [[ ! -d "${backing_volume}" ]]; then
   echo "La unidad LuisA no está montada en ${backing_volume}." >&2
@@ -29,6 +30,39 @@ if ! mount | grep -Fq " on ${map_volume} ("; then
 fi
 
 mkdir -p "${output_dir}"
+
+acquire_lock() {
+  local owner_pid=""
+  local stale_lock=""
+  local attempt=0
+
+  while (( attempt < 3 )); do
+    if mkdir "${lock_dir}" 2>/dev/null; then
+      printf '%s\n' "$$" >"${lock_dir}/pid"
+      return 0
+    fi
+
+    if [[ -f "${lock_dir}/pid" ]]; then
+      owner_pid=$(<"${lock_dir}/pid")
+    fi
+    if [[ "${owner_pid}" =~ ^[0-9]+$ ]] && kill -0 "${owner_pid}" 2>/dev/null; then
+      echo "Ya existe una descarga activa con PID ${owner_pid}." >&2
+      return 1
+    fi
+
+    stale_lock="${lock_dir}.stale.$$"
+    if mv "${lock_dir}" "${stale_lock}" 2>/dev/null; then
+      rm -f "${stale_lock}/pid"
+      rmdir "${stale_lock}" 2>/dev/null || true
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  echo "No se pudo adquirir el bloqueo de descarga: ${lock_dir}" >&2
+  return 1
+}
+
+acquire_lock
 
 echo "Descarga completa en ${output_dir}"
 echo "La barra se actualiza cada cinco segundos. Ctrl+C detiene de forma segura."

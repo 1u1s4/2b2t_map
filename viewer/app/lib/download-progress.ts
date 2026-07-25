@@ -55,6 +55,8 @@ export type DownloadProgressReadResult =
       readonly message: string;
     };
 
+const ACTIVE_PROGRESS_STATUSES = new Set(["running", "discovering"]);
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -210,6 +212,22 @@ export function parseDownloadProgress(
     reason: readShortString(value.reason, MAX_REASON_LENGTH),
     httpErrors: Object.freeze(readHttpErrors(value.http_errors)),
   });
+}
+
+export function isDownloadProgressStale(
+  progress: Pick<
+    DownloadProgressSnapshot,
+    "status" | "updatedAtTimestamp"
+  >,
+  checkedAt: number | null,
+  maximumAgeMilliseconds = 20_000,
+): boolean {
+  return (
+    ACTIVE_PROGRESS_STATUSES.has(progress.status) &&
+    progress.updatedAtTimestamp !== null &&
+    checkedAt !== null &&
+    checkedAt - progress.updatedAtTimestamp > maximumAgeMilliseconds
+  );
 }
 
 function errorName(error: unknown): string | null {

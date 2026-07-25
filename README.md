@@ -685,6 +685,32 @@ válidos. No desconectes `LuisA` mientras el proceso esté activo. Tras una para
 limpia, desmonta primero el contenedor con
 `hdiutil detach '/Volumes/2b2t Tiles'` y después expulsa la unidad física.
 
+### Supervisor conservador
+
+Para una descarga de varios meses puede mantenerse un segundo `screen` con
+`supervise_full_download_luisa.py`. El supervisor primero exige encontrar una
+única instancia activa y la adopta sin reiniciarla. Solo reanuda si ese mismo
+PID desaparece, tres sondeos separados confirman la ausencia y
+`progress.json` todavía dice `running` o `discovering`.
+
+Nunca reanuda `stopped`, `error`, `incomplete`, `preflight_blocked`,
+`protection`, HTTP 403/429, falta de espacio en el APFS o en `LuisA`, volumen
+desmontado, JSON inválido o cualquier finalización. Mientras permanece activo,
+limita los reinicios a tres por cada ventana de 24 horas y el lanzador usa un
+bloqueo atómico para impedir dos descargadores.
+
+```bash
+screen -dmS obsidian_atlas_watchdog /bin/zsh -lc \
+  "cd /Users/luisalvarado/Documents/GitHub/2b2t_map && \
+   exec python3 supervise_full_download_luisa.py"
+
+screen -r obsidian_atlas_watchdog
+```
+
+Salir del `screen` con `Ctrl+A`, `D` no detiene ni el supervisor ni la
+descarga. Detener deliberadamente el descargador deja estado `stopped`, por lo
+que el supervisor no lo vuelve a iniciar.
+
 ## Reanudación, integridad y progreso
 
 - Cada tile se transmite a un `.part` en el mismo directorio.

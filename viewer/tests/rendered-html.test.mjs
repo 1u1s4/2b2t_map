@@ -40,6 +40,14 @@ test("server-renders the Obsidian Atlas product shell and metadata", async () =>
     html,
     /<meta name="description" content="Explora el Overworld de 2b2t por coordenadas, combina capas y guarda highlights privados\."/i,
   );
+  assert.match(
+    html,
+    /<meta property="og:image" content="https:\/\/obsidian-atlas-2b2t\.mchinchimoran\.chatgpt\.site\/og\.png"/i,
+  );
+  assert.match(
+    html,
+    /<meta name="twitter:image" content="https:\/\/obsidian-atlas-2b2t\.mchinchimoran\.chatgpt\.site\/og\.png"/i,
+  );
   assert.match(html, /OBSIDIAN ATLAS/);
   assert.match(html, /2b2t · Overworld archive/);
   assert.match(

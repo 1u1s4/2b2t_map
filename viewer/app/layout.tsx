@@ -12,10 +12,17 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const title = "Obsidian Atlas — visor del Overworld de 2b2t";
+const description =
+  "Explora el Overworld de 2b2t por coordenadas, combina capas y guarda highlights privados.";
+const productionOrigin = new URL(
+  "https://obsidian-atlas-2b2t.mchinchimoran.chatgpt.site",
+);
+
 export const metadata: Metadata = {
-  title: "Obsidian Atlas — visor del Overworld de 2b2t",
-  description:
-    "Explora el Overworld de 2b2t por coordenadas, combina capas y guarda highlights privados.",
+  metadataBase: productionOrigin,
+  title,
+  description,
   applicationName: "Obsidian Atlas",
   keywords: ["2b2t", "Minecraft", "Overworld", "mapa", "coordenadas"],
   icons: {
@@ -24,9 +31,8 @@ export const metadata: Metadata = {
   openGraph: {
     type: "website",
     locale: "es_GT",
-    title: "Obsidian Atlas — visor del Overworld de 2b2t",
-    description:
-      "Explora el Overworld de 2b2t por coordenadas, combina capas y guarda highlights privados.",
+    title,
+    description,
     siteName: "Obsidian Atlas",
     images: [
       {
@@ -39,9 +45,8 @@ export const metadata: Metadata = {
   },
   twitter: {
     card: "summary_large_image",
-    title: "Obsidian Atlas — visor del Overworld de 2b2t",
-    description:
-      "Explora el Overworld de 2b2t por coordenadas, combina capas y guarda highlights privados.",
+    title,
+    description,
     images: ["/og.png"],
   },
 };
