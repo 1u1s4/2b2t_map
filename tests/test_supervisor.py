@@ -918,6 +918,187 @@ class LockTests(unittest.TestCase):
             self.assertEqual(supervisor.owner_pid(lock), 12345)
 
 
+class LauncherTests(unittest.TestCase):
+    def _identity(self) -> supervisor.ProcessIdentity:
+        return supervisor.ProcessIdentity(
+            pid=456,
+            started_at="Fri Jul 24 20:00:00 2026",
+            arguments="python download_all_2b2t.py --all",
+            headroom_percent=20,
+        )
+
+    def _launch(
+        self,
+        root: Path,
+        *,
+        startup_timeout: float = 10,
+    ) -> tuple[
+        supervisor.ProcessIdentity | None,
+        str | None,
+    ]:
+        output = root / "output"
+        output.mkdir(exist_ok=True)
+        return supervisor.launch_and_wait_for_download(
+            launcher=root / "run_full_download_luisa.sh",
+            project_dir=root,
+            output_dir=output,
+            script_path=root / "download_all_2b2t.py",
+            download_lock=output / ".download.lock",
+            environment={"SPACE_HEADROOM_PERCENT": "20"},
+            headroom_percent=20,
+            startup_timeout=startup_timeout,
+            poll_seconds=1,
+            stop_requested=lambda: False,
+            logger=mock.Mock(),
+        )
+
+    def test_contention_adopts_delayed_exact_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = self._identity()
+            child = mock.Mock()
+            child.poll.return_value = supervisor.LOCK_CONTENTION_EXIT_CODE
+            with (
+                mock.patch.object(
+                    supervisor.subprocess,
+                    "Popen",
+                    return_value=child,
+                ) as popen,
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    side_effect=[[], [identity.pid]],
+                ) as find_processes,
+                mock.patch.object(
+                    supervisor,
+                    "read_process_identity",
+                    return_value=identity,
+                ) as read_identity,
+                mock.patch.object(
+                    supervisor,
+                    "owner_pid",
+                    return_value=identity.pid,
+                ) as read_owner,
+                mock.patch.object(
+                    supervisor.time,
+                    "monotonic",
+                    side_effect=[0, 0, 1],
+                ),
+                mock.patch.object(supervisor.time, "sleep") as sleep,
+            ):
+                adopted, error = self._launch(root)
+
+            self.assertEqual(adopted, identity)
+            self.assertIsNone(error)
+            popen.assert_called_once()
+            self.assertEqual(find_processes.call_count, 2)
+            read_identity.assert_called_once_with(
+                identity.pid,
+                root / "download_all_2b2t.py",
+                root / "output",
+            )
+            read_owner.assert_called_once_with(
+                root / "output" / ".download.lock"
+            )
+            sleep.assert_called_once_with(1)
+
+    def test_contention_times_out_without_exact_lock_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = self._identity()
+            child = mock.Mock()
+            child.poll.return_value = supervisor.LOCK_CONTENTION_EXIT_CODE
+            with (
+                mock.patch.object(
+                    supervisor.subprocess,
+                    "Popen",
+                    return_value=child,
+                ) as popen,
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    return_value=[identity.pid],
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_process_identity",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "owner_pid",
+                    return_value=999,
+                ) as read_owner,
+                mock.patch.object(
+                    supervisor.time,
+                    "monotonic",
+                    side_effect=[0, 0, 1, 2],
+                ),
+                mock.patch.object(supervisor.time, "sleep") as sleep,
+            ):
+                adopted, error = self._launch(
+                    root,
+                    startup_timeout=2,
+                )
+
+            self.assertIsNone(adopted)
+            self.assertIsNotNone(error)
+            assert error is not None
+            self.assertIn("otro lanzador ganó el bloqueo", error)
+            self.assertIn(
+                f"salida={supervisor.LOCK_CONTENTION_EXIT_CODE}",
+                error,
+            )
+            popen.assert_called_once()
+            self.assertEqual(read_owner.call_count, 2)
+            self.assertEqual(sleep.call_count, 2)
+
+    def test_launcher_is_detached_and_logs_in_append_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            log_path = output / supervisor.LAUNCHER_LOG_NAME
+            log_path.write_text("registro anterior\n", encoding="utf-8")
+            child = mock.Mock()
+            child.poll.return_value = 1
+            with (
+                mock.patch.object(
+                    supervisor.subprocess,
+                    "Popen",
+                    return_value=child,
+                ) as popen,
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    supervisor.time,
+                    "monotonic",
+                    side_effect=[0, 0],
+                ),
+                mock.patch.object(supervisor.time, "sleep") as sleep,
+            ):
+                adopted, error = self._launch(root)
+
+            self.assertIsNone(adopted)
+            self.assertIsNotNone(error)
+            popen.assert_called_once()
+            kwargs = popen.call_args.kwargs
+            self.assertTrue(kwargs["start_new_session"])
+            self.assertIs(kwargs["stdin"], supervisor.subprocess.DEVNULL)
+            self.assertIs(kwargs["stderr"], supervisor.subprocess.STDOUT)
+            self.assertEqual(Path(kwargs["stdout"].name), log_path)
+            self.assertEqual(kwargs["stdout"].mode, "a")
+            self.assertTrue(kwargs["stdout"].closed)
+            self.assertEqual(
+                log_path.read_text(encoding="utf-8"),
+                "registro anterior\n",
+            )
+            sleep.assert_not_called()
+
+
 class TransitionJournalTests(unittest.TestCase):
     def test_prepared_journal_can_be_durably_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

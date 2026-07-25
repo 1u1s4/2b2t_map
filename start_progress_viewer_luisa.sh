@@ -172,7 +172,7 @@ acquire_lock_for_pid() {
 }
 
 acquire_lock() {
-  /usr/bin/lockf -t 10 "${lock_guard}" \
+  /usr/bin/lockf -k -t 10 "${lock_guard}" \
     "${project_dir}/start_progress_viewer_luisa.sh" --acquire-lock "$$"
 }
 

@@ -673,12 +673,12 @@ mapa completo se detenga si no cabe, en vez de declarar terminado un subconjunto
 
 ## Estado actual de la descarga y espacio
 
-Instantánea del **24 de julio de 2026 a las 21:02 UTC−6**:
+Instantánea del **24 de julio de 2026 a las 22:46 UTC−6**:
 
 - `LuisA` está montada y tiene 1,34 TiB libres;
 - un sparsebundle alojado en `LuisA` está montado como `/Volumes/2b2t Tiles`;
 - el contenedor usa APFS con bloques de 4 KiB, frente a los 128 KiB de ExFAT;
-- hay 100 389 tiles completos, 3 638 ausentes y 0 corruptos;
+- hay 109 174 tiles completos, 6 723 ausentes y 0 corruptos;
 - la sesión detached `obsidian_atlas_full` está activa;
 - el alcance solicitado es `overworld,nether,end × base,overlay,newchunks ×
   LOD 0..10`;
@@ -687,14 +687,17 @@ Instantánea del **24 de julio de 2026 a las 21:02 UTC−6**:
 - el preflight de 99 grupos aprobó temporalmente el alcance completo al 18 %;
   esto no se presenta como cumplimiento del requisito independiente del 20 %;
 - el proceso histórico sigue al 18 % mientras descarga; el cálculo estricto
-  para 20 % todavía tiene un faltante de 10,34 GiB en el volumen limitante;
+  para 20 % todavía tiene un faltante de 10,33 GiB en el volumen limitante;
 - `margin_upgrade.json` publica ese cálculo contra el APFS y contra `LuisA`;
   cuando ambos pasen la desigualdad estable, el supervisor migrará al 20 %;
 - la cola estimada contiene 17 157 504 solicitudes y publica su barra cada
-  cinco segundos; lleva 104 028 procesadas (0,606 %) y la velocidad observada
-  ronda 1,96 tiles/s;
+  cinco segundos; lleva 115 898 procesadas (0,675 %) y la velocidad observada
+  ronda 1,93 tiles/s, con unos 102 días de ETA al ritmo actual;
 - el watchdog automático final está activo y adoptó el mismo PID histórico sin
-  interrumpirlo.
+  interrumpirlo;
+- el agente de inicio de sesión está habilitado, pasó dos adopciones
+  idempotentes del PID actual y volverá a comprobar el stack cada cinco
+  minutos, al iniciar sesión y al montar un volumen.
 
 Los datos viven en:
 
@@ -724,7 +727,8 @@ df -h '/Volumes/2b2t Tiles' /Volumes/LuisA
 
 Para salir de `screen` sin detener la descarga, pulsa `Ctrl+A` y después `D`.
 Cuando no haya ningún descargador activo, el lanzador monta el contenedor y
-reanuda exactamente el alcance completo:
+solo reanuda automáticamente si el heartbeat previo aún es activo y no existe
+un freno terminal:
 
 ```bash
 cd /Users/luisalvarado/Documents/GitHub/2b2t_map
@@ -732,8 +736,11 @@ cd /Users/luisalvarado/Documents/GitHub/2b2t_map
 ```
 
 `--resume` devuelve a `pending` las filas interrumpidas y reutiliza los WebP
-válidos. No desconectes `LuisA` mientras el proceso esté activo. Tras una parada
-limpia, desmonta primero el contenedor con
+válidos. Una parada deliberada deja `status=stopped`; para retomarla de forma
+manual usa el `resume_command` exacto guardado en `progress.json`, después de
+confirmar que no existen `storage_stop.json`, protección 403/429 ni otro PID.
+No desconectes `LuisA` mientras el proceso esté activo. Tras una parada limpia,
+desmonta primero el contenedor con
 `hdiutil detach '/Volumes/2b2t Tiles'` y después expulsa la unidad física.
 
 ### Supervisor conservador
@@ -797,6 +804,61 @@ screen -r obsidian_atlas_watchdog
 Salir del `screen` con `Ctrl+A`, `D` no detiene ni el supervisor ni la
 descarga. Detener deliberadamente el descargador deja estado `stopped`, por lo
 que el supervisor no lo vuelve a iniciar.
+
+### Recuperación automática tras login o reinicio
+
+La máquina tiene instalado el LaunchAgent
+`com.luisalvarado.obsidian-atlas.assurer`. Se ejecuta al iniciar sesión, al
+montar un volumen y cada 300 segundos. La copia fuente del plist permanece
+deshabilitada por defecto para evitar una instalación accidental; en esta
+máquina `launchctl` mantiene una habilitación explícita.
+
+La intención durable vive, con permisos `0600`, en:
+
+```text
+/Users/luisalvarado/Library/Application Support/ObsidianAtlas/recovery_intent.json
+```
+
+Esa intención no guarda un comando libre. Liga el alcance completo, los UUID
+exactos de `LuisA` y del APFS, la ruta fija del sparsebundle, el hash de
+`estimate.json`, el piso temporal de `progress.json`, el PID/fecha/argumentos
+adoptados y la reserva exacta. Antes de lanzar vuelve a validar mounts, UUID,
+SQLite, espacio, journals y procesos. El coordinador:
+
+- adopta el descargador y supervisor existentes sin cambiar el PID;
+- puede adjuntar únicamente el sparsebundle fijo después de autenticar
+  `LuisA`;
+- permite hasta tres intentos durables en 24 horas;
+- recupera un stack perdido en el mismo boot solo si la intención ya lo había
+  adoptado y el progreso sigue siendo reanudable;
+- admite `stopped/interrumpido` automáticamente solo después de observar un
+  reinicio real;
+- nunca supera `storage_stop.json`, 403/429, protección, alcance/UUID/hash
+  incorrectos ni una base SQLite que falle `PRAGMA quick_check`;
+- delega cualquier `margin_transition.json` válido exclusivamente al
+  supervisor.
+
+El launcher posee bloqueos `lockf` antes y después de montar el APFS, además
+del lock por PID dentro de la salida. También vuelve a ejecutar el gate
+terminal antes de retirar un lock obsoleto y justo antes de iniciar Python.
+Las dependencias de Python 3.11 están fijadas en un directorio privado, y una
+prueba real bajo `launchd` verificó acceso al repositorio, ambos volúmenes,
+sparsebundle, progreso y SQLite antes de habilitar el agente.
+
+Para comprobarlo sin modificar el estado:
+
+```bash
+launchctl print \
+  gui/$(id -u)/com.luisalvarado.obsidian-atlas.assurer
+
+tail -n 80 \
+  '/Users/luisalvarado/Library/Logs/ObsidianAtlas/assurer.out.log'
+
+'/Users/luisalvarado/.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/bin/python3.11' \
+  '/Users/luisalvarado/Library/Application Support/ObsidianAtlas/bin/resume_after_login_luisa.py' \
+  --check-only \
+  --project-dir='/Users/luisalvarado/Documents/GitHub/2b2t_map'
+```
 
 ## Reanudación, integridad y progreso
 

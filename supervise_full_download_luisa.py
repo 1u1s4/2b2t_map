@@ -26,7 +26,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 ACTIVE_STATUSES = frozenset({"running", "discovering"})
@@ -73,6 +73,8 @@ FULL_MAP_LAYERS = frozenset({"base", "overlay", "newchunks"})
 FULL_MAP_LODS = frozenset(range(11))
 TEMPORARY_MIGRATION_HEADROOM_PERCENT = 18.0
 REQUIRED_HEADROOM_PERCENT = 20.0
+LOCK_CONTENTION_EXIT_CODE = getattr(os, "EX_TEMPFAIL", 75)
+LAUNCHER_LOG_NAME = "download-launcher.log"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1632,6 +1634,97 @@ def clear_stale_download_lock(lock_dir: Path, expected_pid: int) -> bool:
     return True
 
 
+def launch_and_wait_for_download(
+    *,
+    launcher: Path,
+    project_dir: Path,
+    output_dir: Path,
+    script_path: Path,
+    download_lock: Path,
+    environment: dict[str, str],
+    headroom_percent: float,
+    startup_timeout: float,
+    poll_seconds: float,
+    stop_requested: Callable[[], bool],
+    logger: logging.Logger,
+) -> tuple[ProcessIdentity | None, str | None]:
+    """Launch once and adopt the exact process, including a lock winner."""
+
+    launcher_log_path = output_dir / LAUNCHER_LOG_NAME
+    try:
+        with launcher_log_path.open(
+            "a",
+            encoding="utf-8",
+        ) as launcher_log:
+            child = subprocess.Popen(
+                [str(launcher)],
+                cwd=project_dir,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=launcher_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        return (
+            None,
+            f"no se pudo iniciar el lanzador o abrir su log: {exc}",
+        )
+
+    deadline = time.monotonic() + startup_timeout
+    launcher_returncode: int | None = None
+    contention_logged = False
+    while time.monotonic() < deadline and not stop_requested():
+        replacement = find_download_processes(script_path, output_dir)
+        if len(replacement) == 1:
+            identity = read_process_identity(
+                replacement[0],
+                script_path,
+                output_dir,
+            )
+            if (
+                identity is not None
+                and math.isclose(
+                    identity.headroom_percent,
+                    headroom_percent,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                and owner_pid(download_lock) == identity.pid
+            ):
+                return identity, None
+        if len(replacement) > 1:
+            return None, "el lanzador creó varias instancias"
+
+        if launcher_returncode is None:
+            launcher_returncode = child.poll()
+        if launcher_returncode is not None:
+            if launcher_returncode != LOCK_CONTENTION_EXIT_CODE:
+                break
+            if not contention_logged:
+                logger.info(
+                    "Otro lanzador ganó el bloqueo de ejecución; se "
+                    "observará su instancia durante el timeout de arranque."
+                )
+                contention_logged = True
+        time.sleep(min(5.0, poll_seconds))
+
+    if launcher_returncode is None:
+        launcher_returncode = child.poll()
+    if launcher_returncode == LOCK_CONTENTION_EXIT_CODE:
+        return (
+            None,
+            "otro lanzador ganó el bloqueo, pero no produjo una única "
+            f"instancia exacta en {startup_timeout:.0f}s "
+            f"(salida={launcher_returncode})",
+        )
+    return (
+        None,
+        "el lanzador no produjo una única instancia "
+        f"en {startup_timeout:.0f}s (salida={launcher_returncode})",
+    )
+
+
 def acquire_supervisor_lock() -> Any:
     path = Path(tempfile.gettempdir()) / "obsidian-atlas-full-supervisor.lock"
     handle = path.open("a+", encoding="ascii")
@@ -1805,40 +1898,18 @@ def run(argv: Sequence[str] | None = None) -> int:
                 "se alcanzó el límite de reinicios antes de invocar "
                 "el lanzador",
             )
-        child = subprocess.Popen(
-            [str(launcher)],
-            cwd=project_dir,
-            env=environment,
-        )
-        deadline = time.monotonic() + args.startup_timeout
-        while time.monotonic() < deadline and not stop_requested:
-            replacement = find_download_processes(script_path, output_dir)
-            if len(replacement) == 1:
-                identity = read_process_identity(
-                    replacement[0],
-                    script_path,
-                    output_dir,
-                )
-                if (
-                    identity is not None
-                    and math.isclose(
-                        identity.headroom_percent,
-                        headroom_percent,
-                        rel_tol=0.0,
-                        abs_tol=1e-9,
-                    )
-                    and owner_pid(download_lock) == identity.pid
-                ):
-                    return identity, None
-            if len(replacement) > 1:
-                return None, "el lanzador creó varias instancias"
-            if child.poll() is not None:
-                break
-            time.sleep(min(5.0, args.poll_seconds))
-        return (
-            None,
-            "el lanzador no produjo una única instancia "
-            f"en {args.startup_timeout:.0f}s (salida={child.poll()})",
+        return launch_and_wait_for_download(
+            launcher=launcher,
+            project_dir=project_dir,
+            output_dir=output_dir,
+            script_path=script_path,
+            download_lock=download_lock,
+            environment=environment,
+            headroom_percent=headroom_percent,
+            startup_timeout=args.startup_timeout,
+            poll_seconds=args.poll_seconds,
+            stop_requested=lambda: stop_requested,
+            logger=logger,
         )
 
     def wait_for_clean_planned_stop(
