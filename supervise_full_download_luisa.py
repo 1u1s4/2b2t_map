@@ -219,6 +219,14 @@ def safety_signal(observation: ProgressObservation) -> str | None:
         return "progress.json registra HTTP 403"
     if observation.http_errors.get("429", 0) > 0:
         return "progress.json registra HTTP 429"
+    return current_safety_signal(observation)
+
+
+def current_safety_signal(
+    observation: ProgressObservation,
+) -> str | None:
+    """Return a present-tense safety reason, ignoring cumulative HTTP rows."""
+
     text = (observation.reason or "").casefold()
     for term in SAFETY_TERMS:
         if term in text:
@@ -238,7 +246,7 @@ def healthy_active_heartbeat(
         and observation.status in ACTIVE_STATUSES
         and observation.age_seconds is not None
         and observation.age_seconds <= maximum_age_seconds
-        and safety_signal(observation) is None
+        and current_safety_signal(observation) is None
     )
 
 
@@ -2233,7 +2241,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     )
                     storage_stop_checks = 0
             if progress_is_new:
-                signal_reason = safety_signal(progress)
+                signal_reason = current_safety_signal(progress)
                 if signal_reason:
                     return signal_reason
                 if healthy_active_heartbeat(
@@ -2371,7 +2379,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                     storage_stop_checks = 0
                     storage_gate_is_safe = False
             if progress_is_new:
-                signal_reason = safety_signal(progress)
+                signal_reason = current_safety_signal(progress)
                 if signal_reason:
                     return signal_reason
                 heartbeat_is_healthy = healthy_active_heartbeat(

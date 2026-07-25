@@ -90,11 +90,17 @@ class RestartDecisionTests(unittest.TestCase):
                 maximum_age_seconds=30,
             )
         )
-        for unsafe in (
-            observation("running", errors={"403": 1}),
-            observation("running", errors={"429": 1}),
-            observation("running", reason="protection HTTP"),
-        ):
+        historical_errors = supervisor.dataclasses.replace(
+            observation("running", errors={"403": 1, "429": 1}),
+            age_seconds=1,
+        )
+        self.assertTrue(
+            supervisor.healthy_active_heartbeat(
+                historical_errors,
+                maximum_age_seconds=30,
+            )
+        )
+        for unsafe in (observation("running", reason="protection HTTP"),):
             with self.subTest(unsafe=unsafe):
                 self.assertFalse(
                     supervisor.healthy_active_heartbeat(
@@ -1569,7 +1575,7 @@ class StorageStopRunTests(unittest.TestCase):
             self.assertEqual(latch.phase, "committed")
             self.assertTrue(transition_path.exists())
 
-    def test_safe_margin_does_not_adopt_http_protected_replacement(
+    def test_safe_margin_does_not_adopt_current_http_protection(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1603,7 +1609,10 @@ class StorageStopRunTests(unittest.TestCase):
                 json.dumps(
                     {
                         "status": "running",
-                        "reason": None,
+                        "reason": (
+                            "cinco respuestas HTTP 429 consecutivas; "
+                            "descarga detenida"
+                        ),
                         "http_errors": {"429": 1},
                     }
                 ),
