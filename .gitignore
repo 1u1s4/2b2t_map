@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+
+# Descargas y estado de ejecución
+2b2t_tiles/
+*.sqlite3-wal
+*.sqlite3-shm
+*.part
+*.corrupt.*
+overworld_background.log
+
+# Mosaicos grandes generados localmente
+mosaics/
