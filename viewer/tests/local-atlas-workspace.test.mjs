@@ -26,6 +26,7 @@ import {
   createExplorationState,
   serializeExplorationState,
   withCellReviewed,
+  withCellSkipped,
   withCurrentIndex,
 } from "../app/lib/exploration-grid.ts";
 import { createCoverageSelection } from "../app/lib/overworld-coverage.ts";
@@ -54,6 +55,7 @@ function explorationState(id = "region-a") {
   state = withCurrentIndex(state, 3);
   state = withCellReviewed(state, 0);
   state = withCellReviewed(state, 3);
+  state = withCellSkipped(state, 1);
   return JSON.parse(serializeExplorationState(state));
 }
 
@@ -120,6 +122,7 @@ test("workspace parser canonicalizes nested state, coverage, and highlights", ()
   const parsed = parseAtlasWorkspaceContent(content());
   assert.equal(parsed.explorations.length, 1);
   assert.equal(parsed.explorations[0].state.reviewedCount, 2);
+  assert.equal(parsed.explorations[0].state.skippedCount, 1);
   assert.equal(parsed.highlights[0].color, "#ff5f57");
   assert.equal(parsed.coverageSelection?.cellCount, 6);
 

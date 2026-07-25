@@ -3,21 +3,32 @@ import test from "node:test";
 
 import {
   MAX_EXPLORATION_CELLS,
+  MAX_SERIALIZED_EXPLORATION_CHARS,
+  MAX_DETAIL_EXPLORATION_LOD,
+  MAX_DETAIL_EXPLORATION_SCALE,
+  MAX_VISIBLE_EXPLORATION_COLUMNS,
+  MAX_VISIBLE_EXPLORATION_ROWS,
   cardinalNeighbor,
+  clampCameraToExploration,
   cellForIndex,
   cellIndexAtSerpentinePosition,
   cellIndexAtWorld,
   createExplorationRegion,
   createExplorationState,
+  createMaxDetailExplorationState,
   deserializeExplorationState,
   isCellReviewed,
+  isCellSkipped,
   moveCurrentCardinal,
   moveCurrentSerpentine,
+  minimumSafeExplorationScale,
   serpentineNeighbor,
   serpentinePositionForCellIndex,
   serializeExplorationState,
   withCellReviewed,
+  withCellSkipped,
   withCurrentCellReviewed,
+  withCurrentCellSkipped,
   withCurrentIndex,
   worldBlockToExplorationTile,
 } from "../app/lib/exploration-grid.ts";
@@ -103,6 +114,87 @@ test("exposes exact half-open cell bounds and tile coordinates", () => {
   assert.throws(() => cellForIndex(grid, 12), /fuera de rango/);
 });
 
+test("new explorations always use canonical LOD0 maximum detail", () => {
+  const state = createMaxDetailExplorationState({
+    id: "maximum-detail",
+    name: "Máximo detalle",
+    bounds: {
+      minX: -1,
+      minZ: -1,
+      maxXExclusive: 513,
+      maxZExclusive: 513,
+    },
+    // Runtime callers cannot override the canonical workflow accidentally,
+    // even if an untyped legacy object still includes these properties.
+    lod: 3,
+    scale: 1 / 8,
+  });
+
+  assert.equal(MAX_DETAIL_EXPLORATION_LOD, 0);
+  assert.equal(MAX_DETAIL_EXPLORATION_SCALE, 1);
+  assert.equal(state.region.lod, 0);
+  assert.equal(state.region.scale, 1);
+  assert.equal(state.region.tileSpan, 512);
+  assert.deepEqual(state.region.bounds, {
+    minX: -512,
+    minZ: -512,
+    maxXExclusive: 1024,
+    maxZExclusive: 1024,
+  });
+});
+
+test("exact-detail viewport keeps the visible tile budget bounded", () => {
+  const viewport = { width: 1_440, height: 900 };
+  const scale = minimumSafeExplorationScale(512, viewport);
+
+  assert.ok(
+    viewport.width / (512 * scale) <= MAX_VISIBLE_EXPLORATION_COLUMNS,
+  );
+  assert.ok(
+    viewport.height / (512 * scale) <= MAX_VISIBLE_EXPLORATION_ROWS,
+  );
+  assert.throws(
+    () => minimumSafeExplorationScale(0, viewport),
+    /must be positive/,
+  );
+});
+
+test("exploration camera stays inside the selected region with one-cell context", () => {
+  const bounds = {
+    minX: -1024,
+    minZ: -512,
+    maxXExclusive: 2048,
+    maxZExclusive: 1536,
+  };
+  const viewport = { width: 1024, height: 512 };
+
+  assert.deepEqual(
+    clampCameraToExploration(
+      { x: -1_000_000, z: 1_000_000 },
+      bounds,
+      512,
+      1,
+      viewport,
+    ),
+    { x: -1024, z: 1792 },
+  );
+  assert.deepEqual(
+    clampCameraToExploration(
+      { x: 99_999, z: -99_999 },
+      {
+        minX: 0,
+        minZ: 0,
+        maxXExclusive: 512,
+        maxZExclusive: 512,
+      },
+      512,
+      0.25,
+      viewport,
+    ),
+    { x: 256, z: 256 },
+  );
+});
+
 test("rejects invalid LOD/scale pairs and oversized regions before allocation", () => {
   assert.throws(
     () => region({ lod: 2, scale: 1 }),
@@ -146,6 +238,41 @@ test("cardinal navigation respects every edge", () => {
   state = moveCurrentCardinal(state, "south");
   assert.equal(state.currentIndex, 4);
   assert.equal(moveCurrentCardinal(state, "south"), state);
+});
+
+test("maximum-detail navigation moves one 512-block tile in every direction", () => {
+  const initial = createMaxDetailExplorationState({
+    id: "cardinal-lod0",
+    name: "Ruta cardinal LOD0",
+    bounds: {
+      minX: 0,
+      minZ: 0,
+      maxXExclusive: 3 * 512,
+      maxZExclusive: 3 * 512,
+    },
+  });
+  let state = withCurrentIndex(initial, 4);
+  const route = [
+    ["north", 1, 512, 0],
+    ["east", 2, 1024, 0],
+    ["south", 5, 1024, 512],
+    ["west", 4, 512, 512],
+  ];
+
+  for (const [direction, expectedIndex, expectedX, expectedZ] of route) {
+    state = moveCurrentCardinal(state, direction);
+    const cell = cellForIndex(state.region, state.currentIndex);
+    assert.equal(state.currentIndex, expectedIndex);
+    assert.equal(cell.bounds.minX, expectedX);
+    assert.equal(cell.bounds.minZ, expectedZ);
+  }
+
+  const topLeft = withCurrentIndex(state, 0);
+  assert.equal(moveCurrentCardinal(topLeft, "north"), topLeft);
+  assert.equal(moveCurrentCardinal(topLeft, "west"), topLeft);
+  const bottomRight = withCurrentIndex(state, 8);
+  assert.equal(moveCurrentCardinal(bottomRight, "south"), bottomRight);
+  assert.equal(moveCurrentCardinal(bottomRight, "east"), bottomRight);
 });
 
 test("next and previous follow a reversible serpentine route", () => {
@@ -209,12 +336,42 @@ test("reviewed cells use an immutable compact bitset and stable count", () => {
   assert.equal(isCellReviewed(reviewedCurrent, 5), true);
 });
 
+test("confirmed no-data cells use a separate durable bitset", () => {
+  const initial = createExplorationState(region());
+  const skipped = withCellSkipped(initial, 5);
+
+  assert.equal(initial.skipped.byteLength, 2);
+  assert.equal(initial.skippedCount, 0);
+  assert.equal(isCellSkipped(skipped, 5), true);
+  assert.equal(skipped.skippedCount, 1);
+  assert.equal(isCellReviewed(skipped, 5), false);
+
+  const reviewedInstead = withCellReviewed(skipped, 5);
+  assert.equal(isCellReviewed(reviewedInstead, 5), true);
+  assert.equal(isCellSkipped(reviewedInstead, 5), false);
+  assert.equal(reviewedInstead.reviewedCount, 1);
+  assert.equal(reviewedInstead.skippedCount, 0);
+
+  const skippedInstead = withCurrentCellSkipped(
+    withCurrentIndex(reviewedInstead, 5),
+  );
+  assert.equal(isCellReviewed(skippedInstead, 5), false);
+  assert.equal(isCellSkipped(skippedInstead, 5), true);
+  assert.equal(skippedInstead.reviewedCount, 0);
+  assert.equal(skippedInstead.skippedCount, 1);
+
+  const restored = withCurrentCellSkipped(skippedInstead, false);
+  assert.equal(isCellSkipped(restored, 5), false);
+  assert.equal(restored.skippedCount, 0);
+});
+
 test("serialization round-trips region, fixed scale, cursor, and bitset", () => {
   let state = createExplorationState(region());
   state = withCurrentIndex(state, 7);
   state = withCellReviewed(state, 0);
   state = withCellReviewed(state, 7);
   state = withCellReviewed(state, 11);
+  state = withCellSkipped(state, 5);
 
   const serialized = serializeExplorationState(state);
   const restored = deserializeExplorationState(serialized);
@@ -222,8 +379,35 @@ test("serialization round-trips region, fixed scale, cursor, and bitset", () => 
   assert.deepEqual(restored.region, state.region);
   assert.equal(restored.currentIndex, 7);
   assert.equal(restored.reviewedCount, 3);
+  assert.equal(restored.skippedCount, 1);
   assert.deepEqual(restored.reviewed, state.reviewed);
+  assert.deepEqual(restored.skipped, state.skipped);
   assert.equal(serializeExplorationState(restored), serialized);
+});
+
+test("deserialization preserves legacy coarser-LOD sessions", () => {
+  let state = createExplorationState(
+    region({
+      id: "legacy-lod3",
+      lod: 3,
+      scale: 1 / 8,
+    }),
+  );
+  state = withCurrentIndex(state, 1);
+  state = withCurrentCellReviewed(state);
+
+  const legacyPayload = JSON.parse(serializeExplorationState(state));
+  delete legacyPayload.skippedCount;
+  delete legacyPayload.skippedBits;
+  const restored = deserializeExplorationState(JSON.stringify(legacyPayload));
+
+  assert.equal(restored.region.lod, 3);
+  assert.equal(restored.region.scale, 1 / 8);
+  assert.equal(restored.region.tileSpan, 4_096);
+  assert.equal(restored.currentIndex, 1);
+  assert.equal(restored.reviewedCount, 1);
+  assert.equal(restored.skippedCount, 0);
+  assert.equal(isCellReviewed(restored, 1), true);
 });
 
 test("deserialization rejects tampering, noncanonical bounds, and unsafe input", () => {
@@ -254,9 +438,20 @@ test("deserialization rejects tampering, noncanonical bounds, and unsafe input",
     /bits fuera de la región/,
   );
 
+  const overlappingBits = structuredClone(payload);
+  overlappingBits.skippedBits = overlappingBits.reviewedBits;
+  overlappingBits.skippedCount = overlappingBits.reviewedCount;
+  assert.throws(
+    () => deserializeExplorationState(JSON.stringify(overlappingBits)),
+    /revisada y sin datos/,
+  );
+
   assert.throws(() => deserializeExplorationState("{broken"), /JSON válido/);
   assert.throws(
-    () => deserializeExplorationState("x".repeat(1_000_001)),
+    () =>
+      deserializeExplorationState(
+        "x".repeat(MAX_SERIALIZED_EXPLORATION_CHARS + 1),
+      ),
     /tamaño inválido/,
   );
 });

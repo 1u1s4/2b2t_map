@@ -9,6 +9,13 @@ export const EXPLORATION_DIMENSION = "overworld" as const;
 export const MIN_EXPLORATION_LOD = 0;
 export const MAX_EXPLORATION_LOD = 10;
 export const TILE_SIZE_PIXELS = 512;
+/** Canonical source resolution for every newly-created exploration. */
+export const MAX_DETAIL_EXPLORATION_LOD = 0 as const;
+/** One world block per rendered pixel while inspecting an LOD-0 tile. */
+export const MAX_DETAIL_EXPLORATION_SCALE = 1 as const;
+/** Rendering budget while an exact-detail session is active. */
+export const MAX_VISIBLE_EXPLORATION_COLUMNS = 8;
+export const MAX_VISIBLE_EXPLORATION_ROWS = 6;
 export const WORLD_MIN_BLOCK = -30_000_000;
 export const WORLD_MAX_BLOCK_EXCLUSIVE = 30_000_000;
 export const MIN_EXPLORATION_SCALE = 1 / 1_500;
@@ -20,7 +27,7 @@ export const MAX_EXPLORATION_SCALE = 8;
  * storage and JSON parsing limits.
  */
 export const MAX_EXPLORATION_CELLS = 4_000_000;
-export const MAX_SERIALIZED_EXPLORATION_CHARS = 1_000_000;
+export const MAX_SERIALIZED_EXPLORATION_CHARS = 2_000_000;
 
 const MAX_REGION_ID_LENGTH = 100;
 const MAX_REGION_NAME_LENGTH = 200;
@@ -37,6 +44,82 @@ export interface WorldBounds {
   readonly maxZExclusive: number;
 }
 
+export interface ExplorationViewport {
+  readonly width: number;
+  readonly height: number;
+}
+
+export interface ExplorationCamera {
+  readonly x: number;
+  readonly z: number;
+}
+
+/**
+ * Keeps the exact LOD tile loop bounded even when the user zooms out. The
+ * renderer adds a one-tile margin around this viewport, so 8×6 also remains
+ * below the in-memory tile-cache budget with all three layers visible.
+ */
+export function minimumSafeExplorationScale(
+  tileSpan: number,
+  viewport: ExplorationViewport,
+): number {
+  if (
+    !Number.isFinite(tileSpan) ||
+    tileSpan <= 0 ||
+    !Number.isFinite(viewport.width) ||
+    viewport.width <= 0 ||
+    !Number.isFinite(viewport.height) ||
+    viewport.height <= 0
+  ) {
+    throw new RangeError("Tile span and viewport must be positive");
+  }
+  return Math.max(
+    MIN_EXPLORATION_SCALE,
+    viewport.width / (tileSpan * MAX_VISIBLE_EXPLORATION_COLUMNS),
+    viewport.height / (tileSpan * MAX_VISIBLE_EXPLORATION_ROWS),
+  );
+}
+
+/**
+ * Keeps the visible viewport within the selected region plus one neighboring
+ * cell of context. If the viewport is larger than an axis, that axis is
+ * centered instead of producing an invalid clamp interval.
+ */
+export function clampCameraToExploration(
+  camera: ExplorationCamera,
+  bounds: WorldBounds,
+  tileSpan: number,
+  scale: number,
+  viewport: ExplorationViewport,
+): ExplorationCamera {
+  if (!Number.isFinite(scale) || scale <= 0) {
+    throw new RangeError("Scale must be positive");
+  }
+  const halfWidth = viewport.width / (2 * scale);
+  const halfHeight = viewport.height / (2 * scale);
+  const outerMinX = bounds.minX - tileSpan;
+  const outerMaxX = bounds.maxXExclusive + tileSpan;
+  const outerMinZ = bounds.minZ - tileSpan;
+  const outerMaxZ = bounds.maxZExclusive + tileSpan;
+
+  const clampAxis = (
+    value: number,
+    outerMinimum: number,
+    outerMaximum: number,
+    halfExtent: number,
+  ) => {
+    const minimum = outerMinimum + halfExtent;
+    const maximum = outerMaximum - halfExtent;
+    if (minimum > maximum) return (outerMinimum + outerMaximum) / 2;
+    return Math.min(maximum, Math.max(minimum, value));
+  };
+
+  return {
+    x: clampAxis(camera.x, outerMinX, outerMaxX, halfWidth),
+    z: clampAxis(camera.z, outerMinZ, outerMaxZ, halfHeight),
+  };
+}
+
 export interface ExplorationRegionInput {
   readonly id: string;
   readonly name: string;
@@ -48,6 +131,11 @@ export interface ExplorationRegionInput {
   /** Exact map scale to restore and hold while this region is active. */
   readonly scale: number;
 }
+
+export type MaxDetailExplorationInput = Pick<
+  ExplorationRegionInput,
+  "id" | "name" | "bounds"
+>;
 
 export interface ExplorationRegion {
   readonly version: typeof EXPLORATION_GRID_VERSION;
@@ -86,6 +174,9 @@ export interface ExplorationState {
    */
   readonly reviewed: Uint8Array;
   readonly reviewedCount: number;
+  /** Confirmed source absences, kept separate from human review progress. */
+  readonly skipped: Uint8Array;
+  readonly skippedCount: number;
 }
 
 type SerializedExplorationState = {
@@ -101,6 +192,9 @@ type SerializedExplorationState = {
   readonly currentIndex: number;
   readonly reviewedCount: number;
   readonly reviewedBits: string;
+  /** Optional only so version-1 exports from earlier builds remain readable. */
+  readonly skippedCount?: number;
+  readonly skippedBits?: string;
 };
 
 export class ExplorationGridError extends Error {
@@ -295,7 +389,7 @@ export function createExplorationRegion(
   const cellCount = columns * rows;
   if (cellCount > MAX_EXPLORATION_CELLS) {
     fail(
-      `La región contiene ${cellCount.toLocaleString("en-US")} celdas; el máximo seguro es ${MAX_EXPLORATION_CELLS.toLocaleString("en-US")}. Divide la región o usa un LOD mayor.`,
+      `La región contiene ${cellCount.toLocaleString("en-US")} celdas; el máximo seguro es ${MAX_EXPLORATION_CELLS.toLocaleString("en-US")}. Divide la región en selecciones más pequeñas.`,
       "TOO_MANY_CELLS",
     );
   }
@@ -446,7 +540,7 @@ export function serpentineNeighbor(
   return cellIndexAtSerpentinePosition(region, nextPosition);
 }
 
-function reviewedByteLength(cellCount: number): number {
+function cellBitsetByteLength(cellCount: number): number {
   return Math.ceil(cellCount / 8);
 }
 
@@ -467,26 +561,27 @@ function popcountByte(value: number): number {
   return count;
 }
 
-function countReviewedBits(bits: Uint8Array): number {
+function countCellBits(bits: Uint8Array): number {
   let count = 0;
   for (const value of bits) count += popcountByte(value);
   return count;
 }
 
-function assertCanonicalReviewedBits(
+function assertCanonicalCellBits(
   region: ExplorationRegion,
   bits: Uint8Array,
+  label: string,
 ): void {
-  const expectedBytes = reviewedByteLength(region.cellCount);
+  const expectedBytes = cellBitsetByteLength(region.cellCount);
   if (!(bits instanceof Uint8Array) || bits.byteLength !== expectedBytes) {
-    fail("El bitset revisado tiene un tamaño incompatible", "INVALID_STATE");
+    fail(`El bitset ${label} tiene un tamaño incompatible`, "INVALID_STATE");
   }
   const remainder = region.cellCount % 8;
   if (remainder !== 0 && bits.byteLength > 0) {
     const allowedMask = (1 << remainder) - 1;
     if ((bits[bits.byteLength - 1] & ~allowedMask) !== 0) {
       fail(
-        "El bitset contiene bits fuera de la región",
+        `El bitset ${label} contiene bits fuera de la región`,
         "INVALID_STATE",
       );
     }
@@ -501,8 +596,28 @@ export function createExplorationState(
   return Object.freeze({
     region,
     currentIndex: 0,
-    reviewed: new Uint8Array(reviewedByteLength(region.cellCount)),
+    reviewed: new Uint8Array(cellBitsetByteLength(region.cellCount)),
     reviewedCount: 0,
+    skipped: new Uint8Array(cellBitsetByteLength(region.cellCount)),
+    skippedCount: 0,
+  });
+}
+
+/**
+ * Create a new exploration at the only resolution used by the current
+ * source-to-local workflow. The generic constructors and deserializer remain
+ * intentionally LOD-aware so existing workspaces from older versions can
+ * still be restored without changing their meaning.
+ */
+export function createMaxDetailExplorationState(
+  input: MaxDetailExplorationInput,
+): ExplorationState {
+  return createExplorationState({
+    id: input.id,
+    name: input.name,
+    bounds: input.bounds,
+    lod: MAX_DETAIL_EXPLORATION_LOD,
+    scale: MAX_DETAIL_EXPLORATION_SCALE,
   });
 }
 
@@ -511,9 +626,19 @@ export function isCellReviewed(
   index: number,
 ): boolean {
   assertCellIndex(state.region, index);
-  assertCanonicalReviewedBits(state.region, state.reviewed);
+  assertCanonicalCellBits(state.region, state.reviewed, "revisado");
   const location = bitLocation(index);
   return (state.reviewed[location.byte] & location.mask) !== 0;
+}
+
+export function isCellSkipped(
+  state: ExplorationState,
+  index: number,
+): boolean {
+  assertCellIndex(state.region, index);
+  assertCanonicalCellBits(state.region, state.skipped, "sin datos");
+  const location = bitLocation(index);
+  return (state.skipped[location.byte] & location.mask) !== 0;
 }
 
 export function withCellReviewed(
@@ -529,8 +654,12 @@ export function withCellReviewed(
   if (currentlyReviewed === reviewed) return state;
 
   const nextBits = state.reviewed.slice();
+  const nextSkipped = state.skipped.slice();
+  const currentlySkipped =
+    (state.skipped[location.byte] & location.mask) !== 0;
   if (reviewed) {
     nextBits[location.byte] |= location.mask;
+    if (currentlySkipped) nextSkipped[location.byte] &= ~location.mask;
   } else {
     nextBits[location.byte] &= ~location.mask;
   }
@@ -538,6 +667,9 @@ export function withCellReviewed(
     ...state,
     reviewed: nextBits,
     reviewedCount: state.reviewedCount + (reviewed ? 1 : -1),
+    skipped: nextSkipped,
+    skippedCount:
+      state.skippedCount - (reviewed && currentlySkipped ? 1 : 0),
   });
 }
 
@@ -546,6 +678,45 @@ export function withCurrentCellReviewed(
   reviewed = true,
 ): ExplorationState {
   return withCellReviewed(state, state.currentIndex, reviewed);
+}
+
+export function withCellSkipped(
+  state: ExplorationState,
+  index: number,
+  skipped = true,
+): ExplorationState {
+  assertExplorationState(state);
+  assertCellIndex(state.region, index);
+  const location = bitLocation(index);
+  const currentlySkipped =
+    (state.skipped[location.byte] & location.mask) !== 0;
+  if (currentlySkipped === skipped) return state;
+
+  const nextSkipped = state.skipped.slice();
+  const nextReviewed = state.reviewed.slice();
+  const currentlyReviewed =
+    (state.reviewed[location.byte] & location.mask) !== 0;
+  if (skipped) {
+    nextSkipped[location.byte] |= location.mask;
+    if (currentlyReviewed) nextReviewed[location.byte] &= ~location.mask;
+  } else {
+    nextSkipped[location.byte] &= ~location.mask;
+  }
+  return Object.freeze({
+    ...state,
+    reviewed: nextReviewed,
+    reviewedCount:
+      state.reviewedCount - (skipped && currentlyReviewed ? 1 : 0),
+    skipped: nextSkipped,
+    skippedCount: state.skippedCount + (skipped ? 1 : -1),
+  });
+}
+
+export function withCurrentCellSkipped(
+  state: ExplorationState,
+  skipped = true,
+): ExplorationState {
+  return withCellSkipped(state, state.currentIndex, skipped);
 }
 
 export function withCurrentIndex(
@@ -624,14 +795,31 @@ function assertExplorationState(state: ExplorationState): void {
   }
   const region = validateCanonicalRegion(state.region);
   assertCellIndex(region, state.currentIndex);
-  assertCanonicalReviewedBits(region, state.reviewed);
+  assertCanonicalCellBits(region, state.reviewed, "revisado");
+  assertCanonicalCellBits(region, state.skipped, "sin datos");
   if (
     !Number.isSafeInteger(state.reviewedCount) ||
     state.reviewedCount < 0 ||
     state.reviewedCount > region.cellCount ||
-    countReviewedBits(state.reviewed) !== state.reviewedCount
+    countCellBits(state.reviewed) !== state.reviewedCount
   ) {
     fail("El contador de celdas revisadas no coincide", "INVALID_STATE");
+  }
+  if (
+    !Number.isSafeInteger(state.skippedCount) ||
+    state.skippedCount < 0 ||
+    state.skippedCount > region.cellCount ||
+    countCellBits(state.skipped) !== state.skippedCount
+  ) {
+    fail("El contador de celdas sin datos no coincide", "INVALID_STATE");
+  }
+  for (let index = 0; index < state.reviewed.length; index += 1) {
+    if ((state.reviewed[index] & state.skipped[index]) !== 0) {
+      fail(
+        "Una celda no puede estar revisada y sin datos a la vez",
+        "INVALID_STATE",
+      );
+    }
   }
 }
 
@@ -708,6 +896,8 @@ export function serializeExplorationState(state: ExplorationState): string {
     currentIndex: state.currentIndex,
     reviewedCount: state.reviewedCount,
     reviewedBits: encodeBase64Url(state.reviewed),
+    skippedCount: state.skippedCount,
+    skippedBits: encodeBase64Url(state.skipped),
   };
   const serialized = JSON.stringify(payload);
   if (serialized.length > MAX_SERIALIZED_EXPLORATION_CHARS) {
@@ -771,6 +961,9 @@ export function deserializeExplorationState(
   }
   const currentIndex = value.currentIndex;
   const serializedReviewedCount = value.reviewedCount;
+  const hasSkippedState =
+    value.skippedCount !== undefined || value.skippedBits !== undefined;
+  const serializedSkippedCount = hasSkippedState ? value.skippedCount : 0;
   if (
     typeof currentIndex !== "number" ||
     !Number.isSafeInteger(currentIndex) ||
@@ -780,26 +973,53 @@ export function deserializeExplorationState(
     !Number.isSafeInteger(serializedReviewedCount) ||
     serializedReviewedCount < 0 ||
     serializedReviewedCount > region.cellCount ||
-    typeof value.reviewedBits !== "string"
+    typeof value.reviewedBits !== "string" ||
+    typeof serializedSkippedCount !== "number" ||
+    !Number.isSafeInteger(serializedSkippedCount) ||
+    serializedSkippedCount < 0 ||
+    serializedSkippedCount > region.cellCount ||
+    (hasSkippedState && typeof value.skippedBits !== "string")
   ) {
     fail("Índice o contador exportado fuera de rango", "INVALID_SERIALIZATION");
   }
 
   const reviewed = decodeBase64Url(
     value.reviewedBits,
-    reviewedByteLength(region.cellCount),
+    cellBitsetByteLength(region.cellCount),
   );
+  const skipped = hasSkippedState
+    ? decodeBase64Url(
+        value.skippedBits as string,
+        cellBitsetByteLength(region.cellCount),
+      )
+    : new Uint8Array(cellBitsetByteLength(region.cellCount));
   try {
-    assertCanonicalReviewedBits(region, reviewed);
+    assertCanonicalCellBits(region, reviewed, "revisado");
+    assertCanonicalCellBits(region, skipped, "sin datos");
   } catch (error) {
     if (error instanceof ExplorationGridError) {
       throw new ExplorationGridError(error.message, "INVALID_SERIALIZATION");
     }
     throw error;
   }
-  const reviewedCount = countReviewedBits(reviewed);
+  const reviewedCount = countCellBits(reviewed);
   if (reviewedCount !== serializedReviewedCount) {
     fail("El contador exportado no coincide con el bitset", "INVALID_SERIALIZATION");
+  }
+  const skippedCount = countCellBits(skipped);
+  if (skippedCount !== serializedSkippedCount) {
+    fail(
+      "El contador sin datos exportado no coincide con el bitset",
+      "INVALID_SERIALIZATION",
+    );
+  }
+  for (let index = 0; index < reviewed.length; index += 1) {
+    if ((reviewed[index] & skipped[index]) !== 0) {
+      fail(
+        "Una celda exportada no puede estar revisada y sin datos",
+        "INVALID_SERIALIZATION",
+      );
+    }
   }
 
   return Object.freeze({
@@ -807,5 +1027,7 @@ export function deserializeExplorationState(
     currentIndex,
     reviewed,
     reviewedCount,
+    skipped,
+    skippedCount,
   });
 }

@@ -8,11 +8,12 @@ import {
   parseRegionDownloadRequest,
 } from "../build/local-atlas-vite-plugin.ts";
 import {
+  isCompletedBaseCellRequest,
   parseLocalAtlasCoverage,
   parseLocalAtlasRuntime,
 } from "../app/lib/local-atlas-runtime.ts";
 
-test("local atlas accepts one aligned regional cell and a bounded rate", () => {
+test("local atlas accepts one aligned regional LOD 0 cell and a bounded rate", () => {
   assert.deepEqual(
     parseRegionDownloadRequest({
       xMin: -85_504,
@@ -35,7 +36,7 @@ test("local atlas accepts one aligned regional cell and a bounded rate", () => {
   );
 });
 
-test("local atlas rejects paths-by-proxy, unaligned ranges, and bulk work", () => {
+test("local atlas rejects non-LOD0, paths-by-proxy, unaligned ranges, and bulk work", () => {
   const valid = {
     xMin: 0,
     zMin: 0,
@@ -49,7 +50,10 @@ test("local atlas rejects paths-by-proxy, unaligned ranges, and bulk work", () =
     { ...valid, xMin: "/Volumes/LuisA" },
     { ...valid, xMin: 1 },
     { ...valid, xMaxExclusive: 0 },
+    { ...valid, lod: 1 },
     { ...valid, lod: 11 },
+    { ...valid, layers: ["overlay"] },
+    { ...valid, layers: ["newchunks"] },
     { ...valid, layers: ["../../private"] },
     { ...valid, requestsPerSecond: 0 },
     {
@@ -123,6 +127,77 @@ test("browser runtime accepts only the projected local capability", () => {
       mutationToken: "short",
     }),
     null,
+  );
+});
+
+test("browser runtime preserves the exact local cell request for completed jobs", () => {
+  const runtime = parseLocalAtlasRuntime({
+    localOnly: true,
+    mutationToken: "12345678-1234-4234-9234-123456789abc",
+    capacity: {
+      configured: true,
+      volume: "LuisA",
+      totalBytes: 2_000_000,
+      freeBytes: 1_500_000,
+      archiveBytes: 10_000,
+      availableForAtlasBytes: 1_500_000,
+      overworldRequirementBytes: 1_400_000,
+      marginBytes: 100_000,
+      fits: true,
+    },
+    job: {
+      id: "job-lod0",
+      status: "complete",
+      request: {
+        xMin: -512,
+        zMin: 0,
+        xMaxExclusive: 0,
+        zMaxExclusive: 512,
+        lod: 0,
+        layers: ["base", "overlay"],
+        requestsPerSecond: 1,
+      },
+      startedAt: "2026-07-25T12:00:00.000Z",
+      finishedAt: "2026-07-25T12:01:00.000Z",
+      exitCode: 0,
+      message: "Celda disponible en la biblioteca local",
+    },
+  });
+
+  assert.deepEqual(runtime?.job?.request, {
+    xMin: -512,
+    zMin: 0,
+    xMaxExclusive: 0,
+    zMaxExclusive: 512,
+    lod: 0,
+    layers: ["base", "overlay"],
+    requestsPerSecond: 1,
+  });
+  assert.equal(
+    isCompletedBaseCellRequest(
+      runtime.job,
+      {
+        minX: -512,
+        minZ: 0,
+        maxXExclusive: 0,
+        maxZExclusive: 512,
+      },
+      0,
+    ),
+    true,
+  );
+  assert.equal(
+    isCompletedBaseCellRequest(
+      runtime.job,
+      {
+        minX: 0,
+        minZ: 0,
+        maxXExclusive: 512,
+        maxZExclusive: 512,
+      },
+      0,
+    ),
+    false,
   );
 });
 

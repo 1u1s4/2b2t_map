@@ -275,7 +275,7 @@ export interface RegionDownloadRequest {
   readonly zMin: number;
   readonly xMaxExclusive: number;
   readonly zMaxExclusive: number;
-  readonly lod: number;
+  readonly lod: 0;
   readonly layers: readonly ("base" | "overlay" | "newchunks")[];
   readonly requestsPerSecond: number;
 }
@@ -515,7 +515,11 @@ export function parseRegionDownloadRequest(
     -WORLD_BORDER_BLOCKS,
     WORLD_BORDER_BLOCKS,
   );
-  const lod = safeInteger(value.lod, "lod", 0, 10);
+  const requestedLod = safeInteger(value.lod, "lod", 0, 10);
+  if (requestedLod !== 0) {
+    throw new TypeError("La descarga regional usa únicamente LOD 0");
+  }
+  const lod = 0 as const;
   if (xMaxExclusive <= xMin || zMaxExclusive <= zMin) {
     throw new TypeError("La región debe tener ancho y alto positivos");
   }
@@ -531,6 +535,9 @@ export function parseRegionDownloadRequest(
     )
   ) {
     throw new TypeError("Las capas solicitadas no son válidas");
+  }
+  if (!layers.includes("base")) {
+    throw new TypeError("La descarga regional siempre incluye la capa base");
   }
 
   const requestsPerSecond = value.requestsPerSecond;
@@ -1014,7 +1021,6 @@ function parseTileRequest(url: string | undefined) {
     lod,
     tileX,
     tileZ,
-    online: parsed.searchParams.get("online") === "1",
   };
 }
 
@@ -1199,11 +1205,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
         const result = await tryServeLocalTile(request, response, tileRoot);
         if (result === "served") return;
       }
-      if (!parsedTile.online) {
-        writeEmpty(response, 404);
-        return;
-      }
-      next();
+      writeEmpty(response, 404);
       return;
     }
 

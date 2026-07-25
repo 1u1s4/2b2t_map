@@ -19,6 +19,16 @@ export type LocalJobStatus =
   | "stopped"
   | "error";
 
+export interface LocalRegionJobRequest {
+  readonly xMin: number;
+  readonly zMin: number;
+  readonly xMaxExclusive: number;
+  readonly zMaxExclusive: number;
+  readonly lod: number;
+  readonly layers: readonly ("base" | "overlay" | "newchunks")[];
+  readonly requestsPerSecond: number;
+}
+
 export interface LocalCapacitySnapshot {
   readonly configured: boolean;
   readonly volume: string;
@@ -34,6 +44,7 @@ export interface LocalCapacitySnapshot {
 export interface LocalRegionJob {
   readonly id: string;
   readonly status: LocalJobStatus;
+  readonly request: LocalRegionJobRequest | null;
   readonly startedAt: string;
   readonly finishedAt: string | null;
   readonly exitCode: number | null;
@@ -52,6 +63,25 @@ export interface LocalAtlasRuntime {
     readonly updatedAt: string | null;
   };
   readonly job: LocalRegionJob | null;
+}
+
+export function isCompletedBaseCellRequest(
+  job: LocalRegionJob | null,
+  bounds: WorldBounds,
+  lod: number,
+): boolean {
+  const request = job?.request;
+  return Boolean(
+    job?.status === "complete" &&
+      job.exitCode === 0 &&
+      request &&
+      request.lod === lod &&
+      request.layers.includes("base") &&
+      request.xMin === bounds.minX &&
+      request.zMin === bounds.minZ &&
+      request.xMaxExclusive === bounds.maxXExclusive &&
+      request.zMaxExclusive === bounds.maxZExclusive,
+  );
 }
 
 export interface LocalAtlasCoverageCell {
@@ -90,6 +120,8 @@ export interface LocalAtlasWorkspaceExploration {
     readonly currentIndex: number;
     readonly reviewedCount: number;
     readonly reviewedBits: string;
+    readonly skippedCount: number;
+    readonly skippedBits: string;
   };
 }
 
@@ -285,9 +317,51 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
   ) {
     return undefined;
   }
+  let request: LocalRegionJobRequest | null = null;
+  if (value.request !== undefined) {
+    if (
+      !isRecord(value.request) ||
+      !safeMapCoordinate(value.request.xMin) ||
+      !safeMapCoordinate(value.request.zMin) ||
+      !safeMapCoordinate(value.request.xMaxExclusive) ||
+      !safeMapCoordinate(value.request.zMaxExclusive) ||
+      value.request.xMaxExclusive <= value.request.xMin ||
+      value.request.zMaxExclusive <= value.request.zMin ||
+      typeof value.request.lod !== "number" ||
+      !Number.isSafeInteger(value.request.lod) ||
+      value.request.lod < 0 ||
+      value.request.lod > 10 ||
+      !Array.isArray(value.request.layers) ||
+      value.request.layers.length < 1 ||
+      value.request.layers.length > 3 ||
+      !value.request.layers.every(
+        (layer) =>
+          layer === "base" ||
+          layer === "overlay" ||
+          layer === "newchunks",
+      ) ||
+      new Set(value.request.layers).size !== value.request.layers.length ||
+      typeof value.request.requestsPerSecond !== "number" ||
+      !Number.isFinite(value.request.requestsPerSecond) ||
+      value.request.requestsPerSecond < 0.25 ||
+      value.request.requestsPerSecond > 2
+    ) {
+      return undefined;
+    }
+    request = {
+      xMin: value.request.xMin,
+      zMin: value.request.zMin,
+      xMaxExclusive: value.request.xMaxExclusive,
+      zMaxExclusive: value.request.zMaxExclusive,
+      lod: value.request.lod,
+      layers: value.request.layers,
+      requestsPerSecond: value.request.requestsPerSecond,
+    };
+  }
   return {
     id: value.id,
     status: value.status as LocalJobStatus,
+    request,
     startedAt: value.startedAt,
     finishedAt: value.finishedAt,
     exitCode: value.exitCode,
@@ -660,7 +734,6 @@ export async function writeLocalAtlasWorkspace(
 export async function downloadExplorationCell(
   runtime: LocalAtlasRuntime,
   bounds: WorldBounds,
-  lod: number,
   layers: readonly ("base" | "overlay" | "newchunks")[],
   requestsPerSecond: number,
 ): Promise<void> {
@@ -675,7 +748,7 @@ export async function downloadExplorationCell(
       zMin: bounds.minZ,
       xMaxExclusive: bounds.maxXExclusive,
       zMaxExclusive: bounds.maxZExclusive,
-      lod,
+      lod: 0,
       layers,
       requestsPerSecond,
     }),

@@ -1,10 +1,11 @@
 # Obsidian Atlas — visor local
 
 Este directorio contiene la UI local de Obsidian Atlas. El producto divide una
-región del Overworld en tiles revisables, fija el zoom de la sesión y conserva
-el progreso en un workspace durable de LuisA. El backend de desarrollo expone
-capacidad, persistencia, lectura de tiles y descarga regional únicamente en
-`localhost`.
+región del Overworld en tiles LOD 0 revisables de 512×512 bloques y conserva el
+progreso en un workspace durable de LuisA. El zoom y el desplazamiento son
+visuales: durante una sesión no cambian el LOD de los datos. El backend de
+desarrollo expone capacidad, persistencia, lectura local de tiles y descarga
+regional únicamente en `localhost`.
 
 ## Ejecutar
 
@@ -67,12 +68,16 @@ servidor a `localhost`.
 ## Crear una sesión
 
 1. Abre **Atlas** con el dock o `0` / `Home`.
-2. Alterna entre **En disco**, **Revisado** y **Fuente**.
-3. Elige el LOD `0..3` y filtra sectores completos, en curso o pendientes.
-4. Haz clic en un sector o arrastra uno o más sectores de la rejilla 33×33.
-5. Abre **Explorar**, encaja la región o prepara el detalle máximo LOD 0.
-6. También puedes dibujar una región, usar la vista o introducir coordenadas.
-7. Pulsa **Crear sesión de exploración**.
+2. Consulta el progreso único de descarga local LOD 0 y, si lo necesitas,
+   filtra sectores **Listos**, **En curso** o **Por explorar**.
+3. Haz clic en un sector o arrastra uno o más sectores de la rejilla 33×33.
+4. Revisa los límites X/Z y el número de filas y columnas LOD 0.
+5. Pulsa **Explorar en máximo detalle**. La sesión se crea y abre directamente
+   en su primera celda.
+
+Desde **Explorar** también puedes usar **Elegir región en el Atlas**. Dibujar
+una región, usar la vista o introducir coordenadas permanece disponible como
+alternativa avanzada; **Iniciar en LOD 0** aplica la misma regla.
 
 La región usa límites semiabiertos:
 
@@ -80,14 +85,15 @@ La región usa límites semiabiertos:
 X [minX, maxX) × Z [minZ, maxZ)
 ```
 
-El modelo expande esos límites a tiles enteros. Una celda mide:
+El modelo expande esos límites a tiles enteros. Toda región nueva usa:
 
 ```text
-512 * 2**LOD bloques por lado
+LOD de datos = 0
+celda = 512 × 512 bloques
 ```
 
-El zoom y el LOD quedan fijados durante la sesión. Los controles de rueda,
-doble clic, `+` y `-` no alteran la escala hasta cerrar la sesión.
+Rueda, pellizco, doble clic, `+`, `-` y arrastre cambian la vista sin sustituir
+los tiles LOD 0 por otra resolución.
 
 ## Atlas global
 
@@ -95,21 +101,16 @@ El Atlas encaja los 1,089 sectores del Overworld en una sola vista y permanece
 disponible durante una sesión activa. Al cerrarlo restaura exactamente la
 cámara, escala y celda regionales.
 
-- **En disco** consulta la capa `base` de `tiles.sqlite3` para el LOD elegido.
-- **Revisado** une el bitset de todas las sesiones compatibles y deduplica
-  solapamientos.
-- **Fuente** muestra la huella LOD 3 publicada: 961 sectores completos, 128
-  parciales y 66,464 tiles disponibles.
+El Atlas presenta una sola cobertura: la descarga local de la capa `base` en
+LOD 0. Los estados **Listas**, **En curso** y **Por explorar** funcionan como
+filtros. El inspector muestra tiles guardados, objetivo, porcentaje y límites
+X/Z. **Anterior**, **Siguiente**, flechas y `Enter` permiten operar sin apuntar
+a celdas pequeñas; un toque o clic selecciona el sector. En móvil, una cruceta
+de 44 px permite ajustar el sector enfocado antes de elegirlo.
 
-En LOD 0–2, los descendientes de esa huella se consideran un objetivo
-provisional. Cada `404` confirmado se registra y se excluye del denominador:
-tras explorar toda la envolvente, el progreso puede llegar a 100% aunque el
-borde fino sea más irregular que su padre LOD 3.
-
-Los estados completos, en curso y pendientes funcionan como filtros. El
-inspector muestra sector, objetivo, porcentaje y límites X/Z. **Anterior**,
-**Siguiente**, flechas y `Enter` permiten operar sin apuntar a celdas pequeñas.
-En pantallas táctiles, el primer toque enfoca y el segundo confirma.
+La huella publicada permanece como detalle interno del cálculo, no como una
+vista seleccionable. Cada `404` confirmado se excluye del denominador para que
+los bordes irregulares puedan alcanzar 100% sin crear pendientes imposibles.
 
 La cobertura local se precarga para que **Explorar** no muestre ceros
 provisionales. Mientras existe un trabajo regional activo, el endpoint se
@@ -119,25 +120,37 @@ actualiza cada 2.5 segundos.
 
 La cruceta visible y las flechas del teclado mueven exactamente una celda:
 
-- izquierda/derecha cambian de columna;
-- arriba/abajo cambian de fila;
+- oeste/este cambian de columna;
+- norte/sur cambian de fila;
 - los controles se desactivan en los bordes.
 
-**Anterior** y **Revisada y siguiente** usan una ruta serpentina. La tarjeta
-muestra porcentaje, revisadas, total, posición de la ruta, fila, columna, LOD
-y límites X/Z de la celda actual.
+La tarjeta muestra porcentaje, revisadas, total revisable, celdas sin datos,
+fila, columna y límites X/Z de la celda actual. La cruceta sigue disponible aunque el usuario
+acerque o desplace visualmente el mapa; al cambiar de celda, la cámara vuelve a
+encajarla sin modificar su LOD de datos.
 
-**Marcar como revisada** es reversible. La presencia de un WebP no cambia el
-progreso humano.
+**Marcar como revisada** se habilita cuando el WebP LOD 0 exacto de la celda
+está guardado y es reversible. Descargarlo no cambia por sí solo el progreso
+humano. Si la descarga termina correctamente pero `base` devuelve `404`,
+**Omitir celda sin datos** la guarda en un bitset separado y la excluye del
+denominador; nunca se cuenta como revisada.
 
-**Exportar** genera `obsidian-atlas-exploracion.json`. El archivo incluye un
-bitset base64url, no una lista extensa de coordenadas. **Importar** valida
-versión, dimensión, límites alineados, escala, LOD, índice y contador.
+**Exportar** genera `obsidian-atlas-exploracion.json`. El archivo incluye dos
+bitsets base64url —revisadas y sin datos—, no listas extensas de coordenadas.
+**Importar** valida versión, dimensión, límites alineados, escala, LOD, índice y
+contadores.
 **Pausar sesión** la conserva y permite abrir otra región sin perder progreso.
 También se puede elegir directamente cualquier celda visible con un clic.
 
-El máximo por sesión es 4,000,000 de celdas. El canvas solo recorre las celdas
-visibles para evitar que una región grande bloquee la interfaz.
+Las sesiones creadas por versiones anteriores conservan su LOD, escala, celda
+actual y progreso al restaurarlas o importarlas. Un LOD heredado queda en solo
+lectura; **Crear versión en LOD 0** archiva la original intacta y crea una
+sesión nueva sobre los mismos límites.
+
+El máximo por sesión es 4,000,000 de celdas. Durante una sesión, la escala
+mínima limita el viewport a 8×6 tiles antes del margen de render y la cámara se
+mantiene dentro de la región más una celda de contexto. El Atlas calcula el
+tamaño LOD 0 antes de iniciar y pide reducir una selección que supere el máximo.
 
 ## Datos bajo demanda
 
@@ -151,8 +164,8 @@ La tarjeta de la celda ofrece:
 
 - límites exactos de esa celda;
 - Overworld;
-- LOD fijado;
-- capas visibles;
+- LOD 0 para toda sesión nueva;
+- `base` siempre y las capas complementarias visibles;
 - ritmo elegido.
 
 El runtime ejecuta `../download_region_2b2t.py`, permite un trabajo a la vez,
@@ -212,13 +225,12 @@ respaldo. La comparación no acredita los datos existentes contra la referencia,
 por lo que mantiene un margen conservador. Esta lectura es informativa y no
 crea operaciones.
 
-## Fuentes de tiles
+## Biblioteca de tiles
 
 El orden de lectura es:
 
 1. biblioteca configurada por `OBSIDIAN_ATLAS_TILE_ROOT`;
 2. carpeta elegida manualmente en Chrome;
-3. vista rápida online, solo si el usuario la activa.
 
 La estructura esperada es:
 
@@ -229,10 +241,11 @@ La estructura esperada es:
 └── newchunks/{lod}/overworld/{shard_x}/{shard_z}/t.{tile_x}.{tile_z}.webp
 ```
 
-El endpoint `/api/tile` sirve primero un WebP local válido. Solo permite
-consultar 2b2t.place si la solicitud lleva la opción online explícita. Esa vista
-es temporal, no escribe en la biblioteca y no usa el selector regional de
-ritmo. Crear o importar una sesión la desactiva.
+El endpoint `/api/tile` sirve únicamente un WebP local válido. No tiene modo
+remoto: incluso el parámetro heredado `online=1` se ignora y una ausencia local
+responde `404` sin contactar la red. El usuario puede obtener el tile mediante
+**Descargar celda actual**; la descarga respeta el ritmo regional y escribe el
+resultado en la biblioteca antes de mostrarlo.
 
 Chrome puede abrir `2b2t_tiles` mediante File System Access con permiso de solo
 lectura. El navegador calcula la ruta visible; no escanea ni sube la carpeta.
@@ -246,7 +259,8 @@ El panel **Capas** controla visibilidad y opacidad de:
 - Chunks nuevos (`newchunks`);
 - cuadrícula adaptativa de coordenadas.
 
-La cabecera muestra centro X/Z, zoom, LOD y bloques por píxel. El pie muestra
+La cabecera muestra centro X/Z, zoom, LOD y resolución fuente en bloques por
+píxel. El pie muestra
 las coordenadas del cursor. La búsqueda acepta `X, Z`, `X Z`, `X, Z, zoom` o el
 nombre exacto de un highlight.
 
@@ -268,10 +282,10 @@ desde su tarjeta.
 
 | Acción | Entrada |
 | --- | --- |
-| Mover libremente antes de una sesión | arrastrar o flechas |
-| Cambiar zoom antes de una sesión | rueda, pellizco, doble clic, `+`, `-` |
+| Mover visualmente el mapa | arrastrar |
+| Cambiar zoom visual | rueda, pellizco, doble clic, `+`, `-` |
 | Abrir o volver a encajar el Atlas | `0` o `Home` |
-| Saltar entre celdas | flechas |
+| Mover una celda al norte/sur/este/oeste | flechas |
 | Abrir exploración | `E` |
 | Ir a coordenadas/highlight | `G` |
 | Abrir highlights | `H` |
@@ -291,7 +305,7 @@ Rutas:
 | `GET` | `/api/local-atlas/coverage?layer=base&lod=0..3` | cobertura exacta del terreno local |
 | `POST` | `/api/local-atlas/download` | iniciar una celda validada |
 | `POST` | `/api/local-atlas/stop` | detener el trabajo activo |
-| `GET`/`HEAD` | `/api/tile` | servir un tile local o la vista opcional |
+| `GET`/`HEAD` | `/api/tile` | servir exclusivamente un tile local |
 
 Protecciones:
 
@@ -299,7 +313,7 @@ Protecciones:
 - token efímero para mutaciones;
 - cuerpo JSON de tamaño acotado;
 - coordenadas enteras dentro del borde del mundo;
-- Overworld y LOD `0..10`;
+- descarga regional únicamente en Overworld LOD 0;
 - capas permitidas por lista cerrada;
 - límites alineados a tiles;
 - ritmo `0.25..2 req/s`;
@@ -315,8 +329,9 @@ npm test
 ```
 
 Las pruebas cubren matemática de rejilla, negativos, rangos semiabiertos,
-serpentina, bitset, serialización, validación del bridge local, proxy de tiles
-y HTML renderizado.
+navegación cardinal, bitsets de revisión/sin datos, serialización, presupuesto
+de viewport, validación del bridge local, endpoint local de tiles y HTML
+renderizado.
 
 ## Archivos principales
 
@@ -334,7 +349,7 @@ viewer/
 └── vite.config.ts
 ```
 
-- `exploration-grid.ts`: región, celdas, navegación, bitset y JSON seguro.
+- `exploration-grid.ts`: región, celdas, navegación, bitsets y JSON seguro.
 - `local-atlas-runtime.ts`: cliente tipado del bridge.
 - `local-tile-source.ts`: acceso de solo lectura elegido en Chrome.
 - `local-atlas-vite-plugin.ts`: capacidad, tiles y trabajos regionales.
@@ -344,6 +359,6 @@ Límites actuales:
 
 - solo Overworld;
 - tiles WebP de 512 × 512 y LOD 0–10;
-- la vista online depende de la red y de 2b2t.place;
+- las sesiones nuevas de la UI usan únicamente LOD 0;
 - la carpeta manual necesita Chrome o Chromium;
 - las preferencias del navegador deben exportarse antes de limpiar el perfil.

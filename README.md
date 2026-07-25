@@ -6,15 +6,17 @@
 
 Obsidian Atlas es una herramienta local para revisar el Overworld publicado por
 [2b2t.place](https://2b2t.place) por regiones pequeñas y a un ritmo decidido
-por el usuario. El mapa se divide en una rejilla de tiles; cada sesión conserva
-un zoom y un LOD fijos, permite avanzar con flechas o en recorrido serpentina y
-registra qué celdas ya fueron revisadas.
+por el usuario. El mapa se divide en una rejilla de tiles; toda región nueva se
+explora con los datos originales LOD 0, permite avanzar en las cuatro
+direcciones y registra qué celdas ya fueron revisadas. El zoom y el
+desplazamiento cambian únicamente la presentación: no reducen el nivel de
+detalle de la sesión.
 
 La aplicación se sirve únicamente en `localhost`. Los datos persistentes se
 guardan de forma atómica en LuisA y mantienen una copia de recuperación en el
-navegador. La
-biblioteca existente se conserva: los WebP válidos se reutilizan y solo se
-solicitan los tiles que falten en la celda elegida.
+navegador. La biblioteca existente se conserva: el visor solo abre WebP locales
+válidos y la descarga regional solicita a la fuente únicamente los tiles que
+falten en la celda elegida.
 
 La versión actual admite únicamente **Overworld**.
 
@@ -22,18 +24,25 @@ La versión actual admite únicamente **Overworld**.
 
 - visor canvas con coordenadas X/Z, zoom, LOD y bloques por píxel;
 - Atlas global con los 1,089 sectores visibles en una sola vista;
-- lentes separadas para terreno en disco, progreso revisado y fuente publicada;
-- filtros de sectores completos, en curso y pendientes para LOD `0..3`;
+- una sola vista de descarga local LOD 0, con sectores listos, en curso y por
+  explorar;
 - rejilla maestra 33×33 basada en la huella irregular real de 66,464 tiles LOD 3;
 - selección por arrastre de uno o varios sectores de 32,768×32,768 bloques;
-- regiones dibujadas, tomadas de la vista o introducidas por coordenadas;
-- una celda por tile del LOD fijado;
-- navegación cardinal y recorrido anterior/siguiente en serpentina;
+- inicio directo de una sesión LOD 0 desde el sector o la región seleccionada;
+- regiones dibujadas, tomadas de la vista o introducidas por coordenadas como
+  alternativa avanzada;
+- una celda de 512×512 bloques por tile LOD 0;
+- navegación cardinal con cruceta y flechas del teclado;
+- zoom y desplazamiento visuales sin cambiar el LOD de datos;
+- zoom acotado a un presupuesto seguro de tiles visibles y cámara contenida en
+  la región;
 - varias sesiones pausables con progreso persistente y exportable;
+- ausencias `404` persistentes en un estado **Sin datos** separado de
+  **Revisadas**;
 - descarga explícita de la celda actual entre `0.25` y `2 req/s`;
 - capas `base`, `overlay` y `newchunks`;
 - puntos y áreas con nombre, color y notas privadas;
-- lectura prioritaria de la biblioteca local;
+- lectura exclusiva de la biblioteca local;
 - tarjeta de capacidad de LuisA, sin iniciar trabajos por sí sola;
 - composición opcional de una región como PNG o WebP desde el CLI.
 
@@ -93,42 +102,38 @@ PYTHON_BIN='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
 ## Flujo de exploración
 
 1. Abre **Atlas** desde el dock o con `0` / `Home`.
-2. Elige **En disco**, **Revisado** o **Fuente** y, cuando corresponda, el LOD.
-3. Filtra sectores completos, en curso o pendientes. Haz clic en uno, usa
-   anterior/siguiente o arrastra sobre varios sectores.
-4. Abre **Explorar** y usa **Encajar región**, **Preparar LOD 0**,
-   **Dibujar región**, **Usar vista** o escribe límites X/Z exactos.
-5. Ajusta el zoom deseado y crea la sesión; su zoom y LOD quedan fijados.
-6. Recorre la rejilla fina con clic, las flechas o la ruta serpentina.
-7. Usa **Marcar como revisada** o **Revisada y siguiente**.
-8. Si falta información local, elige el ritmo y pulsa
+2. Consulta la descarga local LOD 0 y filtra sectores **Listos**, **En curso**
+   o **Por explorar**.
+3. Haz clic en un sector o arrastra sobre varios. El panel muestra sus límites
+   X/Z y la cantidad de filas y columnas LOD 0.
+4. Pulsa **Explorar en máximo detalle** o **Iniciar exploración LOD 0**. La
+   primera celda se abre directamente a 512×512 bloques.
+5. Recorre la región con la cruceta norte/sur/este/oeste, las flechas del
+   teclado o un clic en otra celda.
+6. Acerca, aleja o arrastra el mapa cuando necesites inspeccionar una
+   estructura: los datos continúan en LOD 0.
+7. Si falta el tile local, elige el ritmo y pulsa
    **Descargar celda actual**.
+8. Cuando el detalle LOD 0 esté guardado, usa **Marcar como revisada**.
+   Si la fuente confirma un `404`, usa **Omitir celda sin datos**.
 9. **Pausar sesión** la conserva en LuisA; después puedes abrirla desde
    **Workspace durable**. **Guardar ahora** fuerza una escritura inmediata.
 
 El progreso de revisión y la presencia del tile son conceptos distintos.
 Descargar una celda no la marca como revisada, y navegar no inicia solicitudes
-en segundo plano.
+en segundo plano. Una ausencia `404` tampoco se disfraza de revisión: se guarda
+en su propio bitset y se excluye del total revisable.
 
 El Atlas se puede abrir mientras una sesión está activa. La cámara y el zoom
-regionales se conservan y se restauran al volver. En móvil, el primer toque
-enfoca un sector y el segundo lo elige; el inspector ofrece
-anterior/siguiente y límites X/Z exactos.
+regionales se conservan y se restauran al volver. Un toque o clic selecciona el
+sector; en móvil una cruceta permite corregir el foco con objetivos táctiles de
+44 px. El inspector ofrece anterior/siguiente y límites X/Z exactos. La vista
+global consulta `tiles.sqlite3` en modo lectura y usa internamente la huella
+irregular publicada para calcular el objetivo LOD 0. Los `404` confirmados se
+excluyen, de modo que una descarga exhaustiva pueda alcanzar 100% sin presentar
+tiles inexistentes como pendientes eternos.
 
-La lente **En disco** consulta `tiles.sqlite3` en modo lectura y respeta la
-huella irregular publicada. **Revisado** une sesiones superpuestas sin contar
-dos veces una misma zona. **Fuente** describe disponibilidad, no trabajo
-pendiente: sus 961 sectores completos y 128 parciales contienen los 66,464
-tiles LOD 3 publicados.
-
-En LOD 0–2, esa huella LOD 3 funciona como envolvente de búsqueda. Los `404`
-confirmados se excluyen del objetivo fino, de modo que una descarga exhaustiva
-pueda alcanzar 100% sin presentar tiles no publicados como pendientes eternos.
-
-El orden serpentina avanza de izquierda a derecha en una fila y de derecha a
-izquierda en la siguiente. Así se cubre la región sin saltos largos.
-
-## Rejilla, LOD y coordenadas
+## Rejilla LOD 0 y coordenadas
 
 Los límites de una región son rangos semiabiertos:
 
@@ -140,23 +145,22 @@ La región se expande a los bordes de los tiles que toca. Las coordenadas
 negativas se resuelven con piso matemático, por lo que `X=-1` pertenece al tile
 `-1`, no al tile `0`.
 
-| LOD | Bloques por píxel | Bloques por lado de celda |
-| ---: | ---: | ---: |
-| 0 | 1 | 512 |
-| 1 | 2 | 1,024 |
-| 5 | 32 | 16,384 |
-| 10 | 1,024 | 524,288 |
-
-En general:
-
 ```text
-bloques_por_píxel = 2**LOD
-bloques_por_celda = 512 * 2**LOD
+LOD de datos de toda región nueva = 0
+celda = 512 × 512 bloques
 ```
 
-Antes de crear una sesión, el LOD sigue al zoom. Durante la sesión ambos valores
-se mantienen fijos. El modelo admite hasta 4,000,000 de celdas por sesión y usa
-un bitset compacto para el progreso.
+El zoom del canvas no selecciona otra resolución durante una sesión: rueda,
+pellizco, doble clic, `+`, `-` y arrastre solo cambian la vista. La escala mínima
+mantiene como máximo 8×6 tiles dentro del viewport antes del margen de render y
+la cámara no puede perder la región seleccionada. El modelo admite hasta
+4,000,000 de celdas por sesión y avisa antes de iniciar una selección que supere
+ese límite.
+
+Las sesiones creadas por versiones anteriores conservan su LOD, escala, celda
+actual y progreso al restaurarlas o importarlas. Las sesiones con LOD heredado
+son de solo lectura; **Crear versión en LOD 0** conserva la original y abre una
+copia nueva en máximo detalle.
 
 ## Capacidad de LuisA
 
@@ -191,15 +195,11 @@ La UI ofrece cuatro ritmos:
 0.25 req/s · 0.5 req/s · 1 req/s · 2 req/s
 ```
 
-Solo se descargan la celda actual, el LOD fijado y las capas visibles. El
+Siempre se descarga la capa `base` de la celda actual LOD 0; `overlay` y
+`newchunks` se añaden cuando están visibles. El
 runtime permite un trabajo regional a la vez, valida espacio antes de iniciarlo
 y admite como máximo 64 combinaciones tile/capa por operación. **Detener
 celda** termina las solicitudes activas de forma segura.
-
-La vista rápida online es opcional, temporal y no escribe archivos. Al crear o
-importar una sesión queda desactivada. Sus solicitudes no usan el control de
-ritmo regional, por lo que conviene mantenerla apagada durante un análisis
-medible.
 
 ## CLI regional
 
@@ -299,9 +299,11 @@ Los shards agrupan 32 tiles y truncan hacia cero, igual que el cliente público.
 La ubicación del tile en el mundo, en cambio, usa piso matemático. El visor y
 el CLI aplican cada regla en su lugar correspondiente.
 
-El servidor local consulta primero esta biblioteca. Chrome también puede abrir
-la carpeta `2b2t_tiles` con permiso de solo lectura desde **Explorar → Fuentes
-de datos locales**.
+El visor consulta exclusivamente esta biblioteca. Chrome también puede abrir la
+carpeta `2b2t_tiles` con permiso de solo lectura desde **Explorar → Biblioteca
+local**. `/api/tile` nunca obtiene imágenes remotas: también ignora el parámetro
+heredado `online=1`. Un tile ausente se obtiene mediante **Descargar celda
+actual** y solo se muestra después de quedar guardado localmente.
 
 ## Workspace, sesiones y highlights
 
@@ -329,9 +331,9 @@ La exportación manual de una sesión crea:
 obsidian-atlas-exploracion.json
 ```
 
-El archivo contiene región, zoom, LOD, celda actual y bitset de celdas
-revisadas. La importación valida versión, dimensión, límites, contador y
-codificación antes de añadirla al workspace.
+El archivo contiene región, zoom, LOD, celda actual y bitsets independientes de
+celdas revisadas y celdas sin datos. La importación valida versión, dimensión,
+límites, contadores y codificación antes de añadirla al workspace.
 
 Los highlights pueden ser puntos o áreas con nombre, nota, color y visibilidad.
 Su exportación crea

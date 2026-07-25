@@ -38,8 +38,6 @@ import {
   Sparkles,
   SquareDashedMousePointer,
   SquareMousePointer,
-  StepBack,
-  StepForward,
   Trash2,
   Upload,
   X,
@@ -56,17 +54,22 @@ import {
 } from "./lib/local-tile-source";
 import {
   cardinalNeighbor,
+  clampCameraToExploration,
   cellForIndex,
   cellIndexAtTile,
   cellIndexAtWorld,
-  createExplorationState,
+  createMaxDetailExplorationState,
   deserializeExplorationState,
   isCellReviewed,
+  isCellSkipped,
+  MAX_DETAIL_EXPLORATION_LOD,
+  MAX_DETAIL_EXPLORATION_SCALE,
+  MAX_EXPLORATION_CELLS,
+  minimumSafeExplorationScale,
   moveCurrentCardinal,
-  moveCurrentSerpentine,
   serializeExplorationState,
-  serpentinePositionForCellIndex,
   withCurrentCellReviewed,
+  withCurrentCellSkipped,
   withCurrentIndex,
   type CardinalDirection,
   type ExplorationState,
@@ -89,12 +92,11 @@ import {
 } from "./lib/overworld-coverage";
 import {
   summarizeLocalCoverage,
-  summarizeReviewProgress,
-  type OverworldProgressExploration,
   type OverworldProgressStatus,
 } from "./lib/overworld-progress";
 import {
   downloadExplorationCell,
+  isCompletedBaseCellRequest,
   LocalAtlasWorkspaceConflictError,
   localAtlasWorkspaceContent,
   parseLocalAtlasWorkspaceContent,
@@ -124,6 +126,7 @@ import {
 
 const INITIAL_CAMERA = { x: -85_181, z: 168_232 };
 const INITIAL_SCALE = 2.9423;
+const INITIAL_VIEW_SIZE = { width: 1280, height: 760 };
 const MIN_SCALE = 1 / 1_500;
 const ATLAS_MIN_SCALE = 1 / 10_000;
 const MAX_SCALE = 8;
@@ -150,7 +153,6 @@ type Drawer =
   | "help"
   | null;
 type MarkMode = "pin" | "area" | "region" | "coverage" | null;
-type AtlasLens = "local" | "review" | "source";
 type AtlasStatusFilter = "all" | OverworldProgressStatus;
 
 type Camera = {
@@ -188,12 +190,11 @@ type Highlight = {
 type TileRecord = {
   status: "loading" | "loaded" | "missing" | "error";
   bitmap?: ImageBitmap;
-  source?: "local" | "remote";
+  source?: "local";
 };
 
 type TileStats = {
   local: number;
-  remote: number;
   missing: number;
 };
 
@@ -513,14 +514,13 @@ function tileCacheKey(key: TileKey) {
   return `${key.layer}:${key.lod}:${key.tileX}:${key.tileZ}`;
 }
 
-function remoteTileUrl(key: TileKey, online: boolean) {
+function localTileUrl(key: TileKey) {
   const params = new URLSearchParams({
     layer: key.layer,
     lod: String(key.lod),
     dimension: "0",
     tileX: String(key.tileX),
     tileZ: String(key.tileZ),
-    online: online ? "1" : "0",
   });
   return `/api/tile?${params.toString()}`;
 }
@@ -679,8 +679,7 @@ export function MapViewer() {
   const fallbackTextRef = useRef<HTMLSpanElement>(null);
   const tileCacheRef = useRef<Map<string, TileRecord>>(new Map());
   const tileGenerationRef = useRef(0);
-  const onlineFallbackRef = useRef(false);
-  const lastCompletedJobRef = useRef<string | null>(null);
+  const lastTerminalJobRef = useRef<string | null>(null);
   const pointerRef = useRef<{
     id: number;
     pointerType: string;
@@ -731,22 +730,17 @@ export function MapViewer() {
 
   const [camera, setCamera] = useState<Camera>(INITIAL_CAMERA);
   const [scale, setScale] = useState(INITIAL_SCALE);
-  const [viewSize, setViewSize] = useState({ width: 1280, height: 760 });
+  const [viewSize, setViewSize] = useState(INITIAL_VIEW_SIZE);
   const [cursor, setCursor] = useState<Camera>(INITIAL_CAMERA);
   const [drawer, setDrawer] = useState<Drawer>(null);
-  const [atlasLens, setAtlasLens] = useState<AtlasLens>("local");
-  const [atlasLod, setAtlasLod] = useState(0);
   const [atlasStatusFilter, setAtlasStatusFilter] =
     useState<AtlasStatusFilter>("all");
   const [atlasFocusedCellIndex, setAtlasFocusedCellIndex] = useState(
     Math.floor(OVERWORLD_OVERVIEW_CELL_COUNT / 2),
   );
-  const [localCoverageByLod, setLocalCoverageByLod] = useState<
-    Readonly<Record<number, LocalAtlasCoverageSnapshot | undefined>>
-  >({});
-  const [localCoverageErrorLods, setLocalCoverageErrorLods] = useState<
-    ReadonlySet<number>
-  >(new Set());
+  const [localCoverage, setLocalCoverage] =
+    useState<LocalAtlasCoverageSnapshot | null>(null);
+  const [localCoverageError, setLocalCoverageError] = useState(false);
   const [markMode, setMarkMode] = useState<MarkMode>(null);
   const [areaPreview, setAreaPreview] = useState<Highlight["bounds"]>();
   const [search, setSearch] = useState("-85181, 168232");
@@ -784,15 +778,19 @@ export function MapViewer() {
   const [coveragePreview, setCoveragePreview] =
     useState<OverworldCoverageSelection | null>(null);
   const [coverageSelectionReady, setCoverageSelectionReady] = useState(false);
-  const [onlineFallback, setOnlineFallback] = useState(false);
   const [localSource, setLocalSource] = useState<LocalTileSource | null>(null);
   const [archiveName, setArchiveName] = useState<string | null>(null);
   const [localSupported, setLocalSupported] = useState(false);
   const [tileStats, setTileStats] = useState<TileStats>({
     local: 0,
-    remote: 0,
     missing: 0,
   });
+  const [loadedTileKeys, setLoadedTileKeys] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
+  const [missingTileKeys, setMissingTileKeys] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
   const [renderVersion, setRenderVersion] = useState(0);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [selectedHighlightId, setSelectedHighlightId] = useState<string | null>(
@@ -830,17 +828,18 @@ export function MapViewer() {
   const [toast, setToast] = useState<string | null>(null);
 
   const atlasMode = drawer === "atlas";
-  const localCoverage = localCoverageByLod[atlasLod] ?? null;
-  const localLod0Coverage = localCoverageByLod[0] ?? null;
   const localCoverageState: "loading" | "ready" | "stale" | "error" =
-    localCoverageErrorLods.has(atlasLod)
+    localCoverageError
       ? localCoverage !== null
         ? "stale"
         : "error"
       : localCoverage !== null
         ? "ready"
         : "loading";
-  const lod = lodForScale(scale);
+  const lod =
+    explorationState && !atlasMode
+      ? explorationState.region.lod
+      : lodForScale(scale);
   const blocksPerPixel = blocksPerPixelAtLod(lod);
   const gridStep = adaptiveGridStep(scale);
   const selectedHighlight = highlights.find(
@@ -852,28 +851,79 @@ export function MapViewer() {
         explorationState.currentIndex,
       )
     : null;
+  const currentDetailKey =
+    explorationState && currentExplorationCell
+      ? tileCacheKey({
+          layer: "base",
+          lod: MAX_DETAIL_EXPLORATION_LOD,
+          dimension: "overworld",
+          tileX: currentExplorationCell.tileX,
+          tileZ: currentExplorationCell.tileZ,
+        })
+      : null;
+  const currentDetailReady =
+    explorationState?.region.lod === MAX_DETAIL_EXPLORATION_LOD &&
+    currentDetailKey !== null &&
+    loadedTileKeys.has(currentDetailKey);
+  const currentDetailMissing =
+    currentDetailKey !== null && missingTileKeys.has(currentDetailKey);
+  const activeExplorationIsMaxDetail =
+    explorationState?.region.lod === MAX_DETAIL_EXPLORATION_LOD;
+  const currentDetailConfirmedAbsent =
+    activeExplorationIsMaxDetail &&
+    !currentDetailReady &&
+    currentDetailMissing &&
+    currentExplorationCell !== null &&
+    isCompletedBaseCellRequest(
+      localRuntime?.job ?? null,
+      currentExplorationCell.bounds,
+      MAX_DETAIL_EXPLORATION_LOD,
+    );
+  const explorationMinimumScale =
+    explorationState && !atlasMode
+      ? minimumSafeExplorationScale(explorationState.region.tileSpan, viewSize)
+      : MIN_SCALE;
+  const currentCellSkipped =
+    explorationState !== null &&
+    isCellSkipped(explorationState, explorationState.currentIndex);
+  const canReviewCurrentCell =
+    Boolean(explorationState) &&
+    activeExplorationIsMaxDetail &&
+    currentDetailReady &&
+    !currentCellSkipped;
+  const canSkipCurrentCell =
+    activeExplorationIsMaxDetail &&
+    (currentDetailConfirmedAbsent || currentCellSkipped);
+  const currentDetailDownloading =
+    localRuntime?.job?.status === "running" ||
+    localRuntime?.job?.status === "stopping";
+  const reviewableCellCount = explorationState
+    ? explorationState.region.cellCount - explorationState.skippedCount
+    : 0;
   const explorationPercent = explorationState
-    ? (explorationState.reviewedCount / explorationState.region.cellCount) * 100
+    ? reviewableCellCount === 0
+      ? 100
+      : (explorationState.reviewedCount / reviewableCellCount) * 100
     : 0;
   const visibleCoverageSelection = coveragePreview ?? coverageSelection;
-  const coverageSummary = useMemo(() => {
-    let full = 0;
-    let partial = 0;
-    let availableTiles = 0;
-    for (let index = 0; index < OVERWORLD_OVERVIEW_CELL_COUNT; index += 1) {
-      const cell = overviewCellForIndex(index);
-      availableTiles += cell.availableTileCount;
-      if (cell.coverageStatus === "full") full += 1;
-      if (cell.coverageStatus === "partial") partial += 1;
-    }
-    return {
-      full,
-      partial,
-      available: full + partial,
-      empty: OVERWORLD_OVERVIEW_CELL_COUNT - full - partial,
-      availableTiles,
-    };
-  }, []);
+  const selectedLod0CellCount = useMemo(() => {
+    if (!coverageSelection) return 0;
+    const span = blocksPerTileAtLod(MAX_DETAIL_EXPLORATION_LOD);
+    return (
+      Math.ceil(
+        (coverageSelection.bounds.maxXExclusive -
+          coverageSelection.bounds.minX) /
+          span,
+      ) *
+      Math.ceil(
+        (coverageSelection.bounds.maxZExclusive -
+          coverageSelection.bounds.minZ) /
+          span,
+      )
+    );
+  }, [coverageSelection]);
+  const coverageSelectionTooLarge =
+    selectedLod0CellCount > MAX_EXPLORATION_CELLS;
   const workspaceContent = useMemo<LocalAtlasWorkspaceContent>(
     () => ({
       schemaVersion: 1,
@@ -896,57 +946,10 @@ export function MapViewer() {
       ),
     [savedExplorations],
   );
-  const atlasExplorations = useMemo<OverworldProgressExploration[]>(() => {
-    const records = new Map<string, OverworldProgressExploration>();
-    for (const exploration of savedExplorations) {
-      try {
-        records.set(exploration.id, {
-          id: exploration.id,
-          name: exploration.state.region.name,
-          updatedAt: exploration.updatedAt,
-          active: explorationState?.region.id === exploration.id,
-          state:
-            explorationState?.region.id === exploration.id
-              ? explorationState
-              : explorationStateFromWorkspace(exploration),
-        });
-      } catch {
-        // The workspace parser already rejects invalid sessions. Keep the
-        // overview resilient if a future in-memory caller breaks that promise.
-      }
-    }
-    if (explorationState && !records.has(explorationState.region.id)) {
-      records.set(explorationState.region.id, {
-        id: explorationState.region.id,
-        name: explorationState.region.name,
-        updatedAt: new Date(0).toISOString(),
-        active: true,
-        state: explorationState,
-      });
-    }
-    return [...records.values()];
-  }, [explorationState, savedExplorations]);
-  const reviewProgress = useMemo(
-    () =>
-      atlasMode
-        ? summarizeReviewProgress(atlasExplorations, atlasLod)
-        : null,
-    [atlasExplorations, atlasLod, atlasMode],
+  const atlasProgress = useMemo(
+    () => summarizeLocalCoverage(localCoverage, MAX_DETAIL_EXPLORATION_LOD),
+    [localCoverage],
   );
-  const localMapProgress = useMemo(
-    () => summarizeLocalCoverage(localCoverage, atlasLod),
-    [atlasLod, localCoverage],
-  );
-  const localLod0MapProgress = useMemo(
-    () => summarizeLocalCoverage(localLod0Coverage, 0),
-    [localLod0Coverage],
-  );
-  const atlasProgress =
-    atlasLens === "local"
-      ? localMapProgress
-      : atlasLens === "review"
-        ? reviewProgress
-        : null;
   const atlasFocusedCell = overviewCellForIndex(atlasFocusedCellIndex);
   const displayedCoordinate = atlasMode
     ? {
@@ -973,13 +976,11 @@ export function MapViewer() {
     return null;
   }, [atlasFocusedCellIndex, atlasProgress]);
   const atlasFocusedLocalCell =
-    atlasLens === "local"
-      ? localCoverage?.cells.find(
-          (cell) =>
-            cell.row === atlasFocusedCell.row &&
-            cell.column === atlasFocusedCell.column,
-        ) ?? null
-      : null;
+    localCoverage?.cells.find(
+      (cell) =>
+        cell.row === atlasFocusedCell.row &&
+        cell.column === atlasFocusedCell.column,
+    ) ?? null;
   const runtimeMutationToken = localRuntime?.mutationToken ?? null;
   const runtimePersistenceConfigured =
     localRuntime?.persistence.configured ?? false;
@@ -1082,18 +1083,64 @@ export function MapViewer() {
       record.bitmap?.close();
     }
     tileCacheRef.current.clear();
-    setTileStats({ local: 0, remote: 0, missing: 0 });
+    setTileStats({ local: 0, missing: 0 });
+    setLoadedTileKeys(new Set());
+    setMissingTileKeys(new Set());
     setRenderVersion((version) => version + 1);
   }, []);
 
-  const focusExploration = useCallback((state: ExplorationState) => {
-    const cell = cellForIndex(state.region, state.currentIndex);
-    setCamera({
-      x: (cell.bounds.minX + cell.bounds.maxXExclusive) / 2,
-      z: (cell.bounds.minZ + cell.bounds.maxZExclusive) / 2,
-    });
-    setScale(state.region.scale);
-  }, []);
+  const focusExploration = useCallback(
+    (state: ExplorationState) => {
+      const cell = cellForIndex(state.region, state.currentIndex);
+      const mobile = viewSize.width <= 720;
+      const horizontalInset = mobile ? 96 : 500;
+      const verticalInset = mobile ? 220 : 160;
+      const availableWidth = Math.max(
+        220,
+        viewSize.width - horizontalInset,
+      );
+      const availableHeight = Math.max(
+        220,
+        viewSize.height - verticalInset,
+      );
+      const fitScale = Math.min(
+        availableWidth / state.region.tileSpan,
+        availableHeight / state.region.tileSpan,
+      );
+      const nextScale = clamp(
+        Math.min(state.region.scale, fitScale),
+        minimumSafeExplorationScale(state.region.tileSpan, viewSize),
+        MAX_DETAIL_EXPLORATION_SCALE,
+      );
+      const nextCamera = clampCameraToExploration(
+        {
+          x: (cell.bounds.minX + cell.bounds.maxXExclusive) / 2,
+          z: (cell.bounds.minZ + cell.bounds.maxZExclusive) / 2,
+        },
+        state.region.bounds,
+        state.region.tileSpan,
+        nextScale,
+        viewSize,
+      );
+      setCamera(nextCamera);
+      setScale(nextScale);
+    },
+    [viewSize],
+  );
+
+  const constrainActiveExplorationCamera = useCallback(
+    (nextCamera: Camera, nextScale: number) => {
+      if (!explorationState || atlasMode) return nextCamera;
+      return clampCameraToExploration(
+        nextCamera,
+        explorationState.region.bounds,
+        explorationState.region.tileSpan,
+        nextScale,
+        viewSize,
+      );
+    },
+    [atlasMode, explorationState, viewSize],
+  );
 
   const focusMapPoint = useCallback(
     (x: number, z: number) => {
@@ -1194,11 +1241,27 @@ export function MapViewer() {
           restoredExploration.region,
           restoredExploration.currentIndex,
         );
-        setCamera({
-          x: (cell.bounds.minX + cell.bounds.maxXExclusive) / 2,
-          z: (cell.bounds.minZ + cell.bounds.maxZExclusive) / 2,
-        });
-        setScale(restoredExploration.region.scale);
+        const restoredScale = clamp(
+          restoredExploration.region.scale,
+          minimumSafeExplorationScale(
+            restoredExploration.region.tileSpan,
+            INITIAL_VIEW_SIZE,
+          ),
+          MAX_SCALE,
+        );
+        setCamera(
+          clampCameraToExploration(
+            {
+              x: (cell.bounds.minX + cell.bounds.maxXExclusive) / 2,
+              z: (cell.bounds.minZ + cell.bounds.maxZExclusive) / 2,
+            },
+            restoredExploration.region.bounds,
+            restoredExploration.region.tileSpan,
+            restoredScale,
+            INITIAL_VIEW_SIZE,
+          ),
+        );
+        setScale(restoredScale);
       } else {
         const location = parseLocation(window.location.hash, []);
         if (location) {
@@ -1330,14 +1393,36 @@ export function MapViewer() {
     const element = mapRef.current;
     if (!element) return;
     const observer = new ResizeObserver(([entry]) => {
-      setViewSize({
+      const nextViewSize = {
         width: Math.max(1, Math.round(entry.contentRect.width)),
         height: Math.max(1, Math.round(entry.contentRect.height)),
-      });
+      };
+      setViewSize(nextViewSize);
+      if (explorationState && !atlasMode) {
+        const nextScale = clamp(
+          scale,
+          minimumSafeExplorationScale(
+            explorationState.region.tileSpan,
+            nextViewSize,
+          ),
+          MAX_SCALE,
+        );
+        if (nextScale !== scale) setScale(nextScale);
+        setCamera((current) => {
+          const next = clampCameraToExploration(
+            current,
+            explorationState.region.bounds,
+            explorationState.region.tileSpan,
+            nextScale,
+            nextViewSize,
+          );
+          return next.x === current.x && next.z === current.z ? current : next;
+        });
+      }
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, []);
+  }, [atlasMode, explorationState, scale]);
 
   useEffect(() => {
     const cache = tileCacheRef.current;
@@ -1366,13 +1451,21 @@ export function MapViewer() {
         if (cancelled) return;
         setLocalRuntime(runtime);
         setRuntimeChecked(true);
+        const terminalJob =
+          runtime?.job &&
+          runtime.job.status !== "running" &&
+          runtime.job.status !== "stopping"
+            ? runtime.job
+            : null;
         if (
-          runtime?.job?.status === "complete" &&
-          lastCompletedJobRef.current !== runtime.job.id
+          terminalJob &&
+          lastTerminalJobRef.current !== terminalJob.id
         ) {
-          lastCompletedJobRef.current = runtime.job.id;
+          lastTerminalJobRef.current = terminalJob.id;
           clearTileCache();
-          notify("La celda ya está disponible localmente");
+          if (terminalJob.status === "complete") {
+            notify("La celda ya está disponible localmente");
+          }
         }
       } catch {
         if (!cancelled) {
@@ -1399,74 +1492,44 @@ export function MapViewer() {
 
   useEffect(() => {
     const controller = new AbortController();
-    const readingLods = new Set<number>();
-    const requestedLods =
-      atlasMode && atlasLod !== 0 ? [0, atlasLod] : [0];
-    const refreshLod = async (requestedLod: number) => {
-      if (readingLods.has(requestedLod)) return;
-      readingLods.add(requestedLod);
+    let reading = false;
+    const refresh = async () => {
+      if (reading) return;
+      reading = true;
       try {
         const coverage = await readLocalAtlasCoverage(
-          requestedLod,
+          MAX_DETAIL_EXPLORATION_LOD,
           controller.signal,
         );
         if (controller.signal.aborted) return;
         if (!coverage) {
-          setLocalCoverageByLod((current) => {
-            const next = { ...current };
-            delete next[requestedLod];
-            return next;
-          });
-          setLocalCoverageErrorLods((current) => {
-            const next = new Set(current);
-            next.add(requestedLod);
-            return next;
-          });
+          setLocalCoverage(null);
+          setLocalCoverageError(true);
           return;
         }
-        setLocalCoverageByLod((current) => ({
-          ...current,
-          [requestedLod]: coverage,
-        }));
-        setLocalCoverageErrorLods((current) => {
-          if (!current.has(requestedLod)) return current;
-          const next = new Set(current);
-          next.delete(requestedLod);
-          return next;
-        });
+        setLocalCoverage(coverage);
+        setLocalCoverageError(false);
       } catch {
         if (controller.signal.aborted) return;
-        setLocalCoverageErrorLods((current) => {
-          const next = new Set(current);
-          next.add(requestedLod);
-          return next;
-        });
+        setLocalCoverageError(true);
       } finally {
-        readingLods.delete(requestedLod);
+        reading = false;
       }
     };
-    const refresh = () => {
-      for (const requestedLod of requestedLods) {
-        void refreshLod(requestedLod);
-      }
-    };
-    refresh();
+    void refresh();
     const refreshIntervalMs =
       localRuntime?.job?.status === "running" ||
       localRuntime?.job?.status === "stopping"
         ? 2_500
         : 15_000;
-    const interval = window.setInterval(refresh, refreshIntervalMs);
+    const interval = window.setInterval(() => {
+      void refresh();
+    }, refreshIntervalMs);
     return () => {
       controller.abort();
       window.clearInterval(interval);
     };
-  }, [
-    atlasLod,
-    atlasMode,
-    localRuntime?.job?.id,
-    localRuntime?.job?.status,
-  ]);
+  }, [localRuntime?.job?.id, localRuntime?.job?.status]);
 
   const flushWorkspace = useCallback(async (): Promise<boolean> => {
     const inFlight = workspaceSavePromiseRef.current;
@@ -2042,11 +2105,35 @@ export function MapViewer() {
         }
         tileCacheRef.current.set(cacheKey, record);
         if (record.status === "loaded" && record.source) {
+          setMissingTileKeys((current) => {
+            if (!current.has(cacheKey)) return current;
+            const next = new Set(current);
+            next.delete(cacheKey);
+            return next;
+          });
+          setLoadedTileKeys((current) => {
+            if (current.has(cacheKey)) return current;
+            const next = new Set(current);
+            next.add(cacheKey);
+            return next;
+          });
           setTileStats((stats) => ({
             ...stats,
             [record.source!]: stats[record.source!] + 1,
           }));
         } else if (record.status === "missing") {
+          setMissingTileKeys((current) => {
+            if (current.has(cacheKey)) return current;
+            const next = new Set(current);
+            next.add(cacheKey);
+            return next;
+          });
+          setLoadedTileKeys((current) => {
+            if (!current.has(cacheKey)) return current;
+            const next = new Set(current);
+            next.delete(cacheKey);
+            return next;
+          });
           setTileStats((stats) => ({ ...stats, missing: stats.missing + 1 }));
         }
 
@@ -2079,26 +2166,19 @@ export function MapViewer() {
             }
           }
 
-          if (!source || onlineFallbackRef.current) {
-            const response = await fetch(
-              remoteTileUrl(key, onlineFallbackRef.current),
-            );
-            if (response.ok) {
-              const bitmap = await createImageBitmap(await response.blob());
-              finish({
-                status: "loaded",
-                bitmap,
-                source:
-                  response.headers.get("X-Atlas-Tile-Source") === "local"
-                    ? "local"
-                    : "remote",
-              });
-              return;
-            }
-            if (response.status === 404) {
-              finish({ status: "missing" });
-              return;
-            }
+          const response = await fetch(localTileUrl(key));
+          if (response.ok) {
+            const bitmap = await createImageBitmap(await response.blob());
+            finish({
+              status: "loaded",
+              bitmap,
+              source: "local",
+            });
+            return;
+          }
+          if (response.status === 404) {
+            finish({ status: "missing" });
+            return;
           }
           finish({ status: "missing" });
         } catch {
@@ -2108,6 +2188,28 @@ export function MapViewer() {
     },
     [],
   );
+
+  useEffect(() => {
+    if (
+      atlasMode ||
+      !activeExplorationIsMaxDetail ||
+      !currentExplorationCell
+    ) {
+      return;
+    }
+    ensureTile({
+      layer: "base",
+      lod: MAX_DETAIL_EXPLORATION_LOD,
+      dimension: "overworld",
+      tileX: currentExplorationCell.tileX,
+      tileZ: currentExplorationCell.tileZ,
+    });
+  }, [
+    activeExplorationIsMaxDetail,
+    atlasMode,
+    currentExplorationCell,
+    ensureTile,
+  ]);
 
   const worldAtScreen = useCallback(
     (screenX: number, screenY: number) => ({
@@ -2306,13 +2408,12 @@ export function MapViewer() {
         const progressStatus = progress?.status ?? "pending";
         const filtered =
           atlasMode &&
-          atlasLens !== "source" &&
           atlasStatusFilter !== "all" &&
           progressStatus !== atlasStatusFilter;
 
         context.globalAlpha = 1;
         context.fillStyle =
-          atlasMode && atlasLens !== "source"
+          atlasMode
             ? selected
               ? "rgba(98, 168, 255, 0.34)"
               : atlasProgressFill(progressStatus, filtered)
@@ -2331,7 +2432,6 @@ export function MapViewer() {
         );
         if (
           atlasMode &&
-          atlasLens !== "source" &&
           progressStatus === "in-progress" &&
           !filtered &&
           overviewCellSize >= 9
@@ -2364,7 +2464,7 @@ export function MapViewer() {
           ? "rgba(133, 196, 255, 0.98)"
           : focused
             ? "rgba(255, 255, 255, 0.92)"
-            : atlasMode && atlasLens !== "source"
+            : atlasMode
               ? atlasProgressStroke(progressStatus, filtered)
               : cell.coverageStatus === "full"
                 ? "rgba(94, 242, 219, 0.36)"
@@ -2393,7 +2493,7 @@ export function MapViewer() {
             ? "rgba(225, 242, 255, 0.98)"
             : "rgba(225, 236, 246, 0.78)";
           context.fillText(
-            atlasMode && atlasLens !== "source" && progress
+            atlasMode && progress
               ? `${cell.id} · ${Math.round(progress.percent)}%`
               : `${cell.id} · ${cell.availableTileCount}/64`,
             point.x + 8,
@@ -2441,77 +2541,7 @@ export function MapViewer() {
       context.setLineDash([]);
     }
 
-    if (atlasMode && atlasLens === "review") {
-      for (const exploration of atlasExplorations) {
-        const region = exploration.state.region;
-        const start = screenAtWorld(region.bounds.minX, region.bounds.minZ);
-        const end = screenAtWorld(
-          region.bounds.maxXExclusive,
-          region.bounds.maxZExclusive,
-        );
-        const width = end.x - start.x;
-        const height = end.y - start.y;
-        if (
-          end.x < 0 ||
-          end.y < 0 ||
-          start.x > viewSize.width ||
-          start.y > viewSize.height
-        ) {
-          continue;
-        }
-        const explorationPercent =
-          (exploration.state.reviewedCount / region.cellCount) * 100;
-        const tone =
-          explorationPercent >= 100
-            ? "#26d9c7"
-            : explorationPercent > 0
-              ? "#ffbd4a"
-              : "#94a8bd";
-        context.globalAlpha = exploration.active ? 1 : 0.86;
-        if (width >= 2 && height >= 2) {
-          context.fillStyle =
-            explorationPercent >= 100
-              ? "rgba(38, 217, 199, 0.12)"
-              : explorationPercent > 0
-                ? "rgba(255, 189, 74, 0.1)"
-                : "rgba(148, 168, 189, 0.07)";
-          context.fillRect(start.x, start.y, width, height);
-          context.strokeStyle = exploration.active ? "#62a8ff" : tone;
-          context.lineWidth = exploration.active ? 3 : 2;
-          context.setLineDash(explorationPercent > 0 ? [] : [5, 4]);
-          context.strokeRect(start.x, start.y, width, height);
-          context.setLineDash([]);
-        }
-        const centerX = start.x + width / 2;
-        const centerY = start.y + height / 2;
-        context.beginPath();
-        context.fillStyle = exploration.active ? "#62a8ff" : tone;
-        context.strokeStyle = "rgba(4, 11, 20, 0.94)";
-        context.lineWidth = 3;
-        context.arc(
-          centerX,
-          centerY,
-          exploration.active ? 6 : 4.5,
-          0,
-          Math.PI * 2,
-        );
-        context.fill();
-        context.stroke();
-        if (width >= 92 && height >= 34) {
-          context.globalAlpha = 1;
-          context.fillStyle = "rgba(4, 11, 20, 0.82)";
-          context.fillRect(start.x + 6, start.y + 6, Math.min(width - 12, 154), 24);
-          context.fillStyle = "#f3f8fc";
-          context.font = "600 10px var(--font-geist-mono), monospace";
-          context.fillText(
-            `${region.name} · ${Math.round(explorationPercent)}%`,
-            start.x + 12,
-            start.y + 22,
-          );
-        }
-      }
-      context.globalAlpha = 1;
-    } else if (atlasMode && explorationState) {
+    if (atlasMode && explorationState) {
       const bounds = explorationState.region.bounds;
       const center = screenAtWorld(
         (bounds.minX + bounds.maxXExclusive) / 2,
@@ -2693,9 +2723,7 @@ export function MapViewer() {
     }
   }, [
     areaPreview,
-    atlasExplorations,
     atlasFocusedCellIndex,
-    atlasLens,
     atlasMode,
     atlasProgress,
     atlasStatusFilter,
@@ -2718,20 +2746,36 @@ export function MapViewer() {
 
   const zoomAt = useCallback(
     (factor: number, screenX = viewSize.width / 2, screenY = viewSize.height / 2) => {
-      if (explorationState && !atlasMode) return;
       const anchor = worldAtScreen(screenX, screenY);
       const nextScale = clamp(
         scale * factor,
-        atlasMode ? ATLAS_MIN_SCALE : MIN_SCALE,
+        atlasMode
+          ? ATLAS_MIN_SCALE
+          : explorationState
+            ? explorationMinimumScale
+            : MIN_SCALE,
         MAX_SCALE,
       );
-      setCamera({
-        x: anchor.x - (screenX - viewSize.width / 2) / nextScale,
-        z: anchor.z - (screenY - viewSize.height / 2) / nextScale,
-      });
+      setCamera(
+        constrainActiveExplorationCamera(
+          {
+            x: anchor.x - (screenX - viewSize.width / 2) / nextScale,
+            z: anchor.z - (screenY - viewSize.height / 2) / nextScale,
+          },
+          nextScale,
+        ),
+      );
       setScale(nextScale);
     },
-    [atlasMode, explorationState, scale, viewSize, worldAtScreen],
+    [
+      atlasMode,
+      constrainActiveExplorationCamera,
+      explorationMinimumScale,
+      explorationState,
+      scale,
+      viewSize,
+      worldAtScreen,
+    ],
   );
 
   const hitHighlight = useCallback(
@@ -2935,7 +2979,8 @@ export function MapViewer() {
     setAtlasStatusFilter("all");
     setDrawer("atlas");
     fitAtlasView();
-    notify("Atlas global · elige una lente o selecciona un sector");
+    window.requestAnimationFrame(() => canvasRef.current?.focus());
+    notify("Atlas LOD 0 · selecciona una región para explorar");
   }, [atlasMode, camera, fitAtlasView, notify, scale]);
 
   const closeAtlas = useCallback(
@@ -2961,49 +3006,123 @@ export function MapViewer() {
     return () => window.cancelAnimationFrame(frame);
   }, [atlasMode, fitAtlasView]);
 
-  const openCoverageSelection = useCallback(
-    (maximumDetail = false) => {
-      if (!coverageSelection) return;
+  const startMaxDetailExploration = useCallback(
+    (bounds: WorldBounds, name: string) => {
       if (explorationState) {
-        notify("Pausa la sesión activa antes de abrir otra región");
+        notify("Pausa la sesión activa antes de iniciar otra región");
         return;
       }
-      const bounds = coverageSelection.bounds;
-      const nextScale = maximumDetail
-        ? INITIAL_SCALE
-        : clamp(
-            Math.min(
-              (viewSize.width - 144) /
-                (bounds.maxXExclusive - bounds.minX),
-              (viewSize.height - 144) /
-                (bounds.maxZExclusive - bounds.minZ),
-            ),
-            MIN_SCALE,
-            MAX_SCALE,
-          );
-      setCamera({
-        x: (bounds.minX + bounds.maxXExclusive) / 2,
-        z: (bounds.minZ + bounds.maxZExclusive) / 2,
-      });
-      setScale(nextScale);
-      setMarkMode(null);
-      atlasReturnViewRef.current = null;
-      setDrawer("exploration");
-      applyCoverageSelectionToRegion(coverageSelection);
-      notify(
-        maximumDetail
-          ? "Detalle máximo listo · LOD 0"
-          : "Región abierta; ajusta el zoom o inicia la exploración",
+      const knownExplorationIds = new Set(
+        savedExplorations.map((exploration) => exploration.id),
       );
+      if (knownExplorationIds.size >= MAX_WORKSPACE_EXPLORATIONS) {
+        notify(
+          "El workspace alcanzó el límite de 128 sesiones; exporta una antes de crear otra",
+        );
+        return;
+      }
+      try {
+        const next = createMaxDetailExplorationState({
+          id: `region-${Date.now().toString(36)}`,
+          name: name.trim() || "Región de análisis",
+          bounds,
+        });
+        setExplorationState(next);
+        focusExploration(next);
+        setMarkMode(null);
+        atlasReturnViewRef.current = null;
+        clearTileCache();
+        setDrawer(
+          window.matchMedia("(max-width: 720px)").matches
+            ? null
+            : "exploration",
+        );
+        notify(
+          `${next.region.cellCount.toLocaleString("es-GT")} celdas · LOD 0 · usa las flechas`,
+        );
+      } catch (error) {
+        notify(
+          error instanceof Error ? error.message : "La región no es válida",
+        );
+      }
     },
     [
-      applyCoverageSelectionToRegion,
-      coverageSelection,
+      clearTileCache,
       explorationState,
+      focusExploration,
       notify,
-      viewSize,
+      savedExplorations,
     ],
   );
+
+  const createMaxDetailVersionOfLegacy = useCallback(() => {
+    if (!explorationState || activeExplorationIsMaxDetail) return;
+    const knownExplorationIds = new Set(
+      savedExplorations.map((exploration) => exploration.id),
+    );
+    knownExplorationIds.add(explorationState.region.id);
+    if (knownExplorationIds.size >= MAX_WORKSPACE_EXPLORATIONS) {
+      notify(
+        "El workspace alcanzó el límite de 128 sesiones; elimina o exporta una antes de crear la versión LOD 0",
+      );
+      return;
+    }
+    try {
+      const next = createMaxDetailExplorationState({
+        id: `region-${Date.now().toString(36)}`,
+        name: `${explorationState.region.name} · LOD 0`,
+        bounds: explorationState.region.bounds,
+      });
+      archiveExploration(explorationState);
+      setExplorationState(next);
+      focusExploration(next);
+      setConfirmCloseExploration(false);
+      clearTileCache();
+      setDrawer(
+        window.matchMedia("(max-width: 720px)").matches
+          ? null
+          : "exploration",
+      );
+      notify(
+        `Versión LOD 0 creada · la sesión heredada se conservó sin cambios`,
+      );
+    } catch (error) {
+      notify(
+        error instanceof Error
+          ? error.message
+          : "No se pudo crear la versión LOD 0",
+      );
+    }
+  }, [
+    activeExplorationIsMaxDetail,
+    archiveExploration,
+    clearTileCache,
+    explorationState,
+    focusExploration,
+    notify,
+    savedExplorations,
+  ]);
+
+  const startCoverageSelection = useCallback(() => {
+    if (!coverageSelection) return;
+    if (coverageSelectionTooLarge) {
+      notify(
+        `La selección contiene ${selectedLod0CellCount.toLocaleString("es-GT")} celdas LOD 0; reduce la región`,
+      );
+      return;
+    }
+    const name =
+      coverageSelection.cellCount === 1
+        ? `Sector F${coverageSelection.minRow + 1} · C${coverageSelection.minColumn + 1}`
+        : `Región ${coverageSelection.rows}×${coverageSelection.columns}`;
+    startMaxDetailExploration(coverageSelection.bounds, name);
+  }, [
+    coverageSelection,
+    coverageSelectionTooLarge,
+    notify,
+    selectedLod0CellCount,
+    startMaxDetailExploration,
+  ]);
 
   const beginMarkMode = useCallback(
     (mode: Exclude<MarkMode, null>) => {
@@ -3069,22 +3188,6 @@ export function MapViewer() {
       };
       areaPreviewRef.current = preview;
       setAreaPreview(preview);
-      event.currentTarget.setPointerCapture(event.pointerId);
-      return;
-    }
-
-    if (explorationState && !atlasMode) {
-      const hit = hitHighlight(screenX, screenY);
-      pointerRef.current = {
-        id: event.pointerId,
-        pointerType: event.pointerType,
-        atlasCellWasFocused: false,
-        startX: event.clientX,
-        startY: event.clientY,
-        camera,
-        moved: false,
-        hitId: hit?.id ?? null,
-      };
       event.currentTarget.setPointerCapture(event.pointerId);
       return;
     }
@@ -3200,7 +3303,6 @@ export function MapViewer() {
     }
 
     if (pinchRef.current && activePointersRef.current.size >= 2) {
-      if (explorationState && !atlasMode) return;
       const [first, second] = [...activePointersRef.current.values()];
       const centerX = (first.screenX + second.screenX) / 2;
       const centerY = (first.screenY + second.screenY) / 2;
@@ -3214,17 +3316,26 @@ export function MapViewer() {
       const nextScale = clamp(
         pinchRef.current.startScale *
           (distance / pinchRef.current.startDistance),
-        atlasMode ? ATLAS_MIN_SCALE : MIN_SCALE,
+        atlasMode
+          ? ATLAS_MIN_SCALE
+          : explorationState
+            ? explorationMinimumScale
+            : MIN_SCALE,
         MAX_SCALE,
       );
-      setCamera({
-        x:
-          pinchRef.current.anchor.x -
-          (centerX - viewSize.width / 2) / nextScale,
-        z:
-          pinchRef.current.anchor.z -
-          (centerY - viewSize.height / 2) / nextScale,
-      });
+      setCamera(
+        constrainActiveExplorationCamera(
+          {
+            x:
+              pinchRef.current.anchor.x -
+              (centerX - viewSize.width / 2) / nextScale,
+            z:
+              pinchRef.current.anchor.z -
+              (centerY - viewSize.height / 2) / nextScale,
+          },
+          nextScale,
+        ),
+      );
       setScale(nextScale);
       return;
     }
@@ -3233,12 +3344,17 @@ export function MapViewer() {
     if (!pointer || pointer.id !== event.pointerId) return;
     const dx = event.clientX - pointer.startX;
     const dy = event.clientY - pointer.startY;
-    if (Math.abs(dx) + Math.abs(dy) > 3) pointer.moved = true;
-    if (explorationState && !atlasMode) return;
-    setCamera({
-      x: pointer.camera.x - dx / scale,
-      z: pointer.camera.z - dy / scale,
-    });
+    const movementThreshold = pointer.pointerType === "touch" ? 8 : 3;
+    if (Math.hypot(dx, dy) > movementThreshold) pointer.moved = true;
+    setCamera(
+      constrainActiveExplorationCamera(
+        {
+          x: pointer.camera.x - dx / scale,
+          z: pointer.camera.z - dy / scale,
+        },
+        scale,
+      ),
+    );
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -3295,22 +3411,15 @@ export function MapViewer() {
           );
           const cell = overviewCellAtWorld(point.x, point.z);
           if (cell) {
-            if (
-              pointer.pointerType !== "mouse" &&
-              !pointer.atlasCellWasFocused
-            ) {
-              setAtlasFocusedCellIndex(cell.index);
-              notify(`${cell.id} enfocado · toca otra vez para elegirlo`);
-            } else {
-              commitCoverageSelection(
-                createCoverageSelection(
-                  cell.row,
-                  cell.column,
-                  cell.row + 1,
-                  cell.column + 1,
-                ),
-              );
-            }
+            setAtlasFocusedCellIndex(cell.index);
+            commitCoverageSelection(
+              createCoverageSelection(
+                cell.row,
+                cell.column,
+                cell.row + 1,
+                cell.column + 1,
+              ),
+            );
           }
         } else if (explorationState) {
           const rect = event.currentTarget.getBoundingClientRect();
@@ -3416,6 +3525,28 @@ export function MapViewer() {
       if (next !== explorationState) focusExploration(next);
     },
     [explorationState, focusExploration],
+  );
+
+  const moveAtlasFocusCardinal = useCallback(
+    (direction: CardinalDirection) => {
+      const current = overviewCellForIndex(atlasFocusedCellIndex);
+      const nextRow = clamp(
+        current.row +
+          (direction === "south" ? 1 : direction === "north" ? -1 : 0),
+        0,
+        OVERWORLD_OVERVIEW_ROWS - 1,
+      );
+      const nextColumn = clamp(
+        current.column +
+          (direction === "east" ? 1 : direction === "west" ? -1 : 0),
+        0,
+        OVERWORLD_OVERVIEW_COLUMNS - 1,
+      );
+      setAtlasFocusedCellIndex(
+        nextRow * OVERWORLD_OVERVIEW_COLUMNS + nextColumn,
+      );
+    },
+    [atlasFocusedCellIndex],
   );
 
   useEffect(() => {
@@ -3620,13 +3751,6 @@ export function MapViewer() {
     notify("Archivo local desconectado");
   };
 
-  const toggleOnlineFallback = () => {
-    const next = !onlineFallbackRef.current;
-    onlineFallbackRef.current = next;
-    setOnlineFallback(next);
-    clearTileCache();
-  };
-
   const useCurrentViewForRegion = () => {
     const halfWidth = viewSize.width / (2 * scale);
     const halfHeight = viewSize.height / (2 * scale);
@@ -3642,17 +3766,6 @@ export function MapViewer() {
 
   const startExploration = () => {
     try {
-      const knownExplorationIds = new Set(
-        savedExplorations.map((exploration) => exploration.id),
-      );
-      if (explorationState) {
-        knownExplorationIds.add(explorationState.region.id);
-      }
-      if (knownExplorationIds.size >= MAX_WORKSPACE_EXPLORATIONS) {
-        throw new Error(
-          "El workspace alcanzó el límite de 128 sesiones; exporta una antes de crear otra",
-        );
-      }
       const bounds: WorldBounds = {
         minX: Number(regionForm.minX),
         minZ: Number(regionForm.minZ),
@@ -3664,29 +3777,7 @@ export function MapViewer() {
       ) {
         throw new Error("Las cuatro coordenadas deben ser enteros");
       }
-      if (explorationState) archiveExploration(explorationState);
-      let next = createExplorationState({
-        id: `region-${Date.now().toString(36)}`,
-        name: regionForm.name.trim() || "Región de análisis",
-        bounds,
-        lod,
-        scale,
-      });
-      const initialIndex = cellIndexAtWorld(
-        next.region,
-        camera.x,
-        camera.z,
-      );
-      if (initialIndex !== null) next = withCurrentIndex(next, initialIndex);
-      setExplorationState(next);
-      focusExploration(next);
-      onlineFallbackRef.current = false;
-      setOnlineFallback(false);
-      clearTileCache();
-      setDrawer("exploration");
-      notify(
-        `${next.region.cellCount.toLocaleString("es-GT")} celdas · zoom fijado`,
-      );
+      startMaxDetailExploration(bounds, regionForm.name);
     } catch (error) {
       notify(
         error instanceof Error ? error.message : "La región no es válida",
@@ -3800,10 +3891,12 @@ export function MapViewer() {
       if (explorationState) archiveExploration(explorationState);
       setExplorationState(next);
       focusExploration(next);
-      onlineFallbackRef.current = false;
-      setOnlineFallback(false);
       clearTileCache();
-      setDrawer("exploration");
+      setDrawer(
+        window.matchMedia("(max-width: 720px)").matches
+          ? null
+          : "exploration",
+      );
       notify(`${next.reviewedCount.toLocaleString("es-GT")} celdas restauradas`);
     } catch (error) {
       notify(
@@ -3820,10 +3913,12 @@ export function MapViewer() {
       const next = explorationStateFromWorkspace(exploration);
       setExplorationState(next);
       focusExploration(next);
-      onlineFallbackRef.current = false;
-      setOnlineFallback(false);
       clearTileCache();
-      setDrawer("exploration");
+      setDrawer(
+        window.matchMedia("(max-width: 720px)").matches
+          ? null
+          : "exploration",
+      );
       notify(`Sesión “${next.region.name}” restaurada`);
     } catch {
       notify("La sesión guardada ya no es compatible");
@@ -3847,24 +3942,8 @@ export function MapViewer() {
     notify(`Sesión “${exploration.state.region.name}” eliminada`);
   };
 
-  const reviewCurrentAndMove = (step: -1 | 1) => {
-    if (!explorationState) return;
-    const reviewed = withCurrentCellReviewed(explorationState);
-    const next = moveCurrentSerpentine(reviewed, step);
-    setExplorationState(next);
-    if (next.currentIndex !== explorationState.currentIndex) {
-      focusExploration(next);
-    }
-  };
-
-  const moveExplorationSerpentine = (step: -1 | 1) => {
-    if (!explorationState) return;
-    const next = moveCurrentSerpentine(explorationState, step);
-    setExplorationState(next);
-    if (next !== explorationState) focusExploration(next);
-  };
-
   const toggleCurrentReviewed = () => {
+    if (!canReviewCurrentCell) return;
     setExplorationState((current) =>
       current
         ? withCurrentCellReviewed(
@@ -3875,21 +3954,43 @@ export function MapViewer() {
     );
   };
 
+  const toggleCurrentSkipped = () => {
+    if (!canSkipCurrentCell) return;
+    setExplorationState((current) =>
+      current
+        ? withCurrentCellSkipped(
+            current,
+            !isCellSkipped(current, current.currentIndex),
+          )
+        : current,
+    );
+  };
+
   const downloadCurrentCell = async () => {
     if (!localRuntime?.capacity.configured || !currentExplorationCell) {
       notify("Inicia el visor con la biblioteca local de LuisA");
       return;
     }
-    const selectedLayers = layers
-      .filter((layer) => layer.visible)
-      .map((layer) => layer.id);
+    if (!activeExplorationIsMaxDetail) {
+      notify("Crea una versión LOD 0 para descargar o revisar esta región");
+      return;
+    }
+    if (currentDetailConfirmedAbsent || currentCellSkipped) {
+      notify("La fuente ya confirmó que este tile no existe");
+      return;
+    }
+    const selectedLayers: TileLayer[] = [
+      "base",
+      ...layers
+        .filter((layer) => layer.id !== "base" && layer.visible)
+        .map((layer) => layer.id),
+    ];
     setRuntimeBusy(true);
     try {
       await downloadExplorationCell(
         localRuntime,
         currentExplorationCell.bounds,
-        explorationState!.region.lod,
-        selectedLayers.length > 0 ? selectedLayers : ["base"],
+        selectedLayers,
         requestsPerSecond,
       );
       setLocalRuntime(await readLocalAtlasRuntime());
@@ -4114,7 +4215,7 @@ export function MapViewer() {
             <span>
               {atlasMode
                 ? "sector 32,768 × 32,768"
-                : `${blocksPerPixel} bloque${blocksPerPixel === 1 ? "" : "s"}/px`}
+                : `${explorationState ? "fuente " : ""}${blocksPerPixel} bloque${blocksPerPixel === 1 ? "" : "s"}/px`}
             </span>
           </div>
           <div className="coordinate-actions">
@@ -4143,8 +4244,8 @@ export function MapViewer() {
           active={atlasMode}
           label="Atlas"
           badge={
-            localLod0MapProgress
-              ? Math.round(localLod0MapProgress.percent)
+            atlasProgress
+              ? Math.round(atlasProgress.percent)
               : undefined
           }
           onClick={() => toggleDrawer("atlas")}
@@ -4220,8 +4321,8 @@ export function MapViewer() {
                   <span className="coverage-overview-status">33 × 33</span>
                 </div>
                 <p>
-                  Cambia de lente para distinguir lo publicado, lo que ya está
-                  en disco y el progreso de tus revisiones.
+                  Elige una región y explórala celda por celda. Cada sesión
+                  nueva usa siempre el detalle original LOD 0.
                 </p>
                 {explorationState ? (
                   <button
@@ -4239,262 +4340,192 @@ export function MapViewer() {
                 ) : null}
               </section>
 
-              <div
-                className="atlas-lens-switcher"
-                role="group"
-                aria-label="Lente del Atlas"
-              >
-                {(
-                  [
-                    ["local", "En disco"],
-                    ["review", "Revisado"],
-                    ["source", "Fuente"],
-                  ] as const
-                ).map(([value, label]) => (
-                  <button
-                    type="button"
-                    aria-pressed={atlasLens === value}
-                    className={atlasLens === value ? "active" : ""}
-                    key={value}
-                    onClick={() => {
-                      setAtlasLens(value);
-                      setAtlasStatusFilter("all");
-                    }}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
+              <section className="atlas-detail-lock">
+                <LockKeyhole size={18} />
+                <span>
+                  <strong>Máximo detalle fijo</strong>
+                  <small>LOD 0 · 512 × 512 bloques por celda</small>
+                </span>
+                <span className="atlas-detail-badge">L0</span>
+              </section>
 
-              {atlasLens !== "source" ? (
-                <section className="atlas-lod-control">
+              {coverageSelection ? (
+                <section className="atlas-selection-summary">
                   <div>
-                    <span>
-                      {atlasLens === "local"
-                        ? "DETALLE GUARDADO"
-                        : "DETALLE REVISADO"}
-                    </span>
+                    <span>SELECCIÓN LISTA</span>
                     <strong>
-                      LOD {atlasLod}
-                      {atlasLod === 0
-                        ? " · máximo detalle"
-                        : atlasLod === 3
-                          ? " · vista general"
-                          : ""}
+                      {coverageSelection.rows} × {coverageSelection.columns} ·{" "}
+                      {selectedLod0CellCount.toLocaleString("es-GT")} celdas L0
                     </strong>
                   </div>
-                  <div aria-label="Elegir LOD de progreso">
-                    {[0, 1, 2, 3].map((value) => (
+                  <button
+                    type="button"
+                    disabled={!explorationState && coverageSelectionTooLarge}
+                    title={
+                      explorationState
+                        ? "Volver a la sesión activa"
+                        : coverageSelectionTooLarge
+                          ? "Reduce la región para mantener una sesión segura"
+                          : "Iniciar la región en máximo detalle"
+                    }
+                    onClick={() => {
+                      if (explorationState) closeAtlas("exploration");
+                      else startCoverageSelection();
+                    }}
+                  >
+                    <ScanSearch size={15} />
+                    {explorationState
+                      ? "Volver a la sesión"
+                      : "Explorar en máximo detalle"}
+                  </button>
+                  {coverageSelectionTooLarge ? (
+                    <small className="atlas-selection-warning">
+                      El máximo seguro es{" "}
+                      {MAX_EXPLORATION_CELLS.toLocaleString("es-GT")} celdas.
+                      Reduce la selección.
+                    </small>
+                  ) : explorationState ? (
+                    <small>
+                      Pausa la sesión activa antes de iniciar otra región.
+                    </small>
+                  ) : null}
+                </section>
+              ) : null}
+
+              <section className="atlas-progress-card">
+                <div className="atlas-progress-heading">
+                  <div>
+                    <span>DESCARGA LOCAL · LOD 0</span>
+                    <strong>Overworld en máximo detalle</strong>
+                  </div>
+                  <strong>
+                    {atlasProgress
+                      ? `${formatProgressPercent(atlasProgress.percent)}%`
+                      : "—"}
+                  </strong>
+                </div>
+                {atlasProgress ? (
+                  <div
+                    className="atlas-progress-track"
+                    role="progressbar"
+                    aria-label="Cobertura local LOD 0"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={atlasProgress.percent}
+                  >
+                    <span style={{ width: `${atlasProgress.percent}%` }} />
+                  </div>
+                ) : null}
+                {localCoverageState === "loading" ? (
+                  <p className="atlas-progress-loading" role="status">
+                    Leyendo la biblioteca local…
+                  </p>
+                ) : localCoverageState === "error" ? (
+                  <p className="atlas-progress-error" role="alert">
+                    La cobertura local no está disponible. Tus sesiones y
+                    selecciones siguen intactas.
+                  </p>
+                ) : (
+                  <div className="atlas-status-grid">
+                    {(
+                      [
+                        [
+                          "complete",
+                          "Listas",
+                          atlasProgress?.completeSectorCount ?? 0,
+                        ],
+                        [
+                          "in-progress",
+                          "En curso",
+                          atlasProgress?.inProgressSectorCount ?? 0,
+                        ],
+                        [
+                          "pending",
+                          "Por explorar",
+                          atlasProgress?.pendingSectorCount ?? 0,
+                        ],
+                      ] as const
+                    ).map(([status, label, value]) => (
                       <button
                         type="button"
-                        aria-pressed={atlasLod === value}
-                        className={atlasLod === value ? "active" : ""}
-                        key={value}
-                        onClick={() => {
-                          setAtlasLod(value);
-                          setAtlasStatusFilter("all");
-                        }}
+                        data-status={status}
+                        aria-pressed={atlasStatusFilter === status}
+                        className={
+                          atlasStatusFilter === status ? "active" : ""
+                        }
+                        key={status}
+                        onClick={() =>
+                          setAtlasStatusFilter((current) =>
+                            current === status ? "all" : status,
+                          )
+                        }
                       >
-                        L{value}
+                        <span>{label}</span>
+                        <strong>{value.toLocaleString("es-GT")}</strong>
                       </button>
                     ))}
                   </div>
-                </section>
-              ) : (
-                <section className="atlas-source-note">
-                  <Grid3X3 size={17} />
-                  <span>
-                    <strong>Huella publicada · LOD 3</strong>
-                    <small>
-                      El contorno ámbar discontinuo marca bordes parciales; no
-                      es progreso pendiente.
-                    </small>
-                  </span>
-                </section>
-              )}
-
-              {atlasLens === "source" ? (
-                <section className="atlas-progress-card" data-lens="source">
-                  <div className="atlas-progress-heading">
-                    <div>
-                      <span>CATÁLOGO VERIFICADO · LOD 3</span>
-                      <strong>Huella publicada disponible</strong>
-                    </div>
-                    <strong>66,464</strong>
-                  </div>
-                  <div className="atlas-status-grid">
-                    <div data-status="complete">
-                      <span>Completos</span>
-                      <strong>{coverageSummary.full}</strong>
-                    </div>
-                    <div data-status="in-progress">
-                      <span>Parciales</span>
-                      <strong>{coverageSummary.partial}</strong>
-                    </div>
-                    <div data-status="pending">
-                      <span>Sin datos</span>
-                      <strong>{coverageSummary.empty}</strong>
-                    </div>
-                  </div>
-                </section>
-              ) : (
-                <section className="atlas-progress-card">
-                  <div className="atlas-progress-heading">
-                    <div>
-                      <span>
-                        {atlasLens === "local"
-                          ? "TERRENO EN DISCO"
-                          : "PROGRESO DE REVISIÓN"}
-                      </span>
-                      <strong>
-                        {atlasLens === "local"
-                          ? `Mundo · LOD ${atlasLod}`
-                          : `${atlasExplorations.length} ${
-                              atlasExplorations.length === 1
-                                ? "región guardada"
-                                : "regiones guardadas"
-                            }`}
-                      </strong>
-                    </div>
-                    <strong>
-                      {atlasProgress
-                        ? `${formatProgressPercent(atlasProgress.percent)}%`
-                        : "—"}
-                    </strong>
-                  </div>
-                  {atlasProgress ? (
-                    <div
-                      className="atlas-progress-track"
-                      role="progressbar"
-                      aria-label={
-                        atlasLens === "local"
-                          ? "Cobertura del terreno en disco"
-                          : "Cobertura de revisión"
-                      }
-                      aria-valuemin={0}
-                      aria-valuemax={100}
-                      aria-valuenow={atlasProgress.percent}
-                    >
-                      <span style={{ width: `${atlasProgress.percent}%` }} />
-                    </div>
-                  ) : null}
-                  {atlasLens === "local" &&
-                  localCoverageState === "loading" ? (
-                    <p className="atlas-progress-loading" role="status">
-                      Leyendo tiles.sqlite3…
-                    </p>
-                  ) : atlasLens === "local" &&
-                    localCoverageState === "error" ? (
-                    <p className="atlas-progress-error" role="alert">
-                      La cobertura local no está disponible. Tus sesiones y
-                      selecciones siguen intactas.
-                    </p>
-                  ) : (
-                    <div className="atlas-status-grid">
-                      {(
-                        [
-                          [
-                            "complete",
-                            "Completas",
-                            atlasProgress?.completeSectorCount ?? 0,
-                          ],
-                          [
-                            "in-progress",
-                            "En curso",
-                            atlasProgress?.inProgressSectorCount ?? 0,
-                          ],
-                          [
-                            "pending",
-                            "Pendientes",
-                            atlasProgress?.pendingSectorCount ?? 0,
-                          ],
-                        ] as const
-                      ).map(([status, label, value]) => (
-                        <button
-                          type="button"
-                          data-status={status}
-                          aria-pressed={atlasStatusFilter === status}
-                          className={
-                            atlasStatusFilter === status ? "active" : ""
-                          }
-                          key={status}
-                          onClick={() =>
-                            setAtlasStatusFilter((current) =>
-                              current === status ? "all" : status,
-                            )
-                          }
-                        >
-                          <span>{label}</span>
-                          <strong>{value.toLocaleString("es-GT")}</strong>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  {atlasLens === "local" &&
-                  localCoverageState === "stale" ? (
-                    <p className="atlas-progress-stale" role="status">
-                      Mostrando la última lectura válida. El Atlas reintentará
-                      conectar automáticamente.
-                    </p>
-                  ) : null}
-                  {atlasLens === "local" &&
-                  (atlasProgress?.queuedCount ?? 0) > 0 ? (
-                    <p className="atlas-sector-note">
-                      {atlasProgress?.queuedCount.toLocaleString("es-GT")} tiles
-                      en cola o descargándose
-                    </p>
-                  ) : null}
-                  {atlasLens === "local" &&
-                  (atlasProgress?.failedCount ?? 0) > 0 ? (
-                    <p className="atlas-sector-warning" role="alert">
-                      <AlertTriangle size={14} />
-                      {atlasProgress?.failedCount.toLocaleString("es-GT")} tiles
-                      requieren atención
-                    </p>
-                  ) : null}
-                  {atlasLens === "local" &&
-                  (atlasProgress?.excludedCount ?? 0) > 0 ? (
-                    <p className="atlas-sector-note">
-                      {atlasProgress?.excludedCount.toLocaleString("es-GT")}{" "}
-                      tiles 404 confirmados fuera del objetivo fino
-                    </p>
-                  ) : null}
-                  {atlasStatusFilter !== "all" ? (
-                    <button
-                      type="button"
-                      className="atlas-clear-filter"
-                      onClick={() => setAtlasStatusFilter("all")}
-                    >
-                      <X size={13} />
-                      Mostrar todos los sectores
-                    </button>
-                  ) : null}
-                  {atlasNextPending ? (
-                    <button
-                      type="button"
-                      className="atlas-next-pending"
-                      onClick={() => {
-                        setAtlasStatusFilter("all");
-                        setAtlasFocusedCellIndex(atlasNextPending.index);
-                        const cell = overviewCellForIndex(
-                          atlasNextPending.index,
-                        );
-                        commitCoverageSelection(
-                          createCoverageSelection(
-                            cell.row,
-                            cell.column,
-                            cell.row + 1,
-                            cell.column + 1,
-                          ),
-                        );
-                      }}
-                    >
-                      <Navigation size={15} />
-                      Ir al siguiente pendiente
-                    </button>
-                  ) : null}
-                </section>
-              )}
+                )}
+                {localCoverageState === "stale" ? (
+                  <p className="atlas-progress-stale" role="status">
+                    Mostrando la última lectura válida; se reintentará
+                    automáticamente.
+                  </p>
+                ) : null}
+                {(atlasProgress?.queuedCount ?? 0) > 0 ? (
+                  <p className="atlas-sector-note">
+                    {atlasProgress?.queuedCount.toLocaleString("es-GT")} tiles
+                    en cola o descargándose
+                  </p>
+                ) : null}
+                {(atlasProgress?.failedCount ?? 0) > 0 ? (
+                  <p className="atlas-sector-warning" role="alert">
+                    <AlertTriangle size={14} />
+                    {atlasProgress?.failedCount.toLocaleString("es-GT")} tiles
+                    requieren atención
+                  </p>
+                ) : null}
+                {(atlasProgress?.excludedCount ?? 0) > 0 ? (
+                  <p className="atlas-sector-note">
+                    {atlasProgress?.excludedCount.toLocaleString("es-GT")} tiles
+                    sin imagen confirmada, excluidos del objetivo
+                  </p>
+                ) : null}
+                {atlasStatusFilter !== "all" ? (
+                  <button
+                    type="button"
+                    className="atlas-clear-filter"
+                    onClick={() => setAtlasStatusFilter("all")}
+                  >
+                    <X size={13} />
+                    Mostrar todos los sectores
+                  </button>
+                ) : null}
+                {atlasNextPending ? (
+                  <button
+                    type="button"
+                    className="atlas-next-pending"
+                    onClick={() => {
+                      setAtlasStatusFilter("all");
+                      setAtlasFocusedCellIndex(atlasNextPending.index);
+                      const cell = overviewCellForIndex(
+                        atlasNextPending.index,
+                      );
+                      commitCoverageSelection(
+                        createCoverageSelection(
+                          cell.row,
+                          cell.column,
+                          cell.row + 1,
+                          cell.column + 1,
+                        ),
+                      );
+                    }}
+                  >
+                    <Navigation size={15} />
+                    Ir al siguiente por explorar
+                  </button>
+                ) : null}
+              </section>
 
               <section
                 className="atlas-sector-inspector"
@@ -4522,62 +4553,41 @@ export function MapViewer() {
                   ) : (
                     <span
                       className="atlas-sector-state"
-                      data-status={
-                        atlasFocusedCell.coverageStatus === "full"
-                          ? "complete"
-                          : "in-progress"
-                      }
+                      data-status="pending"
                     >
-                      {atlasFocusedCell.coverageStatus === "full"
-                        ? "Publicado"
-                        : "Parcial"}
+                      Midiendo
                     </span>
                   )}
                 </div>
                 <div className="atlas-sector-metrics">
                   <span>
-                    {atlasLens === "source"
-                      ? "Publicados"
-                      : atlasLens === "local"
-                        ? "En disco"
-                        : "Revisados"}
+                    Guardados
                     <strong>
-                      {atlasLens === "source"
-                        ? atlasFocusedCell.availableTileCount
-                        : atlasFocusedProgress?.completeCount.toLocaleString(
-                            "es-GT",
-                          ) ?? "—"}
+                      {atlasFocusedProgress?.completeCount.toLocaleString(
+                        "es-GT",
+                      ) ?? "—"}
                     </strong>
                   </span>
                   <span>
-                    {atlasLens === "source" ? "Capacidad" : "Objetivo"}
+                    Objetivo
                     <strong>
-                      {atlasLens === "source"
-                        ? atlasFocusedCell.tileCount
-                        : atlasFocusedProgress?.expectedCount.toLocaleString(
-                            "es-GT",
-                          ) ?? "—"}
+                      {atlasFocusedProgress?.expectedCount.toLocaleString(
+                        "es-GT",
+                      ) ?? "—"}
                     </strong>
                   </span>
                   <span>
-                    {atlasLens === "review" ? "Avance" : "Cobertura"}
+                    Descarga
                     <strong>
-                      {atlasLens === "source"
-                        ? `${Math.round(
-                            (atlasFocusedCell.availableTileCount /
-                              atlasFocusedCell.tileCount) *
-                              100,
+                      {atlasFocusedProgress
+                        ? `${formatProgressPercent(
+                            atlasFocusedProgress.percent,
                           )}%`
-                        : atlasFocusedProgress
-                          ? `${formatProgressPercent(
-                              atlasFocusedProgress.percent,
-                            )}%`
-                          : "—"}
+                        : "—"}
                     </strong>
                   </span>
                 </div>
-                {atlasLens === "local" &&
-                (atlasFocusedProgress?.queuedCount ?? 0) > 0 ? (
+                {(atlasFocusedProgress?.queuedCount ?? 0) > 0 ? (
                   <p className="atlas-sector-note">
                     {atlasFocusedProgress?.queuedCount.toLocaleString(
                       "es-GT",
@@ -4585,16 +4595,14 @@ export function MapViewer() {
                     tiles en cola o descargándose
                   </p>
                 ) : null}
-                {atlasLens === "local" &&
-                (atlasFocusedLocalCell?.failedCount ?? 0) > 0 ? (
+                {(atlasFocusedLocalCell?.failedCount ?? 0) > 0 ? (
                   <p className="atlas-sector-warning">
                     <AlertTriangle size={14} />
                     {atlasFocusedLocalCell?.failedCount.toLocaleString("es-GT")}{" "}
                     tiles requieren atención
                   </p>
                 ) : null}
-                {atlasLens === "local" &&
-                (atlasFocusedProgress?.excludedCount ?? 0) > 0 ? (
+                {(atlasFocusedProgress?.excludedCount ?? 0) > 0 ? (
                   <p className="atlas-sector-note">
                     {atlasFocusedProgress?.excludedCount.toLocaleString(
                       "es-GT",
@@ -4614,6 +4622,56 @@ export function MapViewer() {
                   )}
                   )
                 </code>
+                <div
+                  className="direction-pad atlas-focus-pad"
+                  aria-label="Ajustar sector en foco"
+                >
+                  <button
+                    type="button"
+                    className="north"
+                    aria-label="Sector superior"
+                    disabled={atlasFocusedCell.row === 0}
+                    onClick={() => moveAtlasFocusCardinal("north")}
+                  >
+                    <ArrowUp />
+                  </button>
+                  <button
+                    type="button"
+                    className="west"
+                    aria-label="Sector izquierdo"
+                    disabled={atlasFocusedCell.column === 0}
+                    onClick={() => moveAtlasFocusCardinal("west")}
+                  >
+                    <ArrowLeft />
+                  </button>
+                  <span className="center-label" aria-hidden="true">
+                    F{atlasFocusedCell.row + 1} C
+                    {atlasFocusedCell.column + 1}
+                  </span>
+                  <button
+                    type="button"
+                    className="east"
+                    aria-label="Sector derecho"
+                    disabled={
+                      atlasFocusedCell.column ===
+                      OVERWORLD_OVERVIEW_COLUMNS - 1
+                    }
+                    onClick={() => moveAtlasFocusCardinal("east")}
+                  >
+                    <ArrowRight />
+                  </button>
+                  <button
+                    type="button"
+                    className="south"
+                    aria-label="Sector inferior"
+                    disabled={
+                      atlasFocusedCell.row === OVERWORLD_OVERVIEW_ROWS - 1
+                    }
+                    onClick={() => moveAtlasFocusCardinal("south")}
+                  >
+                    <ArrowDown />
+                  </button>
+                </div>
                 <div className="atlas-sector-actions">
                   <button
                     type="button"
@@ -4677,37 +4735,6 @@ export function MapViewer() {
                   </button>
                 </div>
               </section>
-
-              {coverageSelection ? (
-                <section className="atlas-selection-summary">
-                  <div>
-                    <span>SELECCIÓN LISTA</span>
-                    <strong>
-                      {coverageSelection.rows} × {coverageSelection.columns} ·{" "}
-                      {coverageSelection.availableCellCount} con datos
-                    </strong>
-                  </div>
-                  <button
-                    type="button"
-                    disabled={Boolean(explorationState)}
-                    title={
-                      explorationState
-                        ? "Vuelve a la sesión activa y páusala antes de crear otra"
-                        : "Abrir selección en detalle"
-                    }
-                    onClick={() => openCoverageSelection(false)}
-                  >
-                    <ScanSearch size={15} />
-                    Abrir selección
-                  </button>
-                  {explorationState ? (
-                    <small>
-                      La sesión activa sigue segura. Vuelve a ella para
-                      pausarla antes de crear otra región.
-                    </small>
-                  ) : null}
-                </section>
-              ) : null}
 
               <div className="atlas-keyboard-hint">
                 <kbd>←↑↓→</kbd>
@@ -4797,45 +4824,45 @@ export function MapViewer() {
                   <span className="coverage-overview-status">33 × 33</span>
                 </div>
                 <p>
-                  Abre el mundo completo sin pausar tu sesión. Alterna entre
-                  terreno en disco, revisión y fuente publicada.
+                  Abre el mapa completo, selecciona una región e inicia su
+                  recorrido directamente en LOD 0.
                 </p>
-                {localLod0MapProgress ? (
+                {atlasProgress ? (
                   <>
                     <div className="atlas-launch-stats">
                       <span>
                         <strong>
-                          {localLod0MapProgress.completeSectorCount}
+                          {atlasProgress.completeSectorCount}
                         </strong>
-                        completas · L0
+                        listas · L0
                       </span>
                       <span>
                         <strong>
-                          {localLod0MapProgress.inProgressSectorCount}
+                          {atlasProgress.inProgressSectorCount}
                         </strong>
                         en curso
                       </span>
                       <span>
                         <strong>
-                          {localLod0MapProgress.pendingSectorCount}
+                          {atlasProgress.pendingSectorCount}
                         </strong>
-                        pendientes
+                        por explorar
                       </span>
                     </div>
-                    {localCoverageErrorLods.has(0) ? (
+                    {localCoverageError ? (
                       <p className="atlas-launch-loading" role="status">
                         Última lectura válida; reintentando automáticamente.
                       </p>
                     ) : null}
                   </>
-                ) : localCoverageErrorLods.has(0) ? (
+                ) : localCoverageError ? (
                   <p className="atlas-launch-loading" role="alert">
-                    No se pudo medir el terreno local. Abre el Atlas para
-                    reintentar.
+                    No se pudo medir la biblioteca local. Se reintentará
+                    automáticamente.
                   </p>
                 ) : (
                   <p className="atlas-launch-loading" role="status">
-                    Midiendo el terreno guardado en LuisA…
+                    Midiendo el detalle LOD 0 guardado en LuisA…
                   </p>
                 )}
                 <button
@@ -4866,7 +4893,7 @@ export function MapViewer() {
                   </div>
                   {coverageSelection ? (
                     <span className="coverage-selection-status">
-                      {coverageSelection.availableCellCount} con datos
+                      {selectedLod0CellCount.toLocaleString("es-GT")} celdas L0
                     </span>
                   ) : null}
                 </div>
@@ -4878,12 +4905,24 @@ export function MapViewer() {
                         <strong>{coverageSelection.cellCount}</strong>
                       </span>
                       <span>
-                        Completos
-                        <strong>{coverageSelection.fullCellCount}</strong>
+                        Filas L0
+                        <strong>
+                          {Math.ceil(
+                            (coverageSelection.bounds.maxZExclusive -
+                              coverageSelection.bounds.minZ) /
+                              blocksPerTileAtLod(MAX_DETAIL_EXPLORATION_LOD),
+                          ).toLocaleString("es-GT")}
+                        </strong>
                       </span>
                       <span>
-                        Parciales
-                        <strong>{coverageSelection.partialCellCount}</strong>
+                        Columnas L0
+                        <strong>
+                          {Math.ceil(
+                            (coverageSelection.bounds.maxXExclusive -
+                              coverageSelection.bounds.minX) /
+                              blocksPerTileAtLod(MAX_DETAIL_EXPLORATION_LOD),
+                          ).toLocaleString("es-GT")}
+                        </strong>
                       </span>
                     </div>
                     <span className="coverage-selection-bounds">
@@ -4900,39 +4939,57 @@ export function MapViewer() {
                     <div className="coverage-full-map-actions">
                       <button
                         type="button"
-                        disabled={Boolean(explorationState)}
-                        title={
-                          explorationState
-                            ? "Pausa la sesión activa antes de abrir otra región"
-                            : "Encajar la región seleccionada"
-                        }
-                        onClick={() => openCoverageSelection(false)}
-                      >
-                        <Crosshair size={15} />
-                        Encajar región
-                      </button>
-                      <button
-                        type="button"
                         data-primary="true"
-                        disabled={Boolean(explorationState)}
+                        disabled={!explorationState && coverageSelectionTooLarge}
                         title={
                           explorationState
-                            ? "Pausa la sesión activa antes de preparar otra región"
-                            : "Preparar la región seleccionada en LOD 0"
+                            ? "Volver a la sesión activa"
+                            : coverageSelectionTooLarge
+                              ? "Reduce la selección para iniciar LOD 0"
+                              : "Crear una sesión LOD 0 y abrir su primera celda"
                         }
-                        onClick={() => openCoverageSelection(true)}
+                        onClick={() => {
+                          if (explorationState) {
+                            setDrawer(
+                              window.matchMedia("(max-width: 720px)").matches
+                                ? null
+                                : "exploration",
+                            );
+                            focusExploration(explorationState);
+                          } else {
+                            startCoverageSelection();
+                          }
+                        }}
                       >
                         <ScanSearch size={15} />
-                        Preparar LOD 0
+                        {explorationState
+                          ? "Volver a la sesión activa"
+                          : "Iniciar exploración LOD 0"}
                       </button>
                     </div>
+                    {coverageSelectionTooLarge ? (
+                      <p className="coverage-selection-warning" role="alert">
+                        La región supera el máximo seguro de{" "}
+                        {MAX_EXPLORATION_CELLS.toLocaleString("es-GT")} celdas.
+                        Selecciona menos sectores.
+                      </p>
+                    ) : null}
                   </>
                 ) : (
-                  <p className="coverage-selection-hint">
-                    Abre el Atlas global y elige un sector, o arrastra para
-                    seleccionar varios. También puedes escribir coordenadas
-                    exactas.
-                  </p>
+                  <>
+                    <p className="coverage-selection-hint">
+                      Elige un sector con un toque o arrastra varios sectores en
+                      el Atlas.
+                    </p>
+                    <button
+                      type="button"
+                      className="coverage-empty-action"
+                      onClick={viewFullCoverage}
+                    >
+                      <MapIcon size={16} />
+                      Elegir región en el Atlas
+                    </button>
+                  </>
                 )}
               </section>
 
@@ -4996,10 +5053,15 @@ export function MapViewer() {
                         explorationState?.region.id === exploration.id;
                       const savedState =
                         explorationStateFromWorkspace(exploration);
+                      const savedReviewableCount =
+                        savedState.region.cellCount -
+                        exploration.state.skippedCount;
                       const sessionPercent =
-                        (exploration.state.reviewedCount /
-                          savedState.region.cellCount) *
-                        100;
+                        savedReviewableCount === 0
+                          ? 100
+                          : (exploration.state.reviewedCount /
+                              savedReviewableCount) *
+                            100;
                       return (
                         <article
                           className={`saved-session-item ${
@@ -5014,9 +5076,12 @@ export function MapViewer() {
                               {exploration.state.reviewedCount.toLocaleString(
                                 "es-GT",
                               )}{" / "}
-                              {savedState.region.cellCount.toLocaleString(
+                              {savedReviewableCount.toLocaleString(
                                 "es-GT",
                               )}
+                              {exploration.state.skippedCount > 0
+                                ? ` · ${exploration.state.skippedCount.toLocaleString("es-GT")} sin datos`
+                                : ""}
                             </small>
                             <span className="saved-session-mini-track">
                               <i style={{ width: `${sessionPercent}%` }} />
@@ -5143,84 +5208,82 @@ export function MapViewer() {
 
               {!explorationState ? (
                 <>
-                  <div className="section-copy">
-                    <p>Divide una región en celdas del LOD actual.</p>
-                    <span>
-                      Cada celda es un tile; el zoom queda fijado durante la
-                      revisión.
-                    </span>
-                  </div>
-                  <div className="region-actions">
-                    <button
-                      type="button"
-                      onClick={() => beginMarkMode("region")}
-                    >
-                      <SquareMousePointer size={16} />
-                      Dibujar región
-                    </button>
-                    <button type="button" onClick={useCurrentViewForRegion}>
-                      <Crosshair size={16} />
-                      Usar vista
-                    </button>
-                  </div>
-                  <label className="region-name-field">
-                    <span>Nombre</span>
-                    <input
-                      value={regionForm.name}
-                      maxLength={200}
-                      onChange={(event) =>
-                        setRegionForm((current) => ({
-                          ...current,
-                          name: event.target.value,
-                        }))
-                      }
-                    />
-                  </label>
-                  <details className="region-advanced-details">
-                    <summary>Coordenadas avanzadas</summary>
-                    <div className="region-coordinate-grid">
-                      {(
-                        [
-                          ["minX", "X mínima"],
-                          ["minZ", "Z mínima"],
-                          ["maxXExclusive", "X máxima"],
-                          ["maxZExclusive", "Z máxima"],
-                        ] as const
-                      ).map(([field, label]) => (
-                        <label key={field}>
-                          <span>{label}</span>
-                          <input
-                            inputMode="numeric"
-                            value={regionForm[field]}
-                            onChange={(event) =>
-                              setRegionForm((current) => ({
-                                ...current,
-                                [field]: event.target.value,
-                              }))
-                            }
-                          />
-                        </label>
-                      ))}
+                  <details className="manual-region-details">
+                    <summary>
+                      <SquareDashedMousePointer size={17} />
+                      <span>
+                        <strong>Definir otra región</strong>
+                        <small>Dibujo, vista actual o coordenadas exactas</small>
+                      </span>
+                    </summary>
+                    <div className="manual-region-content">
+                      <div className="region-actions">
+                        <button
+                          type="button"
+                          onClick={() => beginMarkMode("region")}
+                        >
+                          <SquareMousePointer size={16} />
+                          Dibujar región
+                        </button>
+                        <button type="button" onClick={useCurrentViewForRegion}>
+                          <Crosshair size={16} />
+                          Usar vista
+                        </button>
+                      </div>
+                      <label className="region-name-field">
+                        <span>Nombre</span>
+                        <input
+                          value={regionForm.name}
+                          maxLength={200}
+                          onChange={(event) =>
+                            setRegionForm((current) => ({
+                              ...current,
+                              name: event.target.value,
+                            }))
+                          }
+                        />
+                      </label>
+                      <div className="region-coordinate-grid">
+                        {(
+                          [
+                            ["minX", "X mínima"],
+                            ["minZ", "Z mínima"],
+                            ["maxXExclusive", "X máxima"],
+                            ["maxZExclusive", "Z máxima"],
+                          ] as const
+                        ).map(([field, label]) => (
+                          <label key={field}>
+                            <span>{label}</span>
+                            <input
+                              inputMode="numeric"
+                              value={regionForm[field]}
+                              onChange={(event) =>
+                                setRegionForm((current) => ({
+                                  ...current,
+                                  [field]: event.target.value,
+                                }))
+                              }
+                            />
+                          </label>
+                        ))}
+                      </div>
+                      <div className="fixed-zoom-card">
+                        <LockKeyhole size={17} />
+                        <span>
+                          <strong>Detalle original garantizado</strong>
+                          <small>LOD 0 · 512 bloques por celda</small>
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="primary-button"
+                        onClick={startExploration}
+                      >
+                        <Navigation size={17} />
+                        Iniciar en LOD 0
+                      </button>
                     </div>
                   </details>
-                  <div className="fixed-zoom-card">
-                    <LockKeyhole size={17} />
-                    <span>
-                      <strong>Zoom a fijar: {scale.toFixed(3)}×</strong>
-                      <small>
-                        LOD {lod} · {blocksPerTileAtLod(lod).toLocaleString("es-GT")}{" "}
-                        bloques por celda
-                      </small>
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    className="primary-button"
-                    onClick={startExploration}
-                  >
-                    <Navigation size={17} />
-                    Crear sesión de exploración
-                  </button>
                   <button
                     type="button"
                     className="secondary-button"
@@ -5260,16 +5323,13 @@ export function MapViewer() {
                       <span>
                         Total
                         <strong>
-                          {explorationState.region.cellCount.toLocaleString("es-GT")}
+                          {reviewableCellCount.toLocaleString("es-GT")}
                         </strong>
                       </span>
                       <span>
-                        Posición
+                        Sin datos
                         <strong>
-                          {serpentinePositionForCellIndex(
-                            explorationState.region,
-                            explorationState.currentIndex,
-                          ) + 1}
+                          {explorationState.skippedCount.toLocaleString("es-GT")}
                         </strong>
                       </span>
                     </div>
@@ -5297,6 +5357,64 @@ export function MapViewer() {
                         {currentExplorationCell.bounds.minZ},{" "}
                         {currentExplorationCell.bounds.maxZExclusive})
                       </code>
+                      <div
+                        className="current-detail-status"
+                        data-state={
+                          !activeExplorationIsMaxDetail
+                            ? "legacy"
+                            : currentCellSkipped
+                              ? "absent"
+                            : currentDetailReady
+                              ? "ready"
+                              : currentDetailConfirmedAbsent
+                                ? "absent"
+                              : currentDetailDownloading
+                                ? "loading"
+                                : "missing"
+                        }
+                      >
+                        {activeExplorationIsMaxDetail ? (
+                          currentCellSkipped ? (
+                            <>
+                              <CheckCircle2 size={15} />
+                              Celda omitida por ausencia confirmada en la fuente
+                            </>
+                          ) : currentDetailReady ? (
+                            <>
+                              <CheckCircle2 size={15} />
+                              LOD 0 local listo para revisar
+                            </>
+                          ) : currentDetailConfirmedAbsent ? (
+                            <>
+                              <CheckCircle2 size={15} />
+                              La fuente confirmó que este tile no existe (404)
+                            </>
+                          ) : (
+                            <>
+                              <Download size={15} />
+                              {currentDetailDownloading
+                                ? "Descargando el detalle LOD 0…"
+                                : "Descarga esta celda antes de revisarla"}
+                            </>
+                          )
+                        ) : (
+                          <>
+                            <AlertTriangle size={15} />
+                            Sesión heredada en LOD{" "}
+                            {explorationState.region.lod} · solo lectura
+                          </>
+                        )}
+                      </div>
+                      {!activeExplorationIsMaxDetail ? (
+                        <button
+                          type="button"
+                          className="primary-button legacy-upgrade-button"
+                          onClick={createMaxDetailVersionOfLegacy}
+                        >
+                          <Sparkles size={16} />
+                          Crear versión en LOD 0
+                        </button>
+                      ) : null}
                       <button
                         type="button"
                         className={`review-toggle ${
@@ -5307,39 +5425,103 @@ export function MapViewer() {
                             ? "reviewed"
                             : ""
                         }`}
-                        onClick={toggleCurrentReviewed}
+                        disabled={
+                          !canReviewCurrentCell && !canSkipCurrentCell
+                        }
+                        onClick={
+                          canSkipCurrentCell
+                            ? toggleCurrentSkipped
+                            : toggleCurrentReviewed
+                        }
                       >
                         <CheckCircle2 size={17} />
-                        {isCellReviewed(
+                        {currentCellSkipped
+                          ? "Restaurar celda al recorrido"
+                          : currentDetailConfirmedAbsent
+                            ? "Omitir celda sin datos"
+                            : isCellReviewed(
                           explorationState,
                           explorationState.currentIndex,
                         )
                           ? "Celda revisada"
-                          : "Marcar como revisada"}
+                          : !activeExplorationIsMaxDetail
+                            ? "Solo lectura · crea versión LOD 0"
+                            : canReviewCurrentCell
+                              ? "Marcar como revisada"
+                              : "Esperando detalle LOD 0"}
                       </button>
-                      <div className="sequence-actions">
+                      <div
+                        className="direction-pad direction-pad-inline"
+                        aria-label="Mover a una celda vecina"
+                      >
                         <button
                           type="button"
+                          className="north"
+                          aria-label="Mover arriba"
                           disabled={
-                            serpentinePositionForCellIndex(
+                            cardinalNeighbor(
                               explorationState.region,
                               explorationState.currentIndex,
-                            ) === 0
+                              "north",
+                            ) === null
                           }
-                          onClick={() => moveExplorationSerpentine(-1)}
+                          onClick={() => moveExplorationCardinal("north")}
                         >
-                          <StepBack size={16} />
-                          Anterior
+                          <ArrowUp />
                         </button>
                         <button
                           type="button"
-                          className="next-review"
-                          onClick={() => reviewCurrentAndMove(1)}
+                          className="west"
+                          aria-label="Mover a la izquierda"
+                          disabled={
+                            cardinalNeighbor(
+                              explorationState.region,
+                              explorationState.currentIndex,
+                              "west",
+                            ) === null
+                          }
+                          onClick={() => moveExplorationCardinal("west")}
                         >
-                          Revisada y siguiente
-                          <StepForward size={16} />
+                          <ArrowLeft />
+                        </button>
+                        <span className="center-label" aria-hidden="true">
+                          <Navigation />
+                        </span>
+                        <button
+                          type="button"
+                          className="east"
+                          aria-label="Mover a la derecha"
+                          disabled={
+                            cardinalNeighbor(
+                              explorationState.region,
+                              explorationState.currentIndex,
+                              "east",
+                            ) === null
+                          }
+                          onClick={() => moveExplorationCardinal("east")}
+                        >
+                          <ArrowRight />
+                        </button>
+                        <button
+                          type="button"
+                          className="south"
+                          aria-label="Mover abajo"
+                          disabled={
+                            cardinalNeighbor(
+                              explorationState.region,
+                              explorationState.currentIndex,
+                              "south",
+                            ) === null
+                          }
+                          onClick={() => moveExplorationCardinal("south")}
+                        >
+                          <ArrowDown />
                         </button>
                       </div>
+                      <small className="direction-pad-hint">
+                        Flechas del teclado o controles para moverte por la
+                        región.
+                      </small>
                     </section>
                   )}
 
@@ -5361,6 +5543,9 @@ export function MapViewer() {
                       <select
                         value={requestsPerSecond}
                         disabled={
+                          !activeExplorationIsMaxDetail ||
+                          currentDetailConfirmedAbsent ||
+                          currentCellSkipped ||
                           localRuntime?.job?.status === "running" ||
                           localRuntime?.job?.status === "stopping"
                         }
@@ -5391,12 +5576,25 @@ export function MapViewer() {
                         className="primary-button"
                         disabled={
                           runtimeBusy ||
+                          !activeExplorationIsMaxDetail ||
+                          currentDetailConfirmedAbsent ||
+                          currentCellSkipped ||
                           !localRuntime?.capacity.configured
                         }
                         onClick={downloadCurrentCell}
                       >
-                        <Download size={16} />
-                        Descargar celda actual
+                        {activeExplorationIsMaxDetail ? (
+                          <Download size={16} />
+                        ) : (
+                          <LockKeyhole size={16} />
+                        )}
+                        {activeExplorationIsMaxDetail
+                          ? currentDetailConfirmedAbsent
+                            ? "Sin datos confirmado"
+                            : currentCellSkipped
+                              ? "Celda omitida"
+                            : "Descargar celda actual"
+                          : "Solo disponible en LOD 0"}
                       </button>
                     )}
                     <small>
@@ -5471,7 +5669,7 @@ export function MapViewer() {
               />
 
               <details className="local-data-details">
-                <summary>Fuentes de datos locales</summary>
+                <summary>Biblioteca local</summary>
                 <div className={`archive-hero ${localSource ? "connected" : ""}`}>
                   <div className="archive-icon">
                     {localSource ? <Check /> : <FolderOpen />}
@@ -5486,7 +5684,7 @@ export function MapViewer() {
                           ? "LuisA conectada"
                           : "Elegir 2b2t_tiles")}
                     </h3>
-                    <p>Los tiles locales siempre tienen prioridad.</p>
+                    <p>El visor solo abre tiles que ya están guardados.</p>
                   </div>
                 </div>
                 {localSupported && (
@@ -5499,24 +5697,8 @@ export function MapViewer() {
                     {localSource ? "Desconectar carpeta" : "Elegir carpeta"}
                   </button>
                 )}
-                <button
-                  className="setting-row"
-                  type="button"
-                  aria-pressed={onlineFallback}
-                  onClick={toggleOnlineFallback}
-                >
-                  <RotateCcw size={18} />
-                  <span>
-                    <strong>Vista rápida online</strong>
-                    <small>
-                      Opcional; no guarda tiles ni respeta el ritmo regional
-                    </small>
-                  </span>
-                  <span className={`switch ${onlineFallback ? "on" : ""}`} />
-                </button>
                 <div className="stats-grid">
                   <Metric label="Local" value={tileStats.local} tone="mint" />
-                  <Metric label="Online" value={tileStats.remote} tone="blue" />
                   <Metric
                     label="Ausentes"
                     value={tileStats.missing}
@@ -5781,8 +5963,8 @@ export function MapViewer() {
               <div className="archive-note">
                 <HelpCircle size={17} />
                 <p>
-                  Antes de iniciar, el LOD sigue al zoom. Una sesión fija ambos
-                  valores y convierte cada tile en una celda revisable.
+                  Toda región nueva usa LOD 0. Puedes acercar y mover el mapa
+                  sin perder el detalle original de 512 × 512 bloques.
                 </p>
               </div>
               <a
@@ -5814,9 +5996,7 @@ export function MapViewer() {
             ? "Carpeta local"
             : localRuntime?.capacity.configured
               ? "Biblioteca LuisA"
-              : onlineFallback
-                ? "Vista online"
-                : "Solo local"}
+              : "Solo local"}
         </strong>
         <span>
           Cursor X {formatCoordinate(cursor.x)} · Z {formatCoordinate(cursor.z)}
@@ -5840,14 +6020,67 @@ export function MapViewer() {
           <div className="navigation-progress">
             <span>
               CELDA{" "}
-              {serpentinePositionForCellIndex(
-                explorationState.region,
-                explorationState.currentIndex,
-              ) + 1}{" "}
+              {explorationState.currentIndex + 1}{" "}
               / {explorationState.region.cellCount.toLocaleString("es-GT")}
             </span>
             <strong>{formatProgressPercent(explorationPercent)}%</strong>
           </div>
+          {!activeExplorationIsMaxDetail ? (
+            <button
+              type="button"
+              className="navigation-review needs-download"
+              onClick={createMaxDetailVersionOfLegacy}
+            >
+              <Sparkles />
+              Crear L0
+            </button>
+          ) : !currentDetailReady &&
+            !currentDetailConfirmedAbsent &&
+            !currentCellSkipped ? (
+            <button
+              type="button"
+              className="navigation-review needs-download"
+              disabled={
+                runtimeBusy ||
+                currentDetailDownloading ||
+                !localRuntime?.capacity.configured
+              }
+              onClick={downloadCurrentCell}
+            >
+              <Download />
+              {currentDetailDownloading ? "Descargando…" : "Descargar L0"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className={`navigation-review ${
+                isCellReviewed(
+                  explorationState,
+                  explorationState.currentIndex,
+                )
+                  ? "reviewed"
+                  : ""
+              }`}
+              disabled={!canReviewCurrentCell && !canSkipCurrentCell}
+              onClick={
+                canSkipCurrentCell
+                  ? toggleCurrentSkipped
+                  : toggleCurrentReviewed
+              }
+            >
+              <CheckCircle2 />
+              {currentCellSkipped
+                ? "Restaurar celda"
+                : currentDetailConfirmedAbsent
+                  ? "Omitir sin datos"
+                  : isCellReviewed(
+                explorationState,
+                explorationState.currentIndex,
+              )
+                ? "Revisada"
+                : "Marcar revisada"}
+            </button>
+          )}
           <div className="direction-pad">
             <button
               type="button"
@@ -5879,14 +6112,9 @@ export function MapViewer() {
             >
               <ArrowLeft />
             </button>
-            <button
-              type="button"
-              className="review"
-              aria-label="Marcar revisada y avanzar"
-              onClick={() => reviewCurrentAndMove(1)}
-            >
-              <Check />
-            </button>
+            <span className="center-label" aria-hidden="true">
+              <Navigation />
+            </span>
             <button
               type="button"
               className="east"
@@ -5934,7 +6162,6 @@ export function MapViewer() {
           type="button"
           aria-label="Acercar"
           title="Acercar"
-          disabled={Boolean(explorationState) && !atlasMode}
           onClick={() => zoomAt(1.5)}
         >
           <Plus />
@@ -5947,7 +6174,6 @@ export function MapViewer() {
           type="button"
           aria-label="Alejar"
           title="Alejar"
-          disabled={Boolean(explorationState) && !atlasMode}
           onClick={() => zoomAt(1 / 1.5)}
         >
           <Minus />
@@ -5978,17 +6204,7 @@ export function MapViewer() {
               return;
             }
             if (currentExplorationCell && explorationState) {
-              setCamera({
-                x:
-                  (currentExplorationCell.bounds.minX +
-                    currentExplorationCell.bounds.maxXExclusive) /
-                  2,
-                z:
-                  (currentExplorationCell.bounds.minZ +
-                    currentExplorationCell.bounds.maxZExclusive) /
-                  2,
-              });
-              setScale(explorationState.region.scale);
+              focusExploration(explorationState);
             } else {
               setCamera(INITIAL_CAMERA);
               setScale(INITIAL_SCALE);

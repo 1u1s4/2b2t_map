@@ -420,9 +420,12 @@ export function summarizeReviewProgress(
   let inProgressExplorationCount = 0;
   let pendingExplorationCount = 0;
   for (const exploration of eligibleExplorations) {
-    const { reviewedCount, region } = exploration.state;
-    if (reviewedCount === region.cellCount) completedExplorationCount += 1;
-    else if (reviewedCount > 0) inProgressExplorationCount += 1;
+    const { reviewedCount, skippedCount, region } = exploration.state;
+    const reviewableCount = region.cellCount - skippedCount;
+    if (reviewedCount === reviewableCount) completedExplorationCount += 1;
+    else if (reviewedCount > 0 || skippedCount > 0) {
+      inProgressExplorationCount += 1;
+    }
     else pendingExplorationCount += 1;
   }
 

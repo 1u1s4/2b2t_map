@@ -64,6 +64,8 @@ export interface SerializedExplorationWorkspaceState {
   readonly currentIndex: number;
   readonly reviewedCount: number;
   readonly reviewedBits: string;
+  readonly skippedCount: number;
+  readonly skippedBits: string;
 }
 
 export interface AtlasWorkspaceExploration {
