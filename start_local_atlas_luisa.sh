@@ -3,12 +3,13 @@ set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 viewer_dir="${project_dir}/viewer"
-output_dir="/Volumes/2b2t Tiles/2b2t_tiles"
-progress_file="${output_dir}/progress.json"
-log_file="${output_dir}/progress_viewer.log"
-lock_file="${output_dir}/.progress_viewer.lock"
+tile_root="/Volumes/2b2t Tiles/2b2t_tiles"
+backing_root="/Volumes/LuisA"
+runtime_dir="/Users/luisalvarado/Library/Application Support/ObsidianAtlas"
+log_file="${runtime_dir}/local_atlas.log"
+lock_file="${runtime_dir}/.local_atlas.lock"
 lock_guard="${lock_file}.guard"
-session_name="obsidian_atlas_viewer"
+session_name="obsidian_atlas_local"
 viewer_port="${OBSIDIAN_ATLAS_VIEWER_PORT:-3001}"
 python_bin="${PYTHON_BIN:-}"
 if [[ -z "${python_bin}" ]]; then
@@ -20,13 +21,13 @@ mode="${1:-start}"
 usage() {
   cat <<'EOF'
 Uso:
-  ./start_progress_viewer_luisa.sh
-  ./start_progress_viewer_luisa.sh --status
-  ./start_progress_viewer_luisa.sh --stop
+  ./start_local_atlas_luisa.sh
+  ./start_local_atlas_luisa.sh --status
+  ./start_local_atlas_luisa.sh --stop
 
-Inicia Obsidian Atlas en una sesión screen supervisada y limitada a localhost.
-La barra lee la descarga activa cada cinco segundos. El modo interno
---serve-loop y sus auxiliares no están pensados para ejecutarse directamente.
+Inicia el atlas local en una sesión screen supervisada y limitada a localhost.
+Lee tiles únicamente desde la biblioteca configurada en LuisA. El modo interno
+--serve-loop y sus auxiliares no deben ejecutarse directamente.
 EOF
 }
 
@@ -47,7 +48,7 @@ supervisor_pid() {
   kill -0 "${owner_pid}" 2>/dev/null || return 1
   owner_command=$(ps -o command= -p "${owner_pid}" 2>/dev/null || true)
   case "${owner_command}" in
-    *start_progress_viewer_luisa.sh*" --serve-loop"*)
+    *start_local_atlas_luisa.sh*" --serve-loop"*)
       printf '%s\n' "${owner_pid}"
       ;;
     *)
@@ -57,8 +58,9 @@ supervisor_pid() {
 }
 
 bridge_is_ready() {
-  "${python_bin}" - "${viewer_url}/api/local-progress" <<'PY' >/dev/null 2>&1
+  "${python_bin}" - "${viewer_url}/api/local-atlas/status" <<'PY' >/dev/null 2>&1
 import json
+import math
 import sys
 import urllib.request
 
@@ -73,10 +75,31 @@ with urllib.request.urlopen(request, timeout=3) as response:
         raise SystemExit(1)
     payload = json.load(response)
 
-status = payload.get("status")
-if not isinstance(status, str) or not status.strip():
+if not isinstance(payload, dict) or payload.get("localOnly") is not True:
     raise SystemExit(1)
-if "output" in payload or "resume_command" in payload:
+capacity = payload.get("capacity")
+if not isinstance(capacity, dict):
+    raise SystemExit(1)
+if capacity.get("configured") is not True:
+    raise SystemExit(1)
+if capacity.get("volume") != "LuisA":
+    raise SystemExit(1)
+numeric_fields = (
+    "totalBytes",
+    "freeBytes",
+    "archiveBytes",
+    "availableForAtlasBytes",
+    "overworldRequirementBytes",
+    "marginBytes",
+)
+if any(
+    isinstance(capacity.get(field), bool)
+    or not isinstance(capacity.get(field), (int, float))
+    or not math.isfinite(capacity[field])
+    for field in numeric_fields
+):
+    raise SystemExit(1)
+if not isinstance(capacity.get("fits"), bool):
     raise SystemExit(1)
 PY
 }
@@ -107,8 +130,13 @@ validate_commands() {
 
 validate_environment() {
   validate_commands
-  if [[ ! -f "${progress_file}" ]]; then
-    echo "No existe el progreso esperado: ${progress_file}" >&2
+  if [[ ! -d "${tile_root}" || ! -r "${tile_root}" ||
+    ! -w "${tile_root}" ]]; then
+    echo "La biblioteca local no está disponible: ${tile_root}" >&2
+    exit 1
+  fi
+  if [[ ! -d "${backing_root}" || ! -r "${backing_root}" ]]; then
+    echo "La unidad LuisA no está disponible: ${backing_root}" >&2
     exit 1
   fi
   if [[ ! -f "${viewer_dir}/package.json" ]]; then
@@ -119,6 +147,7 @@ validate_environment() {
     echo "Faltan dependencias del visor. Ejecuta: cd viewer && npm ci" >&2
     exit 1
   fi
+  /usr/bin/install -d -m 700 "${runtime_dir}"
 }
 
 acquire_lock_for_pid() {
@@ -138,7 +167,7 @@ acquire_lock_for_pid() {
     ps -o command= -p "${requested_pid}" 2>/dev/null || true
   )
   case "${requested_command}" in
-    *start_progress_viewer_luisa.sh*" --serve-loop"*) ;;
+    *start_local_atlas_luisa.sh*" --serve-loop"*) ;;
     *)
       echo "El PID solicitado no es el supervisor canónico del visor." >&2
       return 2
@@ -173,7 +202,7 @@ acquire_lock_for_pid() {
 
 acquire_lock() {
   /usr/bin/lockf -k -t 10 "${lock_guard}" \
-    "${project_dir}/start_progress_viewer_luisa.sh" --acquire-lock "$$"
+    "${project_dir}/start_local_atlas_luisa.sh" --acquire-lock "$$"
 }
 
 rotate_log_if_needed() {
@@ -230,7 +259,9 @@ serve_loop() {
 
     (
       cd "${viewer_dir}"
-      export OBSIDIAN_ATLAS_PROGRESS_FILE="${progress_file}"
+      export OBSIDIAN_ATLAS_TILE_ROOT="${tile_root}"
+      export OBSIDIAN_ATLAS_BACKING_ROOT="${backing_root}"
+      export OBSIDIAN_ATLAS_PYTHON="${python_bin}"
       exec npm run dev -- \
         --hostname localhost \
         --port "${viewer_port}"
@@ -285,10 +316,9 @@ start_viewer() {
   if screen_has_session; then
     echo "La sesión ${session_name} existe; esperando que el visor responda…"
   else
-    mkdir -p "${output_dir}"
     screen \
       -dmS "${session_name}" \
-      "${BASH_SOURCE[0]}" --serve-loop
+      "${project_dir}/start_local_atlas_luisa.sh" --serve-loop
     echo "Iniciando Obsidian Atlas en segundo plano…"
   fi
 

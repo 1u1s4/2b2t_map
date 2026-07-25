@@ -14,13 +14,11 @@ const geistMono = Geist_Mono({
 
 const title = "Obsidian Atlas — visor del Overworld de 2b2t";
 const description =
-  "Explora el Overworld de 2b2t por coordenadas, combina capas y guarda highlights privados.";
-const productionOrigin = new URL(
-  "https://obsidian-atlas-2b2t.mchinchimoran.chatgpt.site",
-);
+  "Explora el Overworld de 2b2t por regiones, avanza celda por celda y guarda tu progreso local.";
+const localOrigin = new URL("http://localhost:3001");
 
 export const metadata: Metadata = {
-  metadataBase: productionOrigin,
+  metadataBase: localOrigin,
   title,
   description,
   applicationName: "Obsidian Atlas",

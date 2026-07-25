@@ -1,15 +1,9 @@
 import { fileURLToPath } from "node:url";
 import vinext from "vinext";
 import { defineConfig, loadEnv } from "vite";
-import hostingConfig from "./.openai/hosting.json";
-import { localProgress } from "./build/local-progress-vite-plugin";
-import { sites } from "./build/sites-vite-plugin";
+import { localAtlas } from "./build/local-atlas-vite-plugin";
 
-const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
-  "00000000-0000-4000-8000-000000000000";
 const CONFIG_DIRECTORY = fileURLToPath(new URL(".", import.meta.url));
-
-const { d1, r2 } = hostingConfig;
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
@@ -17,23 +11,6 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 const localBindingConfig = {
   main: "./worker/index.ts",
   compatibility_flags: ["nodejs_compat"],
-  d1_databases: d1
-    ? [
-        {
-          binding: d1,
-          database_name: "site-creator-d1",
-          database_id: SITE_CREATOR_PLACEHOLDER_DATABASE_ID,
-        },
-      ]
-    : [],
-  r2_buckets: r2
-    ? [
-        {
-          binding: r2,
-          bucket_name: "site-creator-r2",
-        },
-      ]
-    : [],
 };
 
 export default defineConfig(async ({ mode }) => {
@@ -50,7 +27,14 @@ export default defineConfig(async ({ mode }) => {
     CONFIG_DIRECTORY,
     "OBSIDIAN_ATLAS_",
   );
-  const progressFile = atlasEnvironment.OBSIDIAN_ATLAS_PROGRESS_FILE;
+  const tileRoot = atlasEnvironment.OBSIDIAN_ATLAS_TILE_ROOT;
+  const backingRoot = atlasEnvironment.OBSIDIAN_ATLAS_BACKING_ROOT;
+  const pythonBin = atlasEnvironment.OBSIDIAN_ATLAS_PYTHON;
+  const requirementText =
+    atlasEnvironment.OBSIDIAN_ATLAS_OVERWORLD_REQUIREMENT_BYTES;
+  const requirementBytes = requirementText
+    ? Number(requirementText)
+    : undefined;
   const serverOptions = {
     ...(isCodexSeatbeltSandbox
       ? { watch: { useFsEvents: false, usePolling: true } }
@@ -58,17 +42,20 @@ export default defineConfig(async ({ mode }) => {
     // Vinext enables Vite's console-forwarding client without its matching
     // transport in this multi-environment setup. One rejected promise then
     // recursively fills the error overlay; local Chrome already has DevTools.
-    ...(progressFile ? { forwardConsole: false, strictPort: true } : {}),
+    ...(tileRoot ? { forwardConsole: false, strictPort: true } : {}),
   };
 
   return {
     server: Object.keys(serverOptions).length > 0 ? serverOptions : undefined,
     plugins: [
-      localProgress({
-        progressFile,
+      localAtlas({
+        tileRoot,
+        backingRoot,
+        pythonBin,
+        projectRoot: fileURLToPath(new URL("..", import.meta.url)),
+        overworldRequirementBytes: requirementBytes,
       }),
       vinext(),
-      sites(),
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
         config: localBindingConfig,

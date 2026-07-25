@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import tempfile
 import threading
 import unittest
@@ -9,7 +11,7 @@ from pathlib import Path
 
 from PIL import Image, features
 
-from download_all_2b2t import (
+from tile_download_core import (
     AdaptiveRateLimiter,
     DownloadResult,
     TileDatabase,
@@ -17,6 +19,9 @@ from download_all_2b2t import (
     TileSpec,
 )
 from download_region_2b2t import (
+    REGION_DOWNLOAD_LOCK_NAME,
+    RegionDownloadLock,
+    RegionDownloadLockedError,
     download_region_tasks,
     parse_layers,
     region_tile_count,
@@ -24,6 +29,54 @@ from download_region_2b2t import (
     resolve_region,
     seed_region_tasks,
 )
+
+
+class RegionDownloadLockTests(unittest.TestCase):
+    def test_residual_lock_file_is_reused_and_metadata_is_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = root / REGION_DOWNLOAD_LOCK_NAME
+            lock_path.write_text(
+                '{"pid":999999,"started_at":"stale"}\n',
+                encoding="utf-8",
+            )
+
+            lock = RegionDownloadLock(root)
+            lock.acquire()
+            try:
+                metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+                self.assertEqual(metadata["pid"], os.getpid())
+                self.assertNotEqual(metadata["started_at"], "stale")
+            finally:
+                lock.release()
+
+            self.assertTrue(lock_path.exists())
+
+    def test_second_lock_is_refused_until_first_is_released(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = RegionDownloadLock(root)
+            second = RegionDownloadLock(root)
+            first.acquire()
+            try:
+                with self.assertRaises(RegionDownloadLockedError) as caught:
+                    second.acquire()
+                self.assertEqual(caught.exception.metadata["pid"], os.getpid())
+            finally:
+                first.release()
+
+            second.acquire()
+            second.release()
+
+    def test_context_manager_releases_lock_after_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(RuntimeError, "sentinel"):
+                with RegionDownloadLock(root):
+                    raise RuntimeError("sentinel")
+
+            with RegionDownloadLock(root):
+                pass
 
 
 def namespace(**values: int | None) -> argparse.Namespace:

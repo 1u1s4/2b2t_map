@@ -38,24 +38,26 @@ test("server-renders the Obsidian Atlas product shell and metadata", async () =>
   );
   assert.match(
     html,
-    /<meta name="description" content="Explora el Overworld de 2b2t por coordenadas, combina capas y guarda highlights privados\."/i,
+    /<meta name="description" content="Explora el Overworld de 2b2t por regiones, avanza celda por celda y guarda tu progreso local\."/i,
   );
   assert.match(
     html,
-    /<meta property="og:image" content="https:\/\/obsidian-atlas-2b2t\.mchinchimoran\.chatgpt\.site\/og\.png"/i,
+    /<meta property="og:image" content="http:\/\/localhost:3001\/og\.png"/i,
   );
   assert.match(
     html,
-    /<meta name="twitter:image" content="https:\/\/obsidian-atlas-2b2t\.mchinchimoran\.chatgpt\.site\/og\.png"/i,
+    /<meta name="twitter:image" content="http:\/\/localhost:3001\/og\.png"/i,
   );
   assert.match(html, /OBSIDIAN ATLAS/);
-  assert.match(html, /2b2t · Overworld archive/);
+  assert.match(html, /2b2t · exploración local/);
   assert.match(
     html,
     /<canvas[^>]+aria-label="Mapa interactivo del Overworld de 2b2t"/i,
   );
   assert.match(html, /Ir a coordenadas o highlight/);
-  assert.match(html, /Tiles online/);
+  assert.match(html, /Solo local/);
+  assert.match(html, /Explorar/);
+  assert.doesNotMatch(html, /DESCARGA COMPLETA|mchinchimoran\.chatgpt\.site/i);
   assert.doesNotMatch(
     html,
     /codex-preview|Building your site|Your site is taking shape|SkeletonPreview/i,
@@ -112,6 +114,26 @@ test("tile API validates input before contacting an upstream", async () => {
   }
 });
 
+test("tile API is local-only unless online access is explicit", async () => {
+  const originalFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = async () => {
+    upstreamCalls += 1;
+    throw new Error("local-only requests must not reach the network");
+  };
+  try {
+    const response = await request(
+      "/api/tile?layer=base&lod=0&dimension=0&tileX=0&tileZ=0&online=0",
+    );
+    assert.equal(response.status, 404);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(response.headers.get("x-atlas-tile-source"), "local-miss");
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("tile API uses truncating negative shards and returns a cacheable WebP", async () => {
   const originalFetch = globalThis.fetch;
   const webpHeader = new Uint8Array([
@@ -134,7 +156,7 @@ test("tile API uses truncating negative shards and returns a cacheable WebP", as
 
   try {
     const response = await request(
-      "/api/tile?layer=overlay&lod=3&dimension=0&tileX=-33&tileZ=-31",
+      "/api/tile?layer=overlay&lod=3&dimension=0&tileX=-33&tileZ=-31&online=1",
     );
 
     assert.equal(
@@ -168,7 +190,7 @@ test("tile API keeps missing tiles empty and translates upstream failures", asyn
   try {
     globalThis.fetch = async () => new Response(null, { status: 404 });
     const missing = await request(
-      "/api/tile?layer=base&lod=0&dimension=0&tileX=58000&tileZ=58000",
+      "/api/tile?layer=base&lod=0&dimension=0&tileX=58000&tileZ=58000&online=1",
     );
     assert.equal(missing.status, 404);
     assert.equal(await missing.text(), "");
@@ -181,7 +203,7 @@ test("tile API keeps missing tiles empty and translates upstream failures", asyn
       throw new Error("simulated network outage");
     };
     const unavailable = await request(
-      "/api/tile?layer=newchunks&lod=10&dimension=0&tileX=0&tileZ=0",
+      "/api/tile?layer=newchunks&lod=10&dimension=0&tileX=0&tileZ=0&online=1",
     );
     assert.equal(unavailable.status, 502);
     assert.equal(unavailable.headers.get("cache-control"), "no-store");
@@ -203,7 +225,7 @@ test("tile API rejects non-WebP content before it can be cached", async () => {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     const wrongType = await request(
-      "/api/tile?layer=base&lod=0&dimension=0&tileX=0&tileZ=0",
+      "/api/tile?layer=base&lod=0&dimension=0&tileX=0&tileZ=0&online=1",
     );
     assert.equal(wrongType.status, 502);
     assert.equal(wrongType.headers.get("cache-control"), "no-store");
@@ -217,7 +239,7 @@ test("tile API rejects non-WebP content before it can be cached", async () => {
         headers: { "Content-Type": "image/webp" },
       });
     const wrongMagic = await request(
-      "/api/tile?layer=overlay&lod=3&dimension=0&tileX=-33&tileZ=-31",
+      "/api/tile?layer=overlay&lod=3&dimension=0&tileX=-33&tileZ=-31&online=1",
     );
     assert.equal(wrongMagic.status, 502);
     assert.equal(wrongMagic.headers.get("cache-control"), "no-store");
@@ -247,7 +269,7 @@ test("tile API aborts an upstream request when its deadline expires", async () =
 
   try {
     const response = await request(
-      "/api/tile?layer=base&lod=10&dimension=0&tileX=0&tileZ=0",
+      "/api/tile?layer=base&lod=10&dimension=0&tileX=0&tileZ=0&online=1",
     );
     assert.equal(response.status, 502);
     assert.equal(response.headers.get("cache-control"), "no-store");

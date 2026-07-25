@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import subprocess
 import unittest
 from pathlib import Path
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-LAUNCHER = PROJECT_DIR / "run_full_download_luisa.sh"
+LAUNCHER = PROJECT_DIR / "start_local_atlas_luisa.sh"
+LEGACY_LAUNCHER = PROJECT_DIR / "start_progress_viewer_luisa.sh"
 
 
-class LauncherShellLockTests(unittest.TestCase):
+class LocalAtlasLauncherContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.source = LAUNCHER.read_text(encoding="utf-8")
@@ -18,121 +20,143 @@ class LauncherShellLockTests(unittest.TestCase):
         self.assertGreaterEqual(position, 0, f"no se encontró: {text}")
         return position
 
-    def test_bootstrap_lock_precedes_every_volume_probe(self) -> None:
-        app_support = self.position(
-            'application_support="/Users/luisalvarado/Library/'
-            'Application Support/ObsidianAtlas"'
+    def test_launcher_was_renamed_and_help_uses_canonical_name(self) -> None:
+        self.assertTrue(LAUNCHER.is_file())
+        self.assertFalse(LEGACY_LAUNCHER.exists())
+        completed = subprocess.run(
+            ["bash", str(LAUNCHER), "--help"],
+            cwd=PROJECT_DIR,
+            check=False,
+            capture_output=True,
+            text=True,
         )
-        mkdir = self.position(
-            '/usr/bin/install -d -m 700 "${application_support}"'
-        )
-        bootstrap_exec = self.position(
-            'exec /usr/bin/lockf -s -t 0 -k "${bootstrap_lock}"'
-        )
-        volume_probe = self.position(
-            'if [[ ! -d "${backing_volume}" ]]; then'
-        )
-        self.assertLess(app_support, mkdir)
-        self.assertLess(mkdir, bootstrap_exec)
-        self.assertLess(bootstrap_exec, volume_probe)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("./start_local_atlas_luisa.sh", completed.stdout)
+        self.assertNotIn("start_progress_viewer", completed.stdout)
+
+    def test_local_storage_contract_is_explicit(self) -> None:
         self.assertIn(
-            'bootstrap_lock="${application_support}/'
-            'download.bootstrap.lock"',
+            'tile_root="/Volumes/2b2t Tiles/2b2t_tiles"',
+            self.source,
+        )
+        self.assertIn('backing_root="/Volumes/LuisA"', self.source)
+        self.assertIn(
+            'export OBSIDIAN_ATLAS_TILE_ROOT="${tile_root}"',
+            self.source,
+        )
+        self.assertIn(
+            'export OBSIDIAN_ATLAS_BACKING_ROOT="${backing_root}"',
+            self.source,
+        )
+        self.assertIn(
+            'export OBSIDIAN_ATLAS_PYTHON="${python_bin}"',
             self.source,
         )
 
-    def test_lock_order_and_markers_keep_both_locks_for_lifetime(
+    def test_readiness_requires_local_atlas_capacity_contract(self) -> None:
+        endpoint = self.position(
+            '"${viewer_url}/api/local-atlas/status"'
+        )
+        local_only = self.position(
+            'payload.get("localOnly") is not True'
+        )
+        capacity = self.position('capacity = payload.get("capacity")')
+        configured = self.position(
+            'capacity.get("configured") is not True'
+        )
+        fields = self.position('numeric_fields = (')
+        fits = self.position(
+            'not isinstance(capacity.get("fits"), bool)'
+        )
+        self.assertLess(endpoint, local_only)
+        self.assertLess(local_only, capacity)
+        self.assertLess(capacity, configured)
+        self.assertLess(configured, fields)
+        self.assertLess(fields, fits)
+        self.assertIn(
+            'response.headers.get("Cache-Control") != "no-store"',
+            self.source,
+        )
+
+    def test_legacy_full_download_progress_contract_is_absent(self) -> None:
+        lowered = self.source.lower()
+        for legacy_text in (
+            "progress.json",
+            "local-progress",
+            "obsidian_atlas_progress_file",
+            "run_full_download",
+            "download_all_2b2t",
+            "start_progress_viewer",
+        ):
+            with self.subTest(legacy_text=legacy_text):
+                self.assertNotIn(legacy_text, lowered)
+
+    def test_mounts_and_viewer_are_validated_before_screen_launch(self) -> None:
+        validate = self.position("\n  validate_environment\n")
+        tile_probe = self.position('if [[ ! -d "${tile_root}"')
+        backing_probe = self.position('if [[ ! -d "${backing_root}"')
+        package_probe = self.position(
+            'if [[ ! -f "${viewer_dir}/package.json"'
+        )
+        screen_launch = self.position(
+            'screen \\\n'
+            '      -dmS "${session_name}" \\\n'
+            '      "${project_dir}/start_local_atlas_luisa.sh" --serve-loop'
+        )
+        self.assertLess(tile_probe, backing_probe)
+        self.assertLess(backing_probe, package_probe)
+        self.assertLess(validate, screen_launch)
+
+    def test_server_is_supervised_on_localhost_with_status_and_stop(self) -> None:
+        self.assertIn('viewer_url="http://localhost:${viewer_port}"', self.source)
+        self.assertIn("--hostname localhost", self.source)
+        self.assertNotIn("--hostname 0.0.0.0", self.source)
+        self.assertIn('session_name="obsidian_atlas_local"', self.source)
+        self.assertIn(
+            '"${project_dir}/start_local_atlas_luisa.sh" --serve-loop',
+            self.source,
+        )
+        self.assertIn("\n  --status)\n    show_status", self.source)
+        self.assertIn("\n  --stop)\n    stop_viewer", self.source)
+        self.assertIn("trap request_stop HUP INT TERM", self.source)
+        self.assertIn("while (( stop_requested == 0 )); do", self.source)
+
+    def test_singleton_lock_keeps_inode_and_validates_owner_identity(
         self,
     ) -> None:
-        bootstrap_marker = self.position(
-            "export OBSIDIAN_ATLAS_DOWNLOAD_BOOTSTRAP_LOCK_HELD=1"
-        )
-        bootstrap_exec = self.position(
-            'exec /usr/bin/lockf -s -t 0 -k "${bootstrap_lock}"'
-        )
-        apfs_marker = self.position(
-            "export OBSIDIAN_ATLAS_DOWNLOAD_EXEC_LOCK_HELD=1"
-        )
-        apfs_exec = self.position(
-            'exec /usr/bin/lockf -s -t 0 -k "${execution_lock}"'
-        )
-        bootstrap_unset = self.position(
-            "unset OBSIDIAN_ATLAS_DOWNLOAD_BOOTSTRAP_LOCK_HELD"
-        )
-        apfs_unset = self.position(
-            "unset OBSIDIAN_ATLAS_DOWNLOAD_EXEC_LOCK_HELD"
-        )
-        downloader_lock = self.position("\nacquire_lock\n")
-
-        self.assertLess(bootstrap_marker, bootstrap_exec)
-        self.assertLess(bootstrap_exec, apfs_marker)
-        self.assertLess(apfs_marker, apfs_exec)
-        self.assertLess(apfs_exec, bootstrap_unset)
-        self.assertLess(bootstrap_unset, apfs_unset)
-        self.assertLess(apfs_unset, downloader_lock)
-
-    def test_both_command_locks_use_kept_inode_and_zero_timeout(self) -> None:
-        self.assertEqual(
-            self.source.count("exec /usr/bin/lockf -s -t 0 -k"),
-            2,
-        )
-
-    def test_temporary_headroom_requires_exactly_eighteen(self) -> None:
         self.assertIn(
-            "float(sys.argv[1]) == 18.0",
+            'lock_file="${runtime_dir}/.local_atlas.lock"',
             self.source,
         )
-        self.assertNotIn("math.isclose", self.source)
-
-    def test_terminal_safety_gate_surrounds_stale_lock_recovery(self) -> None:
-        gate_definition = self.position("launcher_safety_gate() {")
-        storage_latch = self.position(
-            'storage_stop = output / "storage_stop.json"'
+        self.assertIn(
+            '/usr/bin/lockf -k -t 10 "${lock_guard}"',
+            self.source,
         )
-        transition_latch = self.position(
-            'transition = output / "margin_transition.json"'
+        self.assertIn(
+            '*start_local_atlas_luisa.sh*" --serve-loop"*)',
+            self.source,
         )
-        transition_validation = self.position(
-            "supervisor.read_transition_journal(transition)"
+        candidate = self.position(
+            'printf \'%s\\n\' "${requested_pid}" >"${candidate_lock}"'
         )
-        safety_signal = self.position(
-            "safety = supervisor.safety_signal(progress)"
-        )
-        active_only = self.position(
-            "progress.status not in supervisor.ACTIVE_STATUSES"
-        )
-        authorized_reboot = self.position(
-            'os.environ.get("OBSIDIAN_ATLAS_RECOVERY_AUTHORIZED") == "1"'
-        )
-        first_gate = self.position("\nlauncher_safety_gate\nacquire_lock\n")
-        stale_gate = self.position(
-            "\n    if ! launcher_safety_gate; then\n"
-            "      return 1\n"
-            "    fi\n"
-            '    stale_lock="${lock_dir}.stale.$$"'
+        hard_link = self.position(
+            'if ln "${candidate_lock}" "${lock_file}" 2>/dev/null; then'
         )
         stale_move = self.position(
-            'if mv "${lock_dir}" "${stale_lock}" 2>/dev/null; then'
+            'if mv "${lock_file}" "${stale_lock}" 2>/dev/null; then'
         )
-        final_gate = self.position(
-            "\nacquire_lock\n"
-            "if ! launcher_safety_gate; then\n"
-            "  release_own_lock"
-        )
-        unset_authorization = self.position(
-            "unset OBSIDIAN_ATLAS_RECOVERY_AUTHORIZED"
-        )
+        self.assertLess(candidate, hard_link)
+        self.assertLess(hard_link, stale_move)
 
-        self.assertLess(gate_definition, storage_latch)
-        self.assertLess(storage_latch, transition_latch)
-        self.assertLess(transition_latch, transition_validation)
-        self.assertLess(transition_validation, safety_signal)
-        self.assertLess(safety_signal, authorized_reboot)
-        self.assertLess(authorized_reboot, active_only)
-        self.assertLess(stale_gate, stale_move)
-        self.assertLess(stale_move, first_gate)
-        self.assertLess(first_gate, final_gate)
-        self.assertLess(final_gate, unset_authorization)
+    def test_shell_syntax_is_valid(self) -> None:
+        completed = subprocess.run(
+            ["bash", "-n", str(LAUNCHER)],
+            cwd=PROJECT_DIR,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 if __name__ == "__main__":

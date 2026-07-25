@@ -1,283 +1,306 @@
-# Obsidian Atlas
+# Obsidian Atlas — visor local
 
-Obsidian Atlas es el visor web del archivo local de 2b2t. Está inspirado en la
-experiencia de navegación de 2b2t.place, con una interfaz propia enfocada en
-coordenadas legibles, capas controlables y highlights privados.
+Este directorio contiene la UI local de Obsidian Atlas. El producto divide una
+región del Overworld en tiles revisables, fija el zoom de la sesión y conserva
+el progreso en el navegador. El backend de desarrollo expone capacidad,
+lectura de tiles y descarga regional únicamente en `localhost`.
 
-El visor dibuja los tiles en un canvas y puede combinar dos fuentes:
+## Ejecutar
 
-1. la carpeta local `2b2t_tiles`, que siempre tiene prioridad;
-2. un respaldo online opcional para tiles que todavía no existen en el
-   archivo local.
+La forma recomendada, desde la raíz del repositorio, es:
 
-La versión actual admite únicamente el **Overworld**.
+```bash
+./start_local_atlas_luisa.sh
+```
 
-## Requisitos y ejecución
+Después abre [http://localhost:3001](http://localhost:3001).
 
-- Node.js `>=22.13.0`
-- Google Chrome actualizado para abrir una carpeta local
-- la carpeta `2b2t_tiles` generada por los scripts Python, si se desea uso
-  local
+```bash
+./start_local_atlas_luisa.sh --status
+./start_local_atlas_luisa.sh --stop
+```
 
-Desde la raíz del repositorio:
+El lanzador requiere `/Volumes/LuisA`,
+`/Volumes/2b2t Tiles/2b2t_tiles`, `screen`, Python y las dependencias de este
+directorio. La primera instalación es:
 
 ```bash
 cd viewer
 npm ci
-npm run dev
 ```
 
-Abre en Chrome la URL local que imprima el comando. La aplicación necesita un
-contexto seguro para el selector de carpetas; `localhost` cuenta como seguro.
-Para vincular automáticamente la tarjeta de progreso a la descarga activa:
+Para otro puerto:
 
 ```bash
-OBSIDIAN_ATLAS_PROGRESS_FILE='/Volumes/2b2t Tiles/2b2t_tiles/progress.json' \
-  npm run dev
+OBSIDIAN_ATLAS_VIEWER_PORT=3100 ./start_local_atlas_luisa.sh
 ```
 
-Este bridge se habilita únicamente durante desarrollo, sirve un solo
-`progress.json` con caché desactivada y no expone el resto del archivo. Sin la
-variable, y en el sitio publicado, la ruta responde sin contenido y se mantiene
-el flujo normal de permiso explícito de Chrome.
+## Ejecución manual
 
-Desde la raíz del repositorio, el lanzador supervisado mantiene esa misma vista
-local disponible en una URL fija y la reinicia si el proceso termina:
+Node.js debe ser `>=22.13.0`.
 
 ```bash
-./start_progress_viewer_luisa.sh
-# abre http://localhost:3001
+cd viewer
+OBSIDIAN_ATLAS_TILE_ROOT='/Volumes/2b2t Tiles/2b2t_tiles' \
+OBSIDIAN_ATLAS_BACKING_ROOT='/Volumes/LuisA' \
+OBSIDIAN_ATLAS_PYTHON='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
+  npm run dev -- --hostname localhost --port 3001
 ```
 
-Usa `./start_progress_viewer_luisa.sh --status` para comprobarla y
-`./start_progress_viewer_luisa.sh --stop` para detenerla. El servidor escucha
-solo en `localhost`; `progress.json` se proyecta a los campos de la tarjeta y
-no incluye rutas locales ni el comando de reanudación.
-La sesión `screen` no sobrevive un reinicio o cierre de sesión de macOS; vuelve
-a ejecutar el lanzador en ese caso.
+Variables aceptadas:
 
-Comandos de comprobación:
+| Variable | Valor esperado |
+| --- | --- |
+| `OBSIDIAN_ATLAS_TILE_ROOT` | carpeta canónica `2b2t_tiles` |
+| `OBSIDIAN_ATLAS_BACKING_ROOT` | volumen físico que respalda la biblioteca |
+| `OBSIDIAN_ATLAS_PYTHON` | Python con `requests` y `Pillow` |
+| `OBSIDIAN_ATLAS_OVERWORLD_REQUIREMENT_BYTES` | referencia opcional de capacidad |
+
+Si `OBSIDIAN_ATLAS_PYTHON` no se define, el runtime intenta
+`../.venv/bin/python` y luego `python3`. La referencia predeterminada es
+`1,458,909,433,254` bytes.
+
+No uses un hostname público. El launcher canónico y los ejemplos limitan el
+servidor a `localhost`.
+
+## Crear una sesión
+
+1. Navega hasta el área de interés.
+2. Ajusta el zoom deseado.
+3. Abre **Explorar** con el dock o la tecla `E`.
+4. Dibuja una región, toma la vista actual o introduce cuatro coordenadas.
+5. Pulsa **Crear sesión de exploración**.
+
+La región usa límites semiabiertos:
+
+```text
+X [minX, maxX) × Z [minZ, maxZ)
+```
+
+El modelo expande esos límites a tiles enteros. Una celda mide:
+
+```text
+512 * 2**LOD bloques por lado
+```
+
+El zoom y el LOD quedan fijados durante la sesión. Los controles de rueda,
+doble clic, `+` y `-` no alteran la escala hasta cerrar la sesión.
+
+## Navegación y progreso
+
+La cruceta visible y las flechas del teclado mueven exactamente una celda:
+
+- izquierda/derecha cambian de columna;
+- arriba/abajo cambian de fila;
+- los controles se desactivan en los bordes.
+
+**Anterior** y **Revisada y siguiente** usan una ruta serpentina. La tarjeta
+muestra porcentaje, revisadas, total, posición de la ruta, fila, columna, LOD
+y límites X/Z de la celda actual.
+
+**Marcar como revisada** es reversible. La presencia de un WebP no cambia el
+progreso humano.
+
+El estado se guarda con la clave:
+
+```text
+obsidian-atlas-exploration-v1
+```
+
+**Exportar** genera `obsidian-atlas-exploracion.json`. El archivo incluye un
+bitset base64url, no una lista extensa de coordenadas. **Importar** valida
+versión, dimensión, límites alineados, escala, LOD, índice y contador. Cerrar
+una sesión elimina su estado del navegador, por lo que debe exportarse si se
+quiere archivar.
+
+El máximo por sesión es 4,000,000 de celdas. El canvas solo recorre las celdas
+visibles para evitar que una región grande bloquee la interfaz.
+
+## Datos bajo demanda
+
+La tarjeta de la celda ofrece:
+
+```text
+0.25 req/s · 0.5 req/s · 1 req/s · 2 req/s
+```
+
+**Descargar celda actual** envía al runtime:
+
+- límites exactos de esa celda;
+- Overworld;
+- LOD fijado;
+- capas visibles;
+- ritmo elegido.
+
+El runtime ejecuta `../download_region_2b2t.py`, permite un trabajo a la vez,
+limita cada operación a 64 combinaciones tile/capa y realiza un preflight
+conservador de espacio. Los WebP válidos existentes se reutilizan.
+
+**Detener celda** solicita una interrupción segura. La navegación nunca inicia
+un trabajo automáticamente.
+
+Desde terminal puede reproducirse el mismo flujo:
 
 ```bash
-npm run lint
-npm run build
-npm test
+python ../download_region_2b2t.py \
+  --x-min -85504 \
+  --z-min 167936 \
+  --x-max -84992 \
+  --z-max 168448 \
+  --dimension overworld \
+  --lod 0 \
+  --layers base,overlay \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --workers 1 \
+  --requests-per-second 1 \
+  --max-tiles 2
 ```
 
-`npm run dev` y `npm run build` usan vinext. La configuración incluida simula
-localmente los bindings opcionales declarados para Sites; el visor del mapa no
-necesita D1 para guardar highlights.
+Consulta `python ../download_region_2b2t.py --help` para regiones por centro,
+composición de imágenes y cuadrículas de coordenadas.
 
-## Abrir el archivo local
+## Capacidad
 
-1. Abre el panel **Archivo** en el dock izquierdo.
-2. Pulsa **Elegir carpeta local**.
-3. En el selector de Chrome, elige `2b2t_tiles` directamente, no su carpeta
-   padre.
-4. Chrome mostrará el permiso de lectura correspondiente.
+`GET /api/local-atlas/status` devuelve una instantánea sin caché de:
 
-La raíz seleccionada debe conservar este formato:
+- espacio del APFS de tiles;
+- espacio disponible en LuisA;
+- bytes registrados en la biblioteca;
+- referencia del Overworld;
+- margen y resultado de la comparación;
+- trabajo regional actual.
+
+El espacio efectivo es el menor entre la biblioteca montada y su volumen de
+respaldo. La comparación no acredita los datos existentes contra la referencia,
+por lo que mantiene un margen conservador. Esta lectura es informativa y no
+crea operaciones.
+
+## Fuentes de tiles
+
+El orden de lectura es:
+
+1. biblioteca configurada por `OBSIDIAN_ATLAS_TILE_ROOT`;
+2. carpeta elegida manualmente en Chrome;
+3. vista rápida online, solo si el usuario la activa.
+
+La estructura esperada es:
 
 ```text
 2b2t_tiles/
-├── base/
-│   └── {lod}/overworld/{shard_x}/{shard_z}/t.{tile_x}.{tile_z}.webp
-├── overlay/
-│   └── {lod}/overworld/{shard_x}/{shard_z}/t.{tile_x}.{tile_z}.webp
-└── newchunks/
-    └── {lod}/overworld/{shard_x}/{shard_z}/t.{tile_x}.{tile_z}.webp
+├── base/{lod}/overworld/{shard_x}/{shard_z}/t.{tile_x}.{tile_z}.webp
+├── overlay/{lod}/overworld/{shard_x}/{shard_z}/t.{tile_x}.{tile_z}.webp
+└── newchunks/{lod}/overworld/{shard_x}/{shard_z}/t.{tile_x}.{tile_z}.webp
 ```
 
-Los shards usan truncamiento hacia cero, igual que 2b2t.place. Obsidian Atlas
-calcula la ruta exacta de cada tile visible y no escanea el archivo completo.
-Si se desconecta el archivo o se recarga la página, Chrome puede pedir que se
-vuelva a seleccionar o autorizar la carpeta.
+El endpoint `/api/tile` sirve primero un WebP local válido. Solo permite
+consultar 2b2t.place si la solicitud lleva la opción online explícita. Esa vista
+es temporal, no escribe en la biblioteca y no usa el selector regional de
+ritmo. Crear o importar una sesión la desactiva.
 
-La File System Access API usada para esto está disponible principalmente en
-Chrome y otros navegadores Chromium. Firefox y Safari pueden usar los tiles
-online, pero no el selector local compatible.
+Chrome puede abrir `2b2t_tiles` mediante File System Access con permiso de solo
+lectura. El navegador calcula la ruta visible; no escanea ni sube la carpeta.
 
-### Progreso de la descarga
+## Capas, coordenadas y highlights
 
-Al conectar `2b2t_tiles`, el panel **Archivo** busca `progress.json` en esa
-misma carpeta y vuelve a leerlo cada cinco segundos. La tarjeta de progreso
-muestra estado, porcentaje, solicitudes resueltas, tiles completos y
-pendientes, velocidad, datos descargados, ETA, última actualización y errores
-reportados. La lectura es independiente del canvas: un archivo ausente,
-incompleto o temporalmente ilegible no bloquea la navegación del mapa.
+El panel **Capas** controla visibilidad y opacidad de:
 
-Las versiones nuevas del descargador publican `planned_requests`,
-`processed_requests` y `progress_percent`. Si se abre un archivo creado por una
-versión anterior, el visor deriva un porcentaje aproximado a partir de los
-contadores disponibles y lo marca como estimado. El archivo se solicita de
-nuevo en cada sondeo porque el descargador lo reemplaza atómicamente.
+- Mundo (`base`);
+- Obsidiana (`overlay`);
+- Chunks nuevos (`newchunks`);
+- cuadrícula adaptativa de coordenadas.
 
-## Fuente local y respaldo online
+La cabecera muestra centro X/Z, zoom, LOD y bloques por píxel. El pie muestra
+las coordenadas del cursor. La búsqueda acepta `X, Z`, `X Z`, `X, Z, zoom` o el
+nombre exacto de un highlight.
 
-Con un archivo conectado, el orden es:
+Los highlights disponibles son:
 
-1. intentar el WebP local;
-2. si falta y **Respaldo online** está activado, solicitarlo mediante
-   `/api/tile`;
-3. si no existe o falla, mostrar el mejor tile padre disponible mientras sea
-   posible.
+- punto: `M` y clic;
+- área: `R` y arrastre.
 
-El panel **Archivo** muestra contadores de tiles locales, online y ausentes.
-Los bitmaps se mantienen en una caché acotada y se liberan al salir. Las URLs
-temporales de archivos locales también se revocan después de decodificarlas.
-
-Sin una carpeta conectada, el mapa funciona con la fuente online. Para una
-sesión estrictamente local:
-
-1. conecta `2b2t_tiles`;
-2. desactiva **Respaldo online**;
-3. recuerda que las zonas no descargadas aparecerán vacías o con un LOD padre
-   más grueso.
-
-El respaldo online no modifica el archivo local: solo permite visualizar el
-tile durante la sesión. La descarga persistente y reanudable sigue siendo
-responsabilidad de `download_all_2b2t.py` o `download_region_2b2t.py`.
-
-## Navegación, coordenadas, zoom y LOD
-
-La tarjeta superior muestra:
-
-- coordenadas X/Z del centro;
-- zoom actual;
-- LOD seleccionado;
-- bloques por píxel.
-
-El estado inferior muestra las coordenadas del cursor. La retícula permanece
-en el centro y la cuadrícula adapta automáticamente su paso al zoom. En el
-panel **Capas** se puede activar la cuadrícula y controlar visibilidad y
-opacidad de:
-
-- **Mundo** (`base`);
-- **Obsidiana** (`overlay`);
-- **Chunks nuevos** (`newchunks`).
-
-El LOD se elige automáticamente con:
-
-```text
-LOD = clamp(floor(log2(1 / zoom)), 0, 10)
-bloques_por_píxel = 2**LOD
-```
-
-LOD 0 es la máxima resolución publicada: 1 bloque por píxel. Alejarse aumenta
-el LOD y permite cubrir un área mayor con menos tiles. El zoom visual está
-limitado entre `1/1500×` y `8×`.
-
-La búsqueda acepta:
-
-```text
--85181, 168232
--85181 168232
--85181, 168232, 2.9423
-Nombre exacto de un highlight
-```
-
-El botón de copiar coordenadas coloca `X, Z` en el portapapeles. El botón de
-enlace copia la URL actual, cuyo fragmento conserva centro, zoom y dimensión:
-
-```text
-#@-85181,168232,2.9423,0
-```
-
-## Highlights
-
-Hay dos tipos:
-
-- **Punto**: activa `M` y haz clic en el mapa.
-- **Área**: activa `R` y arrastra el rectángulo.
-
-Cada highlight puede tener nombre, nota, color y visibilidad. Seleccionarlo en
-el mapa o en la lista centra la vista y abre su editor. También puede
-eliminarse desde ese panel.
-
-Los highlights se guardan en el `localStorage` del origen actual con la clave
-`obsidian-atlas-highlights-v1`; no se guardan en SQLite ni dentro de
-`2b2t_tiles`.
-
-**Exportar** descarga:
-
-```text
-obsidian-atlas-highlights.json
-```
-
-**Importar** valida que el JSON sea una lista de highlights seguros, rechaza el
-archivo completo si contiene entradas inválidas y reemplaza la lista local
-actual. Por eso conviene exportar una copia antes de importar, limpiar el
-navegador o cambiar de perfil.
-
-Los enlaces compartibles solo contienen centro y zoom. Los highlights no se
-incluyen en la URL y deben compartirse mediante el JSON exportado.
+Nombre, nota, color y visibilidad permanecen en
+`obsidian-atlas-highlights-v1`. Su JSON de respaldo es
+`obsidian-atlas-highlights.json`. Las sesiones de rejilla y los highlights se
+persisten por separado.
 
 ## Atajos
 
-| Acción | Ratón, gesto o tecla |
+| Acción | Entrada |
 | --- | --- |
-| Mover el mapa | arrastrar, flechas o gesto táctil |
-| Acercar/alejar | rueda, pellizco, doble clic, `+` o `-` |
-| Enfocar búsqueda | `G` |
+| Mover libremente antes de una sesión | arrastrar o flechas |
+| Cambiar zoom antes de una sesión | rueda, pellizco, doble clic, `+`, `-` |
+| Saltar entre celdas | flechas |
+| Abrir exploración | `E` |
+| Ir a coordenadas/highlight | `G` |
 | Abrir highlights | `H` |
-| Marcar un punto | `M`, luego clic |
-| Dibujar un área | `R`, luego arrastrar |
-| Cancelar herramienta/cerrar panel | `Esc` |
+| Marcar un punto | `M` |
+| Dibujar un área | `R` |
+| Cancelar herramienta o cerrar panel | `Esc` |
 
-Al escribir en un campo, estos atajos quedan suspendidos; `Esc` quita el foco.
+Los atajos quedan suspendidos mientras se escribe en un campo.
 
-## Privacidad
+## Runtime local
 
-- La carpeta local se abre con permiso de solo lectura.
-- Los archivos WebP se leen directamente en Chrome y no se suben.
-- El visor no envía a un servidor la base SQLite, las rutas locales, las notas
-  ni los highlights.
-- Los highlights permanecen en el perfil y origen del navegador hasta que se
-  exportan, importan o eliminan.
-- Al activar el respaldo online, las solicitudes de los tiles visibles sí
-  salen a la red. La ruta `/api/tile` valida los parámetros y consulta
-  2b2t.place; por tanto, el servidor y el origen pueden observar qué
-  coordenadas de tile se solicitaron.
-- Copiar o compartir una URL revela el centro y zoom contenidos en su
-  fragmento, aunque no revela los highlights.
+Rutas:
 
-Para máxima privacidad, ejecuta el visor localmente, conecta el archivo,
-desactiva el respaldo online y no compartas enlaces ni JSON sensibles.
+| Método | Ruta | Función |
+| --- | --- | --- |
+| `GET` | `/api/local-atlas/status` | capacidad y trabajo actual |
+| `POST` | `/api/local-atlas/download` | iniciar una celda validada |
+| `POST` | `/api/local-atlas/stop` | detener el trabajo activo |
+| `GET`/`HEAD` | `/api/tile` | servir un tile local o la vista opcional |
 
-## Límites conocidos
+Protecciones:
 
-- Solo se acepta `dimension=0`, Overworld. Nether y End no aparecen todavía.
-- LOD 0–10 y tiles WebP de 512 × 512 siguen el contrato actual de 2b2t.place.
-- El visor no convierte mosaicos PNG/WebP compuestos en una fuente navegable;
-  necesita la estructura canónica de tiles.
-- Conectar una carpeta no inicia ni controla el descargador Python.
-- El respaldo online es visual y temporal; no completa el archivo en disco.
-- Un archivo parcial mostrará huecos, tiles online o ancestros de menor
-  resolución según la configuración.
-- La disponibilidad del respaldo depende de la red y de 2b2t.place.
+- solo loopback y origen local coincidente;
+- token efímero para mutaciones;
+- cuerpo JSON de tamaño acotado;
+- coordenadas enteras dentro del borde del mundo;
+- Overworld y LOD `0..10`;
+- capas permitidas por lista cerrada;
+- límites alineados a tiles;
+- ritmo `0.25..2 req/s`;
+- rutas e intérprete definidos por el proceso, nunca por el navegador;
+- un solo trabajo regional activo.
 
-## Estructura relevante
+## Pruebas
+
+```bash
+cd viewer
+npm run lint
+npm test
+```
+
+Las pruebas cubren matemática de rejilla, negativos, rangos semiabiertos,
+serpentina, bitset, serialización, validación del bridge local, proxy de tiles
+y HTML renderizado.
+
+## Archivos principales
 
 ```text
 viewer/
 ├── app/
-│   ├── api/tile/route.ts
+│   ├── lib/exploration-grid.ts
+│   ├── lib/local-atlas-runtime.ts
 │   ├── lib/local-tile-source.ts
 │   ├── map-viewer.tsx
-│   ├── globals.css
-│   ├── layout.tsx
-│   └── page.tsx
+│   └── globals.css
+├── build/local-atlas-vite-plugin.ts
 ├── tests/
 ├── package.json
 └── vite.config.ts
 ```
 
-- `map-viewer.tsx`: cámara, canvas, capas, interacción y highlights.
-- `local-tile-source.ts`: selector de Chrome, rutas canónicas y ciclo de vida
-  de archivos/URLs locales.
-- `api/tile/route.ts`: proxy validado, Overworld-only, para el respaldo
-  online.
-- `globals.css`: diseño responsivo, estados y accesibilidad visual.
+- `exploration-grid.ts`: región, celdas, navegación, bitset y JSON seguro.
+- `local-atlas-runtime.ts`: cliente tipado del bridge.
+- `local-tile-source.ts`: acceso de solo lectura elegido en Chrome.
+- `local-atlas-vite-plugin.ts`: capacidad, tiles y trabajos regionales.
+- `map-viewer.tsx`: canvas, sesión, capas y highlights.
 
-La documentación del descargador, estimaciones de almacenamiento y comando
-actual de reanudación están en [`../README.md`](../README.md).
+Límites actuales:
+
+- solo Overworld;
+- tiles WebP de 512 × 512 y LOD 0–10;
+- la vista online depende de la red y de 2b2t.place;
+- la carpeta manual necesita Chrome o Chromium;
+- las preferencias del navegador deben exportarse antes de limpiar el perfil.

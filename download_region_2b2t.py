@@ -11,14 +11,19 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import dataclasses
+import datetime
+import errno
+import fcntl
+import json
 import logging
 import math
+import os
 import shutil
 import signal
 import sys
 import threading
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, TextIO
 
 from compose_mosaic import (
     DEFAULT_MAX_PIXELS,
@@ -26,8 +31,7 @@ from compose_mosaic import (
     MosaicError,
     compose_mosaic,
 )
-from download_all_2b2t import (
-    DIMENSIONS,
+from tile_download_core import (
     LAYERS,
     MAX_LOD,
     MIN_LOD,
@@ -50,6 +54,100 @@ DEFAULT_TIMEOUT = 30.0
 DEFAULT_RETRIES = 5
 DEFAULT_MAX_TILE_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_TILES = 10_000
+REGION_DOWNLOAD_LOCK_NAME = ".region-download.lock"
+
+
+class RegionDownloadLockedError(RuntimeError):
+    """Raised when another regional downloader owns an output directory."""
+
+    def __init__(self, lock_path: Path, metadata: dict[str, object]) -> None:
+        details: list[str] = []
+        pid = metadata.get("pid")
+        started_at = metadata.get("started_at")
+        if isinstance(pid, int):
+            details.append(f"PID {pid}")
+        if isinstance(started_at, str):
+            details.append(f"desde {started_at}")
+        holder = f" ({', '.join(details)})" if details else ""
+        super().__init__(
+            "ya hay una descarga regional activa para este directorio"
+            f"{holder}; lock: {lock_path}"
+        )
+        self.lock_path = lock_path
+        self.metadata = metadata
+
+
+class RegionDownloadLock:
+    """Non-blocking advisory lock scoped to one canonical output directory."""
+
+    def __init__(self, output_root: Path) -> None:
+        self.path = output_root / REGION_DOWNLOAD_LOCK_NAME
+        self._handle: TextIO | None = None
+
+    @staticmethod
+    def _read_metadata(handle: TextIO) -> dict[str, object]:
+        try:
+            handle.seek(0)
+            value = json.load(handle)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def acquire(self) -> None:
+        if self._handle is not None:
+            raise RuntimeError("regional download lock is already acquired")
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(
+                handle.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except OSError as exc:
+            metadata = self._read_metadata(handle)
+            handle.close()
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise RegionDownloadLockedError(self.path, metadata) from None
+            raise
+
+        metadata = {
+            "pid": os.getpid(),
+            "started_at": datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat(),
+        }
+        try:
+            handle.seek(0)
+            handle.truncate()
+            json.dump(metadata, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+            raise
+        self._handle = handle
+
+    def release(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def __enter__(self) -> RegionDownloadLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -130,8 +228,8 @@ def required_region_specs(
 ) -> tuple[TileSpec, ...]:
     """Return every direct tile needed by a region, layer then Z then X."""
 
-    if dimension not in DIMENSIONS:
-        raise ValueError(f"unknown dimension: {dimension}")
+    if dimension != "overworld":
+        raise ValueError("only the Overworld is supported")
     if not MIN_LOD <= lod <= MAX_LOD:
         raise ValueError(f"lod must be from {MIN_LOD} to {MAX_LOD}")
     if not layers:
@@ -300,9 +398,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--dimension",
-        choices=tuple(DIMENSIONS),
+        choices=("overworld",),
         default="overworld",
-        help="Minecraft dimension (default: overworld).",
+        help="Minecraft dimension; only overworld is supported.",
     )
     parser.add_argument(
         "--lod",
@@ -421,8 +519,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if inventory_count > args.max_tiles:
         parser.error(
             f"the region requires {inventory_count:,} tiles, above --max-tiles "
-            f"{args.max_tiles:,}; use the global downloader or raise the "
-            "limit deliberately"
+            f"{args.max_tiles:,}; reduce the bounds or raise the limit "
+            "deliberately"
         )
     specs = required_region_specs(
         block_range,
@@ -431,36 +529,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         layers=args.layers,
     )
     output_root.mkdir(parents=True, exist_ok=True)
-    # This intentionally uses the configured response ceiling, not an average:
-    # it is a strict upper-bound preflight for small targeted captures.
-    missing_tiles = sum(
-        not validate_webp(
-            spec.path(output_root), calculate_hash=False
-        ).valid
-        for spec in specs
-    )
-    required_upper_bound = math.ceil(
-        missing_tiles * args.max_tile_bytes * 1.20
-    )
-    free_bytes = shutil.disk_usage(output_root).free
-    if free_bytes < required_upper_bound:
-        parser.error(
-            "insufficient disk for the regional upper bound plus 20%: "
-            f"need {required_upper_bound:,} bytes, have {free_bytes:,}"
-        )
-    stop_event = threading.Event()
-    limiter = AdaptiveRateLimiter(args.requests_per_second, stop_event)
-    fetcher = TileFetcher(
-        output_root,
-        limiter=limiter,
-        stop_event=stop_event,
-        timeout=args.timeout,
-        retries=args.retries,
-        max_tile_bytes=args.max_tile_bytes,
-        logger=logger,
-    )
-    database = TileDatabase(output_root / "tiles.sqlite3")
+    download_lock = RegionDownloadLock(output_root)
+    try:
+        download_lock.acquire()
+    except RegionDownloadLockedError as exc:
+        parser.error(str(exc))
 
+    database: TileDatabase | None = None
     previous_handlers: dict[int, object] = {}
 
     def stop_handler(signum: int, _frame: object) -> None:
@@ -472,6 +547,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         stop_event.set()
 
     try:
+        # This intentionally uses the configured response ceiling, not an average:
+        # it is a strict upper-bound preflight for small targeted captures.
+        missing_tiles = sum(
+            not validate_webp(
+                spec.path(output_root), calculate_hash=False
+            ).valid
+            for spec in specs
+        )
+        required_upper_bound = math.ceil(
+            missing_tiles * args.max_tile_bytes * 1.20
+        )
+        free_bytes = shutil.disk_usage(output_root).free
+        if free_bytes < required_upper_bound:
+            parser.error(
+                "insufficient disk for the regional upper bound plus 20%: "
+                f"need {required_upper_bound:,} bytes, have {free_bytes:,}"
+            )
+
+        stop_event = threading.Event()
+        limiter = AdaptiveRateLimiter(args.requests_per_second, stop_event)
+        fetcher = TileFetcher(
+            output_root,
+            limiter=limiter,
+            stop_event=stop_event,
+            timeout=args.timeout,
+            retries=args.retries,
+            max_tile_bytes=args.max_tile_bytes,
+            logger=logger,
+        )
+        database = TileDatabase(output_root / "tiles.sqlite3")
+
         if threading.current_thread() is threading.main_thread():
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous_handlers[signum] = signal.getsignal(signum)
@@ -551,9 +657,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         return 0
     finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-        database.close()
+        try:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+        finally:
+            try:
+                if database is not None:
+                    database.close()
+            finally:
+                download_lock.release()
 
 
 if __name__ == "__main__":

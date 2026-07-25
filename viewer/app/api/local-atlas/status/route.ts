@@ -1,6 +1,6 @@
 /**
- * The deployed site cannot read the user's disk. During local development,
- * Vite intercepts this route only when OBSIDIAN_ATLAS_PROGRESS_FILE is set.
+ * Local Vite intercepts this route before Vinext. A built bundle has no
+ * authority over the host filesystem and therefore advertises no capability.
  */
 export async function GET() {
   return new Response(null, {

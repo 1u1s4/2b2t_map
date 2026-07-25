@@ -72,6 +72,7 @@ export async function GET(request: Request) {
   let dimension: number;
   let tileX: number;
   let tileZ: number;
+  let online: boolean;
 
   try {
     const params = new URL(request.url).searchParams;
@@ -83,6 +84,7 @@ export async function GET(request: Request) {
     );
     tileX = parseInteger(readRequiredParam(params, "tileX"), "tileX");
     tileZ = parseInteger(readRequiredParam(params, "tileZ"), "tileZ");
+    online = params.get("online") === "1";
 
     if (!TILE_LAYERS.has(layer)) {
       throw new Error("layer must be one of: base, overlay, newchunks");
@@ -109,6 +111,17 @@ export async function GET(request: Request) {
       error instanceof Error ? error.message : "Invalid query parameters",
       400,
     );
+  }
+
+  if (!online) {
+    return new Response(null, {
+      status: 404,
+      headers: {
+        "Cache-Control": "no-store",
+        "X-Atlas-Tile-Source": "local-miss",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
   }
 
   const shardX = Math.trunc(tileX / 32);

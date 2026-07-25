@@ -1,11 +1,13 @@
 "use client";
 
 import {
-  Activity,
-  AlertTriangle,
-  Archive,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   AreaChart,
   Check,
+  CheckCircle2,
   ChevronLeft,
   Copy,
   Crosshair,
@@ -13,20 +15,28 @@ import {
   Eye,
   EyeOff,
   FolderOpen,
+  Gauge,
   Grid3X3,
+  HardDrive,
   HelpCircle,
   Layers3,
   Link2,
   ListFilter,
+  LockKeyhole,
   LocateFixed,
   MapPin,
   Minus,
   MousePointer2,
+  Navigation,
   Plus,
   RotateCcw,
   Search,
+  ScanSearch,
   Sparkles,
   SquareDashedMousePointer,
+  SquareMousePointer,
+  StepBack,
+  StepForward,
   Trash2,
   Upload,
   X,
@@ -42,12 +52,29 @@ import {
   type TileLayer,
 } from "./lib/local-tile-source";
 import {
-  isDownloadProgressStale,
-  readDownloadProgress,
-  readServedDownloadProgress,
-  type DownloadProgressReadResult,
-  type DownloadProgressSnapshot,
-} from "./lib/download-progress";
+  cardinalNeighbor,
+  cellForIndex,
+  cellIndexAtTile,
+  cellIndexAtWorld,
+  createExplorationState,
+  deserializeExplorationState,
+  isCellReviewed,
+  moveCurrentCardinal,
+  moveCurrentSerpentine,
+  serializeExplorationState,
+  serpentinePositionForCellIndex,
+  withCurrentCellReviewed,
+  withCurrentIndex,
+  type CardinalDirection,
+  type ExplorationState,
+  type WorldBounds,
+} from "./lib/exploration-grid";
+import {
+  downloadExplorationCell,
+  readLocalAtlasRuntime,
+  stopLocalRegionJob,
+  type LocalAtlasRuntime,
+} from "./lib/local-atlas-runtime";
 import {
   type ChangeEvent,
   type FormEvent,
@@ -65,10 +92,11 @@ const INITIAL_SCALE = 2.9423;
 const MIN_SCALE = 1 / 1_500;
 const MAX_SCALE = 8;
 const HIGHLIGHT_STORAGE_KEY = "obsidian-atlas-highlights-v1";
+const EXPLORATION_STORAGE_KEY = "obsidian-atlas-exploration-v1";
 const COLORS = ["#ff5f57", "#ffbd4a", "#26d9c7", "#62a8ff", "#c58cff"];
 
-type Drawer = "layers" | "archive" | "highlights" | "help" | null;
-type MarkMode = "pin" | "area" | null;
+type Drawer = "layers" | "exploration" | "highlights" | "help" | null;
+type MarkMode = "pin" | "area" | "region" | null;
 
 type Camera = {
   x: number;
@@ -112,12 +140,6 @@ type TileStats = {
   local: number;
   remote: number;
   missing: number;
-};
-
-type DownloadProgressState = {
-  source: LocalTileSource | "server";
-  result: DownloadProgressReadResult;
-  checkedAt: number;
 };
 
 type ActivePointer = {
@@ -177,13 +199,14 @@ function tileCacheKey(key: TileKey) {
   return `${key.layer}:${key.lod}:${key.tileX}:${key.tileZ}`;
 }
 
-function remoteTileUrl(key: TileKey) {
+function remoteTileUrl(key: TileKey, online: boolean) {
   const params = new URLSearchParams({
     layer: key.layer,
     lod: String(key.lod),
     dimension: "0",
     tileX: String(key.tileX),
     tileZ: String(key.tileZ),
+    online: online ? "1" : "0",
   });
   return `/api/tile?${params.toString()}`;
 }
@@ -286,11 +309,13 @@ export function MapViewer() {
   const mapRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const importRef = useRef<HTMLInputElement>(null);
+  const explorationImportRef = useRef<HTMLInputElement>(null);
   const fallbackBadgeRef = useRef<HTMLDivElement>(null);
   const fallbackTextRef = useRef<HTMLSpanElement>(null);
   const tileCacheRef = useRef<Map<string, TileRecord>>(new Map());
   const tileGenerationRef = useRef(0);
-  const onlineFallbackRef = useRef(true);
+  const onlineFallbackRef = useRef(false);
+  const lastCompletedJobRef = useRef<string | null>(null);
   const pointerRef = useRef<{
     id: number;
     startX: number;
@@ -352,7 +377,7 @@ export function MapViewer() {
     },
   ]);
   const [showGrid, setShowGrid] = useState(true);
-  const [onlineFallback, setOnlineFallback] = useState(true);
+  const [onlineFallback, setOnlineFallback] = useState(false);
   const [localSource, setLocalSource] = useState<LocalTileSource | null>(null);
   const [archiveName, setArchiveName] = useState<string | null>(null);
   const [localSupported, setLocalSupported] = useState(false);
@@ -361,14 +386,29 @@ export function MapViewer() {
     remote: 0,
     missing: 0,
   });
-  const [downloadProgress, setDownloadProgress] =
-    useState<DownloadProgressState | null>(null);
   const [renderVersion, setRenderVersion] = useState(0);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [selectedHighlightId, setSelectedHighlightId] = useState<string | null>(
     null,
   );
   const [highlightsReady, setHighlightsReady] = useState(false);
+  const [explorationState, setExplorationState] =
+    useState<ExplorationState | null>(null);
+  const [confirmCloseExploration, setConfirmCloseExploration] =
+    useState(false);
+  const [explorationReady, setExplorationReady] = useState(false);
+  const [regionForm, setRegionForm] = useState({
+    name: "Región de análisis",
+    minX: "-86000",
+    minZ: "167500",
+    maxXExclusive: "-84000",
+    maxZExclusive: "169000",
+  });
+  const [requestsPerSecond, setRequestsPerSecond] = useState(1);
+  const [localRuntime, setLocalRuntime] =
+    useState<LocalAtlasRuntime | null>(null);
+  const [runtimeChecked, setRuntimeChecked] = useState(false);
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
   const lod = lodForScale(scale);
@@ -377,11 +417,15 @@ export function MapViewer() {
   const selectedHighlight = highlights.find(
     (highlight) => highlight.id === selectedHighlightId,
   );
-  const progressMatchesCurrentSource =
-    (localSource !== null && downloadProgress?.source === localSource) ||
-    (localSource === null && downloadProgress?.source === "server");
-  const showDownloadProgress =
-    localSource !== null || downloadProgress?.source === "server";
+  const currentExplorationCell = explorationState
+    ? cellForIndex(
+        explorationState.region,
+        explorationState.currentIndex,
+      )
+    : null;
+  const explorationPercent = explorationState
+    ? (explorationState.reviewedCount / explorationState.region.cellCount) * 100
+    : 0;
 
   const notify = useCallback((message: string) => {
     setToast(message);
@@ -396,6 +440,15 @@ export function MapViewer() {
     tileCacheRef.current.clear();
     setTileStats({ local: 0, remote: 0, missing: 0 });
     setRenderVersion((version) => version + 1);
+  }, []);
+
+  const focusExploration = useCallback((state: ExplorationState) => {
+    const cell = cellForIndex(state.region, state.currentIndex);
+    setCamera({
+      x: (cell.bounds.minX + cell.bounds.maxXExclusive) / 2,
+      z: (cell.bounds.minZ + cell.bounds.maxZExclusive) / 2,
+    });
+    setScale(state.region.scale);
   }, []);
 
   useEffect(() => {
@@ -416,10 +469,34 @@ export function MapViewer() {
       }
       setHighlightsReady(true);
 
-      const location = parseLocation(window.location.hash, []);
-      if (location) {
-        setCamera({ x: location.x, z: location.z });
-        if (location.scale) setScale(location.scale);
+      let restoredExploration: ExplorationState | null = null;
+      try {
+        const stored = window.localStorage.getItem(EXPLORATION_STORAGE_KEY);
+        if (stored) {
+          restoredExploration = deserializeExplorationState(stored);
+          setExplorationState(restoredExploration);
+        }
+      } catch {
+        // Invalid or obsolete sessions are ignored instead of blocking the map.
+      }
+      setExplorationReady(true);
+
+      if (restoredExploration) {
+        const cell = cellForIndex(
+          restoredExploration.region,
+          restoredExploration.currentIndex,
+        );
+        setCamera({
+          x: (cell.bounds.minX + cell.bounds.maxXExclusive) / 2,
+          z: (cell.bounds.minZ + cell.bounds.maxZExclusive) / 2,
+        });
+        setScale(restoredExploration.region.scale);
+      } else {
+        const location = parseLocation(window.location.hash, []);
+        if (location) {
+          setCamera({ x: location.x, z: location.z });
+          if (location.scale) setScale(location.scale);
+        }
       }
     });
     return () => window.cancelAnimationFrame(frame);
@@ -440,6 +517,26 @@ export function MapViewer() {
       return () => window.clearTimeout(timeout);
     }
   }, [highlights, highlightsReady, notify]);
+
+  useEffect(() => {
+    if (!explorationReady) return;
+    try {
+      if (explorationState) {
+        window.localStorage.setItem(
+          EXPLORATION_STORAGE_KEY,
+          serializeExplorationState(explorationState),
+        );
+      } else {
+        window.localStorage.removeItem(EXPLORATION_STORAGE_KEY);
+      }
+    } catch {
+      const timeout = window.setTimeout(
+        () => notify("No se pudo guardar la sesión de exploración"),
+        0,
+      );
+      return () => window.clearTimeout(timeout);
+    }
+  }, [explorationReady, explorationState, notify]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -484,23 +581,36 @@ export function MapViewer() {
   }, []);
 
   useEffect(() => {
-    if (!localSource) return;
-
     let cancelled = false;
     let reading = false;
+    let activeController: AbortController | null = null;
     const refresh = async () => {
       if (reading) return;
       reading = true;
+      const controller = new AbortController();
+      activeController = controller;
+      const timeout = window.setTimeout(() => controller.abort(), 8_000);
       try {
-        const result = await readDownloadProgress(localSource.directory);
+        const runtime = await readLocalAtlasRuntime(controller.signal);
+        if (cancelled) return;
+        setLocalRuntime(runtime);
+        setRuntimeChecked(true);
+        if (
+          runtime?.job?.status === "complete" &&
+          lastCompletedJobRef.current !== runtime.job.id
+        ) {
+          lastCompletedJobRef.current = runtime.job.id;
+          clearTileCache();
+          notify("La celda ya está disponible localmente");
+        }
+      } catch {
         if (!cancelled) {
-          setDownloadProgress({
-            source: localSource,
-            result,
-            checkedAt: Date.now(),
-          });
+          setLocalRuntime(null);
+          setRuntimeChecked(true);
         }
       } finally {
+        window.clearTimeout(timeout);
+        if (activeController === controller) activeController = null;
         reading = false;
       }
     };
@@ -508,66 +618,13 @@ export function MapViewer() {
     void refresh();
     const interval = window.setInterval(() => {
       void refresh();
-    }, 5_000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [localSource]);
-
-  useEffect(() => {
-    if (localSource) return;
-
-    let cancelled = false;
-    let reading = false;
-    let interval: number | null = null;
-    let activeController: AbortController | null = null;
-    const refresh = async () => {
-      if (reading) return;
-      reading = true;
-      const controller = new AbortController();
-      activeController = controller;
-      const abortTimeout = window.setTimeout(() => controller.abort(), 10_000);
-      let keepPolling = true;
-      try {
-        const result = await readServedDownloadProgress(
-          fetch,
-          controller.signal,
-        );
-        if (cancelled) return;
-        if (result === null) {
-          keepPolling = false;
-          setDownloadProgress((current) =>
-            current?.source === "server" ? null : current,
-          );
-          return;
-        }
-        setDownloadProgress({
-          source: "server",
-          result,
-          checkedAt: Date.now(),
-        });
-      } finally {
-        window.clearTimeout(abortTimeout);
-        if (activeController === controller) activeController = null;
-        reading = false;
-        if (!cancelled && keepPolling) {
-          interval = window.setTimeout(() => {
-            void refresh();
-          }, 5_000);
-        }
-      }
-    };
-
-    void refresh();
-
+    }, 2_500);
     return () => {
       cancelled = true;
       activeController?.abort();
-      if (interval !== null) window.clearTimeout(interval);
+      window.clearInterval(interval);
     };
-  }, [localSource]);
+  }, [clearTileCache, notify]);
 
   const ensureTile = useCallback(
     (key: TileKey) => {
@@ -621,10 +678,19 @@ export function MapViewer() {
           }
 
           if (!source || onlineFallbackRef.current) {
-            const response = await fetch(remoteTileUrl(key));
+            const response = await fetch(
+              remoteTileUrl(key, onlineFallbackRef.current),
+            );
             if (response.ok) {
               const bitmap = await createImageBitmap(await response.blob());
-              finish({ status: "loaded", bitmap, source: "remote" });
+              finish({
+                status: "loaded",
+                bitmap,
+                source:
+                  response.headers.get("X-Atlas-Tile-Source") === "local"
+                    ? "local"
+                    : "remote",
+              });
               return;
             }
             if (response.status === 404) {
@@ -801,6 +867,84 @@ export function MapViewer() {
       }
     }
 
+    if (explorationState) {
+      const region = explorationState.region;
+      const firstTileX = Math.max(
+        region.minTileX,
+        Math.floor(minX / region.tileSpan),
+      );
+      const lastTileXExclusive = Math.min(
+        region.maxTileXExclusive,
+        Math.floor(maxX / region.tileSpan) + 1,
+      );
+      const firstTileZ = Math.max(
+        region.minTileZ,
+        Math.floor(minZ / region.tileSpan),
+      );
+      const lastTileZExclusive = Math.min(
+        region.maxTileZExclusive,
+        Math.floor(maxZ / region.tileSpan) + 1,
+      );
+      const cellSize = region.tileSpan * scale;
+      context.font = "10px var(--font-geist-mono), monospace";
+      context.textBaseline = "top";
+      for (
+        let tileZ = firstTileZ;
+        tileZ < lastTileZExclusive;
+        tileZ += 1
+      ) {
+        for (
+          let tileX = firstTileX;
+          tileX < lastTileXExclusive;
+          tileX += 1
+        ) {
+          const index = cellIndexAtTile(region, tileX, tileZ);
+          if (index === null) continue;
+          const point = screenAtWorld(
+            tileX * region.tileSpan,
+            tileZ * region.tileSpan,
+          );
+          const current = index === explorationState.currentIndex;
+          const reviewed = isCellReviewed(explorationState, index);
+          context.globalAlpha = 1;
+          context.fillStyle = current
+            ? "rgba(98, 168, 255, 0.20)"
+            : reviewed
+              ? "rgba(38, 217, 199, 0.12)"
+              : "rgba(4, 11, 20, 0.05)";
+          context.fillRect(point.x, point.y, cellSize, cellSize);
+          context.lineWidth = current ? 3 : reviewed ? 1.5 : 1;
+          context.strokeStyle = current
+            ? "rgba(133, 196, 255, 0.95)"
+            : reviewed
+              ? "rgba(38, 217, 199, 0.68)"
+              : "rgba(255, 255, 255, 0.24)";
+          context.setLineDash(current ? [] : reviewed ? [] : [7, 6]);
+          context.strokeRect(
+            point.x + 0.5,
+            point.y + 0.5,
+            cellSize - 1,
+            cellSize - 1,
+          );
+          context.setLineDash([]);
+          if (cellSize >= 94) {
+            const cell = cellForIndex(region, index);
+            context.fillStyle = current
+              ? "rgba(224, 242, 255, 0.98)"
+              : reviewed
+                ? "rgba(180, 255, 245, 0.88)"
+                : "rgba(232, 240, 248, 0.72)";
+            context.fillText(
+              `F${cell.row + 1} · C${cell.column + 1}`,
+              point.x + 9,
+              point.y + 9,
+            );
+          }
+        }
+      }
+      context.textBaseline = "alphabetic";
+    }
+
     for (const highlight of highlights) {
       if (!highlight.visible) continue;
       const selected = highlight.id === selectedHighlightId;
@@ -892,6 +1036,7 @@ export function MapViewer() {
     areaPreview,
     camera,
     ensureTile,
+    explorationState,
     gridStep,
     highlights,
     layers,
@@ -906,6 +1051,7 @@ export function MapViewer() {
 
   const zoomAt = useCallback(
     (factor: number, screenX = viewSize.width / 2, screenY = viewSize.height / 2) => {
+      if (explorationState) return;
       const anchor = worldAtScreen(screenX, screenY);
       const nextScale = clamp(scale * factor, MIN_SCALE, MAX_SCALE);
       setCamera({
@@ -914,7 +1060,7 @@ export function MapViewer() {
       });
       setScale(nextScale);
     },
-    [scale, viewSize, worldAtScreen],
+    [explorationState, scale, viewSize, worldAtScreen],
   );
 
   const hitHighlight = useCallback(
@@ -1000,6 +1146,29 @@ export function MapViewer() {
     [highlights.length, notify],
   );
 
+  const captureRegionBounds = useCallback(
+    (bounds: NonNullable<Highlight["bounds"]>) => {
+      const minX = Math.floor(Math.min(bounds.x1, bounds.x2));
+      const minZ = Math.floor(Math.min(bounds.z1, bounds.z2));
+      const maxXExclusive = Math.ceil(Math.max(bounds.x1, bounds.x2));
+      const maxZExclusive = Math.ceil(Math.max(bounds.z1, bounds.z2));
+      if (maxXExclusive - minX < 2 || maxZExclusive - minZ < 2) return;
+      setRegionForm((current) => ({
+        ...current,
+        minX: String(minX),
+        minZ: String(minZ),
+        maxXExclusive: String(maxXExclusive),
+        maxZExclusive: String(maxZExclusive),
+      }));
+      areaPreviewRef.current = undefined;
+      setAreaPreview(undefined);
+      setMarkMode(null);
+      setDrawer("exploration");
+      notify("Región capturada; revisa sus límites");
+    },
+    [notify],
+  );
+
   const beginMarkMode = useCallback((mode: Exclude<MarkMode, null>) => {
     setMarkMode(mode);
     areaPreviewRef.current = undefined;
@@ -1030,7 +1199,7 @@ export function MapViewer() {
       event.currentTarget.setPointerCapture(event.pointerId);
       return;
     }
-    if (markMode === "area") {
+    if (markMode === "area" || markMode === "region") {
       areaStartRef.current = world;
       const preview = {
         x1: world.x,
@@ -1102,7 +1271,10 @@ export function MapViewer() {
       return;
     }
 
-    if (markMode === "area" && areaStartRef.current) {
+    if (
+      (markMode === "area" || markMode === "region") &&
+      areaStartRef.current
+    ) {
       const preview = {
         x1: areaStartRef.current.x,
         z1: areaStartRef.current.z,
@@ -1168,12 +1340,20 @@ export function MapViewer() {
     if (pinStart?.id === event.pointerId) {
       pinStartRef.current = null;
       if (!pinStart.moved) addPin(pinStart.point);
-    } else if (markMode === "area" && areaPreviewRef.current) {
+    } else if (
+      (markMode === "area" || markMode === "region") &&
+      areaPreviewRef.current
+    ) {
       const preview = areaPreviewRef.current;
+      const completedMode = markMode;
       areaStartRef.current = null;
       areaPreviewRef.current = undefined;
       setAreaPreview(undefined);
-      addArea(preview);
+      if (completedMode === "region") {
+        captureRegionBounds(preview);
+      } else {
+        addArea(preview);
+      }
     } else {
       const pointer = pointerRef.current;
       const wasPinching = pinchRef.current !== null;
@@ -1237,6 +1417,16 @@ export function MapViewer() {
     notify(`Centrado en ${Math.round(result.x)}, ${Math.round(result.z)}`);
   };
 
+  const moveExplorationCardinal = useCallback(
+    (direction: CardinalDirection) => {
+      if (!explorationState) return;
+      const next = moveCurrentCardinal(explorationState, direction);
+      setExplorationState(next);
+      if (next !== explorationState) focusExploration(next);
+    },
+    [explorationState, focusExploration],
+  );
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
@@ -1251,6 +1441,8 @@ export function MapViewer() {
         searchRef.current?.focus();
       } else if (event.key === "h" || event.key === "H") {
         setDrawer("highlights");
+      } else if (event.key === "e" || event.key === "E") {
+        setDrawer("exploration");
       } else if (event.key === "m" || event.key === "M") {
         beginMarkMode("pin");
       } else if (event.key === "r" || event.key === "R") {
@@ -1267,6 +1459,19 @@ export function MapViewer() {
         setAreaPreview(undefined);
         setDrawer(null);
       } else if (event.key.startsWith("Arrow")) {
+        if (explorationState) {
+          event.preventDefault();
+          moveExplorationCardinal(
+            event.key === "ArrowRight"
+              ? "east"
+              : event.key === "ArrowLeft"
+                ? "west"
+                : event.key === "ArrowDown"
+                  ? "south"
+                  : "north",
+          );
+          return;
+        }
         const amount = 120 / scale;
         setCamera((current) => ({
           x:
@@ -1288,7 +1493,13 @@ export function MapViewer() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [beginMarkMode, scale, zoomAt]);
+  }, [
+    beginMarkMode,
+    explorationState,
+    moveExplorationCardinal,
+    scale,
+    zoomAt,
+  ]);
 
   const updateLayer = (
     id: TileLayer,
@@ -1328,7 +1539,7 @@ export function MapViewer() {
       setLocalSource(source);
       setArchiveName(handle.name);
       clearTileCache();
-      setDrawer("archive");
+      setDrawer("exploration");
       notify("Archivo local conectado");
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -1350,6 +1561,195 @@ export function MapViewer() {
     onlineFallbackRef.current = next;
     setOnlineFallback(next);
     clearTileCache();
+  };
+
+  const useCurrentViewForRegion = () => {
+    const halfWidth = viewSize.width / (2 * scale);
+    const halfHeight = viewSize.height / (2 * scale);
+    setRegionForm((current) => ({
+      ...current,
+      minX: String(Math.floor(camera.x - halfWidth)),
+      minZ: String(Math.floor(camera.z - halfHeight)),
+      maxXExclusive: String(Math.ceil(camera.x + halfWidth)),
+      maxZExclusive: String(Math.ceil(camera.z + halfHeight)),
+    }));
+    notify("Límites tomados de la vista actual");
+  };
+
+  const startExploration = () => {
+    try {
+      const bounds: WorldBounds = {
+        minX: Number(regionForm.minX),
+        minZ: Number(regionForm.minZ),
+        maxXExclusive: Number(regionForm.maxXExclusive),
+        maxZExclusive: Number(regionForm.maxZExclusive),
+      };
+      if (
+        !Object.values(bounds).every((value) => Number.isSafeInteger(value))
+      ) {
+        throw new Error("Las cuatro coordenadas deben ser enteros");
+      }
+      if (
+        explorationState &&
+        !window.confirm(
+          "Esto reemplazará la sesión de exploración activa. ¿Continuar?",
+        )
+      ) {
+        return;
+      }
+      let next = createExplorationState({
+        id: `region-${Date.now().toString(36)}`,
+        name: regionForm.name.trim() || "Región de análisis",
+        bounds,
+        lod,
+        scale,
+      });
+      const initialIndex = cellIndexAtWorld(
+        next.region,
+        camera.x,
+        camera.z,
+      );
+      if (initialIndex !== null) next = withCurrentIndex(next, initialIndex);
+      setExplorationState(next);
+      focusExploration(next);
+      onlineFallbackRef.current = false;
+      setOnlineFallback(false);
+      clearTileCache();
+      setDrawer("exploration");
+      notify(
+        `${next.region.cellCount.toLocaleString("es-GT")} celdas · zoom fijado`,
+      );
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "La región no es válida",
+      );
+    }
+  };
+
+  const finishExploration = () => {
+    if (!explorationState) return;
+    setConfirmCloseExploration(true);
+  };
+
+  const confirmFinishExploration = () => {
+    setConfirmCloseExploration(false);
+    setExplorationState(null);
+    notify("Sesión de exploración cerrada");
+  };
+
+  const exportExploration = () => {
+    if (!explorationState) return;
+    const blob = new Blob(
+      [JSON.stringify(JSON.parse(serializeExplorationState(explorationState)), null, 2)],
+      { type: "application/json" },
+    );
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "obsidian-atlas-exploracion.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+    notify("Sesión exportada");
+  };
+
+  const importExploration = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const next = deserializeExplorationState(await file.text());
+      if (
+        explorationState &&
+        !window.confirm(
+          "Esto reemplazará la sesión de exploración activa. ¿Continuar?",
+        )
+      ) {
+        return;
+      }
+      setExplorationState(next);
+      focusExploration(next);
+      onlineFallbackRef.current = false;
+      setOnlineFallback(false);
+      clearTileCache();
+      setDrawer("exploration");
+      notify(`${next.reviewedCount.toLocaleString("es-GT")} celdas restauradas`);
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "Sesión de exploración inválida",
+      );
+    }
+  };
+
+  const reviewCurrentAndMove = (step: -1 | 1) => {
+    if (!explorationState) return;
+    const reviewed = withCurrentCellReviewed(explorationState);
+    const next = moveCurrentSerpentine(reviewed, step);
+    setExplorationState(next);
+    if (next.currentIndex !== explorationState.currentIndex) {
+      focusExploration(next);
+    }
+  };
+
+  const moveExplorationSerpentine = (step: -1 | 1) => {
+    if (!explorationState) return;
+    const next = moveCurrentSerpentine(explorationState, step);
+    setExplorationState(next);
+    if (next !== explorationState) focusExploration(next);
+  };
+
+  const toggleCurrentReviewed = () => {
+    setExplorationState((current) =>
+      current
+        ? withCurrentCellReviewed(
+            current,
+            !isCellReviewed(current, current.currentIndex),
+          )
+        : current,
+    );
+  };
+
+  const downloadCurrentCell = async () => {
+    if (!localRuntime?.capacity.configured || !currentExplorationCell) {
+      notify("Inicia el visor con la biblioteca local de LuisA");
+      return;
+    }
+    const selectedLayers = layers
+      .filter((layer) => layer.visible)
+      .map((layer) => layer.id);
+    setRuntimeBusy(true);
+    try {
+      await downloadExplorationCell(
+        localRuntime,
+        currentExplorationCell.bounds,
+        explorationState!.region.lod,
+        selectedLayers.length > 0 ? selectedLayers : ["base"],
+        requestsPerSecond,
+      );
+      setLocalRuntime(await readLocalAtlasRuntime());
+      notify("Descarga regional iniciada");
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "No se pudo iniciar la celda",
+      );
+    } finally {
+      setRuntimeBusy(false);
+    }
+  };
+
+  const stopCurrentJob = async () => {
+    if (!localRuntime?.job) return;
+    setRuntimeBusy(true);
+    try {
+      await stopLocalRegionJob(localRuntime);
+      setLocalRuntime(await readLocalAtlasRuntime());
+      notify("Detención solicitada");
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "No se pudo detener",
+      );
+    } finally {
+      setRuntimeBusy(false);
+    }
   };
 
   const copyCoordinates = async () => {
@@ -1423,7 +1823,7 @@ export function MapViewer() {
     () =>
       ({
         layers: "Capas del mapa",
-        archive: "Archivo de tiles",
+        exploration: "Exploración regional",
         highlights: "Highlights",
         help: "Guía rápida",
       })[drawer ?? "layers"],
@@ -1468,7 +1868,7 @@ export function MapViewer() {
           </div>
           <div>
             <strong>OBSIDIAN ATLAS</strong>
-            <span>2b2t · Overworld archive</span>
+            <span>2b2t · exploración local</span>
           </div>
         </div>
 
@@ -1536,11 +1936,12 @@ export function MapViewer() {
           <Layers3 />
         </DockButton>
         <DockButton
-          active={drawer === "archive"}
-          label="Archivo"
-          onClick={() => toggleDrawer("archive")}
+          active={drawer === "exploration"}
+          label="Explorar"
+          badge={explorationState ? Math.round(explorationPercent) : undefined}
+          onClick={() => toggleDrawer("exploration")}
         >
-          <Archive />
+          <ScanSearch />
         </DockButton>
         <DockButton
           active={drawer === "highlights"}
@@ -1641,80 +2042,439 @@ export function MapViewer() {
             </div>
           )}
 
-          {drawer === "archive" && (
-            <div className="drawer-content">
-              <div className={`archive-hero ${localSource ? "connected" : ""}`}>
-                <div className="archive-icon">
-                  {localSource ? <Check /> : <FolderOpen />}
-                </div>
-                <div>
-                  <span>{localSource ? "ARCHIVO CONECTADO" : "FUENTE DE TILES"}</span>
-                  <h3>{archiveName ?? "Abrir 2b2t_tiles"}</h3>
-                  <p>
-                    {localSource
-                      ? "Los tiles locales tienen prioridad."
-                      : downloadProgress?.source === "server"
-                        ? "El progreso local se actualiza automáticamente."
-                      : "Chrome puede leer tu archivo sin subirlo."}
-                  </p>
-                </div>
-              </div>
-              {localSupported ? (
-                <button
-                  type="button"
-                  className="primary-button"
-                  onClick={localSource ? disconnectArchive : openArchive}
-                >
-                  {localSource ? <X size={17} /> : <FolderOpen size={17} />}
-                  {localSource ? "Desconectar archivo" : "Elegir carpeta local"}
-                </button>
-              ) : (
-                <p className="warning-note">
-                  La apertura directa requiere Chrome y una conexión segura.
-                </p>
-              )}
-              <button
-                className="setting-row"
-                type="button"
-                aria-pressed={onlineFallback}
-                onClick={toggleOnlineFallback}
+          {drawer === "exploration" && (
+            <div className="drawer-content exploration-panel">
+              <section
+                className={`capacity-card ${
+                  localRuntime?.capacity.fits === true
+                    ? "fits"
+                    : localRuntime?.capacity.fits === false
+                      ? "tight"
+                      : ""
+                }`}
               >
-                <RotateCcw size={18} />
-                <span>
-                  <strong>Respaldo online</strong>
-                  <small>Completa tiles ausentes desde 2b2t.place</small>
-                </span>
-                <span className={`switch ${onlineFallback ? "on" : ""}`} />
-              </button>
-              {showDownloadProgress && (
-                <DownloadProgressCard
-                  result={
-                    progressMatchesCurrentSource
-                      ? (downloadProgress?.result ?? null)
-                      : null
-                  }
-                  checkedAt={
-                    progressMatchesCurrentSource
-                      ? (downloadProgress?.checkedAt ?? null)
-                      : null
-                  }
-                />
-              )}
-              <p className="metric-caption">
-                Tiles consultados por el mapa en esta sesión
-              </p>
-              <div className="stats-grid">
-                <Metric label="Local" value={tileStats.local} tone="mint" />
-                <Metric label="Online" value={tileStats.remote} tone="blue" />
-                <Metric label="Ausentes" value={tileStats.missing} tone="amber" />
-              </div>
-              <div className="archive-note">
-                <Archive size={17} />
+                <div className="capacity-heading">
+                  <HardDrive size={20} />
+                  <div>
+                    <span>CAPACIDAD LOCAL · LUISA</span>
+                    <strong>
+                      {localRuntime?.capacity.fits === true
+                        ? "Overworld completo: capacidad verificada"
+                        : localRuntime?.capacity.fits === false
+                          ? "Margen insuficiente para la referencia completa"
+                          : runtimeChecked
+                            ? "Runtime local no configurado"
+                            : "Comprobando discos…"}
+                    </strong>
+                  </div>
+                  {localRuntime?.capacity.fits === true && <CheckCircle2 />}
+                </div>
+                {localRuntime && (
+                  <div className="capacity-metrics">
+                    <span>
+                      Libre
+                      <strong>
+                        {formatBytes(localRuntime.capacity.freeBytes)}
+                      </strong>
+                    </span>
+                    <span>
+                      Referencia + reserva
+                      <strong>
+                        {formatBytes(
+                          localRuntime.capacity.overworldRequirementBytes,
+                        )}
+                      </strong>
+                    </span>
+                    <span>
+                      Margen
+                      <strong>
+                        {formatSignedBytes(localRuntime.capacity.marginBytes)}
+                      </strong>
+                    </span>
+                  </div>
+                )}
                 <p>
-                  Selecciona la carpeta <strong>2b2t_tiles</strong>. El
-                  navegador recibe acceso de solo lectura; nada se sube.
+                  Comprobación conservadora del APFS de tiles y del espacio
+                  disponible en LuisA. No inicia una descarga total.
                 </p>
-              </div>
+              </section>
+
+              {!explorationState ? (
+                <>
+                  <div className="section-copy">
+                    <p>Divide una región en celdas del LOD actual.</p>
+                    <span>
+                      Cada celda es un tile; el zoom queda fijado durante la
+                      revisión.
+                    </span>
+                  </div>
+                  <div className="region-actions">
+                    <button
+                      type="button"
+                      onClick={() => beginMarkMode("region")}
+                    >
+                      <SquareMousePointer size={16} />
+                      Dibujar región
+                    </button>
+                    <button type="button" onClick={useCurrentViewForRegion}>
+                      <Crosshair size={16} />
+                      Usar vista
+                    </button>
+                  </div>
+                  <label className="region-name-field">
+                    <span>Nombre</span>
+                    <input
+                      value={regionForm.name}
+                      maxLength={200}
+                      onChange={(event) =>
+                        setRegionForm((current) => ({
+                          ...current,
+                          name: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                  <div className="region-coordinate-grid">
+                    {(
+                      [
+                        ["minX", "X mínima"],
+                        ["minZ", "Z mínima"],
+                        ["maxXExclusive", "X máxima"],
+                        ["maxZExclusive", "Z máxima"],
+                      ] as const
+                    ).map(([field, label]) => (
+                      <label key={field}>
+                        <span>{label}</span>
+                        <input
+                          inputMode="numeric"
+                          value={regionForm[field]}
+                          onChange={(event) =>
+                            setRegionForm((current) => ({
+                              ...current,
+                              [field]: event.target.value,
+                            }))
+                          }
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <div className="fixed-zoom-card">
+                    <LockKeyhole size={17} />
+                    <span>
+                      <strong>Zoom a fijar: {scale.toFixed(3)}×</strong>
+                      <small>
+                        LOD {lod} · {blocksPerTileAtLod(lod).toLocaleString("es-GT")}{" "}
+                        bloques por celda
+                      </small>
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={startExploration}
+                  >
+                    <Navigation size={17} />
+                    Crear sesión de exploración
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => explorationImportRef.current?.click()}
+                  >
+                    <Upload size={16} />
+                    Importar sesión anterior
+                  </button>
+                </>
+              ) : (
+                <>
+                  <section className="exploration-progress-card">
+                    <div className="exploration-progress-heading">
+                      <div>
+                        <span>SESIÓN ACTIVA</span>
+                        <h3>{explorationState.region.name}</h3>
+                      </div>
+                      <strong>{formatProgressPercent(explorationPercent)}%</strong>
+                    </div>
+                    <div
+                      className="exploration-progress-track"
+                      role="progressbar"
+                      aria-label="Progreso de exploración regional"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={explorationPercent}
+                    >
+                      <span style={{ width: `${explorationPercent}%` }} />
+                    </div>
+                    <div className="exploration-summary-grid">
+                      <span>
+                        Revisadas
+                        <strong>
+                          {explorationState.reviewedCount.toLocaleString("es-GT")}
+                        </strong>
+                      </span>
+                      <span>
+                        Total
+                        <strong>
+                          {explorationState.region.cellCount.toLocaleString("es-GT")}
+                        </strong>
+                      </span>
+                      <span>
+                        Posición
+                        <strong>
+                          {serpentinePositionForCellIndex(
+                            explorationState.region,
+                            explorationState.currentIndex,
+                          ) + 1}
+                        </strong>
+                      </span>
+                    </div>
+                  </section>
+
+                  {currentExplorationCell && (
+                    <section className="current-cell-card">
+                      <div className="current-cell-heading">
+                        <div>
+                          <span>CELDA ACTUAL</span>
+                          <strong>
+                            Fila {currentExplorationCell.row + 1} /{" "}
+                            {explorationState.region.rows} · Columna{" "}
+                            {currentExplorationCell.column + 1} /{" "}
+                            {explorationState.region.columns}
+                          </strong>
+                        </div>
+                        <span className="cell-lod">
+                          L{explorationState.region.lod}
+                        </span>
+                      </div>
+                      <code>
+                        X [{currentExplorationCell.bounds.minX},{" "}
+                        {currentExplorationCell.bounds.maxXExclusive}) · Z [
+                        {currentExplorationCell.bounds.minZ},{" "}
+                        {currentExplorationCell.bounds.maxZExclusive})
+                      </code>
+                      <button
+                        type="button"
+                        className={`review-toggle ${
+                          isCellReviewed(
+                            explorationState,
+                            explorationState.currentIndex,
+                          )
+                            ? "reviewed"
+                            : ""
+                        }`}
+                        onClick={toggleCurrentReviewed}
+                      >
+                        <CheckCircle2 size={17} />
+                        {isCellReviewed(
+                          explorationState,
+                          explorationState.currentIndex,
+                        )
+                          ? "Celda revisada"
+                          : "Marcar como revisada"}
+                      </button>
+                      <div className="sequence-actions">
+                        <button
+                          type="button"
+                          disabled={
+                            serpentinePositionForCellIndex(
+                              explorationState.region,
+                              explorationState.currentIndex,
+                            ) === 0
+                          }
+                          onClick={() => moveExplorationSerpentine(-1)}
+                        >
+                          <StepBack size={16} />
+                          Anterior
+                        </button>
+                        <button
+                          type="button"
+                          className="next-review"
+                          onClick={() => reviewCurrentAndMove(1)}
+                        >
+                          Revisada y siguiente
+                          <StepForward size={16} />
+                        </button>
+                      </div>
+                    </section>
+                  )}
+
+                  <section className="regional-download-card">
+                    <div className="regional-download-heading">
+                      <Gauge size={18} />
+                      <div>
+                        <span>DATOS BAJO DEMANDA</span>
+                        <strong>
+                          {localRuntime?.job?.status === "running" ||
+                          localRuntime?.job?.status === "stopping"
+                            ? localRuntime.job.message
+                            : "Guardar únicamente esta celda"}
+                        </strong>
+                      </div>
+                    </div>
+                    <label>
+                      <span>Ritmo seguro</span>
+                      <select
+                        value={requestsPerSecond}
+                        disabled={
+                          localRuntime?.job?.status === "running" ||
+                          localRuntime?.job?.status === "stopping"
+                        }
+                        onChange={(event) =>
+                          setRequestsPerSecond(Number(event.target.value))
+                        }
+                      >
+                        <option value="0.25">0.25 req/s</option>
+                        <option value="0.5">0.5 req/s</option>
+                        <option value="1">1 req/s</option>
+                        <option value="2">2 req/s</option>
+                      </select>
+                    </label>
+                    {localRuntime?.job?.status === "running" ||
+                    localRuntime?.job?.status === "stopping" ? (
+                      <button
+                        type="button"
+                        className="stop-job-button"
+                        disabled={runtimeBusy}
+                        onClick={stopCurrentJob}
+                      >
+                        <X size={16} />
+                        Detener celda
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={
+                          runtimeBusy ||
+                          !localRuntime?.capacity.configured
+                        }
+                        onClick={downloadCurrentCell}
+                      >
+                        <Download size={16} />
+                        Descargar celda actual
+                      </button>
+                    )}
+                    <small>
+                      El límite de 2 req/s se comparte dentro del trabajo
+                      regional. La navegación no descarga en segundo plano.
+                    </small>
+                  </section>
+
+                  <div className="exploration-transfer">
+                    <button type="button" onClick={exportExploration}>
+                      <Download size={15} />
+                      Exportar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => explorationImportRef.current?.click()}
+                    >
+                      <Upload size={15} />
+                      Importar
+                    </button>
+                    <button
+                      type="button"
+                      className="danger"
+                      aria-expanded={confirmCloseExploration}
+                      onClick={finishExploration}
+                    >
+                      <Trash2 size={15} />
+                      Cerrar sesión
+                    </button>
+                  </div>
+                  {confirmCloseExploration ? (
+                    <section
+                      className="exploration-close-confirm"
+                      aria-label="Confirmar cierre de sesión"
+                    >
+                      <div>
+                        <strong>¿Eliminar este progreso local?</strong>
+                        <small>
+                          Exporta primero si quieres retomarlo más adelante.
+                        </small>
+                      </div>
+                      <div>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmCloseExploration(false)}
+                        >
+                          Conservar
+                        </button>
+                        <button
+                          type="button"
+                          className="danger"
+                          onClick={confirmFinishExploration}
+                        >
+                          Eliminar progreso
+                        </button>
+                      </div>
+                    </section>
+                  ) : null}
+                </>
+              )}
+
+              <input
+                ref={explorationImportRef}
+                type="file"
+                accept="application/json,.json"
+                hidden
+                onChange={importExploration}
+              />
+
+              <details className="local-data-details">
+                <summary>Fuentes de datos locales</summary>
+                <div className={`archive-hero ${localSource ? "connected" : ""}`}>
+                  <div className="archive-icon">
+                    {localSource ? <Check /> : <FolderOpen />}
+                  </div>
+                  <div>
+                    <span>
+                      {localSource ? "CARPETA CONECTADA" : "BIBLIOTECA LOCAL"}
+                    </span>
+                    <h3>
+                      {archiveName ??
+                        (localRuntime?.capacity.configured
+                          ? "LuisA conectada"
+                          : "Elegir 2b2t_tiles")}
+                    </h3>
+                    <p>Los tiles locales siempre tienen prioridad.</p>
+                  </div>
+                </div>
+                {localSupported && (
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={localSource ? disconnectArchive : openArchive}
+                  >
+                    {localSource ? <X size={17} /> : <FolderOpen size={17} />}
+                    {localSource ? "Desconectar carpeta" : "Elegir carpeta"}
+                  </button>
+                )}
+                <button
+                  className="setting-row"
+                  type="button"
+                  aria-pressed={onlineFallback}
+                  onClick={toggleOnlineFallback}
+                >
+                  <RotateCcw size={18} />
+                  <span>
+                    <strong>Vista rápida online</strong>
+                    <small>
+                      Opcional; no guarda tiles ni respeta el ritmo regional
+                    </small>
+                  </span>
+                  <span className={`switch ${onlineFallback ? "on" : ""}`} />
+                </button>
+                <div className="stats-grid">
+                  <Metric label="Local" value={tileStats.local} tone="mint" />
+                  <Metric label="Online" value={tileStats.remote} tone="blue" />
+                  <Metric
+                    label="Ausentes"
+                    value={tileStats.missing}
+                    tone="amber"
+                  />
+                </div>
+              </details>
             </div>
           )}
 
@@ -1964,7 +2724,9 @@ export function MapViewer() {
               <div className="shortcut-list">
                 <Shortcut keys="Arrastrar" label="Mover el mapa" />
                 <Shortcut keys="Rueda / ±" label="Cambiar zoom" />
+                <Shortcut keys="Flechas" label="Saltar entre celdas" />
                 <Shortcut keys="G" label="Ir a coordenadas" />
+                <Shortcut keys="E" label="Abrir exploración" />
                 <Shortcut keys="M" label="Marcar punto" />
                 <Shortcut keys="R" label="Dibujar área" />
                 <Shortcut keys="Esc" label="Cancelar o cerrar" />
@@ -1972,8 +2734,8 @@ export function MapViewer() {
               <div className="archive-note">
                 <HelpCircle size={17} />
                 <p>
-                  El LOD cambia automáticamente según el zoom. LOD 0 conserva
-                  la resolución máxima de 1 bloque por píxel.
+                  Antes de iniciar, el LOD sigue al zoom. Una sesión fija ambos
+                  valores y convierte cada tile en una celda revisable.
                 </p>
               </div>
               <a
@@ -1994,9 +2756,21 @@ export function MapViewer() {
 
       <div className="bottom-left-status">
         <span
-          className={`source-dot ${localSource ? "is-local" : "is-online"}`}
+          className={`source-dot ${
+            localSource || localRuntime?.capacity.configured
+              ? "is-local"
+              : "is-online"
+          }`}
         />
-        <strong>{localSource ? "Archivo local" : "Tiles online"}</strong>
+        <strong>
+          {localSource
+            ? "Carpeta local"
+            : localRuntime?.capacity.configured
+              ? "Biblioteca LuisA"
+              : onlineFallback
+                ? "Vista online"
+                : "Solo local"}
+        </strong>
         <span>
           Cursor X {formatCoordinate(cursor.x)} · Z {formatCoordinate(cursor.z)}
         </span>
@@ -2011,6 +2785,95 @@ export function MapViewer() {
         <span ref={fallbackTextRef} />
       </div>
 
+      {explorationState && currentExplorationCell && (
+        <section
+          className="exploration-navigation glass-card"
+          aria-label="Navegación por celdas"
+        >
+          <div className="navigation-progress">
+            <span>
+              CELDA{" "}
+              {serpentinePositionForCellIndex(
+                explorationState.region,
+                explorationState.currentIndex,
+              ) + 1}{" "}
+              / {explorationState.region.cellCount.toLocaleString("es-GT")}
+            </span>
+            <strong>{formatProgressPercent(explorationPercent)}%</strong>
+          </div>
+          <div className="direction-pad">
+            <button
+              type="button"
+              className="north"
+              aria-label="Celda superior"
+              disabled={
+                cardinalNeighbor(
+                  explorationState.region,
+                  explorationState.currentIndex,
+                  "north",
+                ) === null
+              }
+              onClick={() => moveExplorationCardinal("north")}
+            >
+              <ArrowUp />
+            </button>
+            <button
+              type="button"
+              className="west"
+              aria-label="Celda izquierda"
+              disabled={
+                cardinalNeighbor(
+                  explorationState.region,
+                  explorationState.currentIndex,
+                  "west",
+                ) === null
+              }
+              onClick={() => moveExplorationCardinal("west")}
+            >
+              <ArrowLeft />
+            </button>
+            <button
+              type="button"
+              className="review"
+              aria-label="Marcar revisada y avanzar"
+              onClick={() => reviewCurrentAndMove(1)}
+            >
+              <Check />
+            </button>
+            <button
+              type="button"
+              className="east"
+              aria-label="Celda derecha"
+              disabled={
+                cardinalNeighbor(
+                  explorationState.region,
+                  explorationState.currentIndex,
+                  "east",
+                ) === null
+              }
+              onClick={() => moveExplorationCardinal("east")}
+            >
+              <ArrowRight />
+            </button>
+            <button
+              type="button"
+              className="south"
+              aria-label="Celda inferior"
+              disabled={
+                cardinalNeighbor(
+                  explorationState.region,
+                  explorationState.currentIndex,
+                  "south",
+                ) === null
+              }
+              onClick={() => moveExplorationCardinal("south")}
+            >
+              <ArrowDown />
+            </button>
+          </div>
+        </section>
+      )}
+
       <div className="dimension-pill glass-card">
         <button type="button" className="active" aria-pressed="true">
           <span className="dimension-orb" />
@@ -2024,15 +2887,19 @@ export function MapViewer() {
           type="button"
           aria-label="Acercar"
           title="Acercar"
+          disabled={Boolean(explorationState)}
           onClick={() => zoomAt(1.5)}
         >
           <Plus />
         </button>
-        <span className="zoom-lod">L{lod}</span>
+        <span className="zoom-lod">
+          {explorationState ? <LockKeyhole size={12} /> : null} L{lod}
+        </span>
         <button
           type="button"
           aria-label="Alejar"
           title="Alejar"
+          disabled={Boolean(explorationState)}
           onClick={() => zoomAt(1 / 1.5)}
         >
           <Minus />
@@ -2042,8 +2909,22 @@ export function MapViewer() {
           aria-label="Volver al área inicial"
           title="Volver al área inicial"
           onClick={() => {
-            setCamera(INITIAL_CAMERA);
-            setScale(INITIAL_SCALE);
+            if (currentExplorationCell && explorationState) {
+              setCamera({
+                x:
+                  (currentExplorationCell.bounds.minX +
+                    currentExplorationCell.bounds.maxXExclusive) /
+                  2,
+                z:
+                  (currentExplorationCell.bounds.minZ +
+                    currentExplorationCell.bounds.maxZExclusive) /
+                  2,
+              });
+              setScale(explorationState.region.scale);
+            } else {
+              setCamera(INITIAL_CAMERA);
+              setScale(INITIAL_SCALE);
+            }
           }}
         >
           <LocateFixed />
@@ -2052,12 +2933,20 @@ export function MapViewer() {
 
       {markMode && (
         <div className="marking-banner glass-card">
-          {markMode === "pin" ? <MapPin /> : <SquareDashedMousePointer />}
+          {markMode === "pin" ? (
+            <MapPin />
+          ) : markMode === "region" ? (
+            <SquareMousePointer />
+          ) : (
+            <SquareDashedMousePointer />
+          )}
           <div>
             <strong>
               {markMode === "pin"
                 ? "Haz clic para marcar"
-                : "Arrastra para delimitar un área"}
+                : markMode === "region"
+                  ? "Arrastra para delimitar la región"
+                  : "Arrastra para delimitar un área"}
             </strong>
             <span>Esc para cancelar</span>
           </div>
@@ -2116,22 +3005,6 @@ function DockButton({
   );
 }
 
-const DOWNLOAD_STATUS_META: Record<
-  string,
-  { readonly label: string; readonly tone: string }
-> = {
-  discovering: { label: "Analizando", tone: "running" },
-  running: { label: "Descargando", tone: "running" },
-  complete: { label: "Completa", tone: "complete" },
-  fallback_complete: { label: "Prioridad completa", tone: "warning" },
-  incomplete: { label: "Incompleta", tone: "warning" },
-  stopped: { label: "Pausada", tone: "warning" },
-  preflight_blocked: { label: "Falta espacio", tone: "error" },
-  error: { label: "Con errores", tone: "error" },
-  smoke_test_complete: { label: "Prueba completa", tone: "complete" },
-  unknown: { label: "Estado desconocido", tone: "neutral" },
-};
-
 function formatProgressPercent(value: number) {
   return new Intl.NumberFormat("es-GT", {
     maximumFractionDigits: value < 10 ? 1 : 0,
@@ -2152,244 +3025,9 @@ function formatBytes(value: number | null) {
   }).format(normalized)} ${units[unitIndex]}`;
 }
 
-function formatDuration(value: number | null) {
-  if (value === null || !Number.isFinite(value)) return "—";
-  const seconds = Math.max(0, Math.round(value));
-  if (seconds < 60) return `${seconds} s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} min`;
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  if (hours < 48) {
-    return remainingMinutes ? `${hours} h ${remainingMinutes} min` : `${hours} h`;
-  }
-  const days = Math.floor(hours / 24);
-  const remainingHours = hours % 24;
-  return remainingHours ? `${days} d ${remainingHours} h` : `${days} d`;
-}
-
-function formatUpdatedAt(progress: DownloadProgressSnapshot) {
-  if (progress.updatedAtTimestamp === null) return "Sin fecha válida";
-  return new Intl.DateTimeFormat("es-GT", {
-    dateStyle: "short",
-    timeStyle: "medium",
-  }).format(progress.updatedAtTimestamp);
-}
-
-function DownloadProgressCard({
-  checkedAt,
-  result,
-}: {
-  checkedAt: number | null;
-  result: DownloadProgressReadResult | null;
-}) {
-  if (result === null) {
-    return (
-      <section
-        className="download-progress-card is-loading"
-        aria-label="Progreso de la descarga"
-        aria-busy="true"
-      >
-        <div className="download-progress-heading">
-          <Activity size={18} aria-hidden="true" />
-          <div>
-            <span>DESCARGA COMPLETA</span>
-            <strong>Leyendo progress.json…</strong>
-          </div>
-        </div>
-        <div className="download-progress-track is-indeterminate" aria-hidden="true">
-          <span />
-        </div>
-      </section>
-    );
-  }
-
-  if (result.kind !== "ready") {
-    return (
-      <section
-        className={`download-progress-card has-message ${result.kind === "missing" ? "" : "has-error"}`}
-        aria-label="Progreso de la descarga"
-        role="status"
-      >
-        <div className="download-progress-heading">
-          {result.kind === "missing" ? (
-            <Activity size={18} aria-hidden="true" />
-          ) : (
-            <AlertTriangle size={18} aria-hidden="true" />
-          )}
-          <div>
-            <span>DESCARGA COMPLETA</span>
-            <strong>
-              {result.kind === "missing"
-                ? "Esperando al descargador"
-                : "Progreso no disponible"}
-            </strong>
-          </div>
-        </div>
-        <p>{result.message}</p>
-      </section>
-    );
-  }
-
-  const progress = result.progress;
-  const statusMeta =
-    DOWNLOAD_STATUS_META[progress.status] ?? DOWNLOAD_STATUS_META.unknown;
-  const percent = progress.progressPercent;
-  const isIndeterminate = percent === null;
-  const percentText =
-    percent === null ? "Calculando…" : `${formatProgressPercent(percent)} %`;
-  const estimateLabel =
-    progress.progressKind === "dynamic"
-      ? "dinámico"
-      : progress.progressKind === "estimated" ||
-          progress.progressPercentSource === "derived"
-        ? "estimado"
-        : null;
-  const isStale = isDownloadProgressStale(progress, checkedAt);
-  const httpErrors = progress.httpErrors.filter(
-    (item) => item.count > 0 && item.code !== "404",
-  );
-  const hasProblems =
-    Boolean(progress.reason) ||
-    progress.tilesCorrupt > 0 ||
-    progress.tilesFailed > 0 ||
-    httpErrors.length > 0;
-  const processedText =
-    progress.plannedRequests === null
-      ? `${progress.processedRequests.toLocaleString("es-GT")} solicitudes resueltas`
-      : `${progress.processedRequests.toLocaleString("es-GT")} de ${progress.plannedRequests.toLocaleString("es-GT")} solicitudes`;
-  const speedParts: string[] = [];
-  if (progress.tilesPerSecond !== null) {
-    speedParts.push(
-      `${progress.tilesPerSecond.toLocaleString("es-GT", {
-        maximumFractionDigits: 2,
-      })} tiles/s`,
-    );
-  } else if (progress.effectiveRequestsPerSecond !== null) {
-    speedParts.push(
-      `${progress.effectiveRequestsPerSecond.toLocaleString("es-GT", {
-        maximumFractionDigits: 2,
-      })} req/s`,
-    );
-  }
-  if (progress.megabytesPerSecond !== null) {
-    speedParts.push(
-      `${progress.megabytesPerSecond.toLocaleString("es-GT", {
-        maximumFractionDigits: 2,
-      })} MB/s`,
-    );
-  }
-  const speed = speedParts.join(" · ") || "—";
-
-  return (
-    <section
-      className="download-progress-card"
-      aria-labelledby="download-progress-title"
-    >
-      <div className="download-progress-heading">
-        <Activity size={18} aria-hidden="true" />
-        <div>
-          <span>DESCARGA COMPLETA</span>
-          <strong id="download-progress-title">Progreso del archivo</strong>
-        </div>
-        <span
-          className={`download-status ${statusMeta.tone}`}
-          role="status"
-          aria-live="polite"
-        >
-          {statusMeta.label}
-        </span>
-      </div>
-
-      <div className="download-progress-summary">
-        <strong>{percentText}</strong>
-        <span>
-          {processedText}
-          {estimateLabel ? ` · ${estimateLabel}` : ""}
-        </span>
-      </div>
-      <div
-        className={`download-progress-track ${isIndeterminate ? "is-indeterminate" : ""}`}
-        role="progressbar"
-        aria-label="Avance de la descarga completa"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={percent ?? undefined}
-        aria-valuetext={percentText}
-      >
-        <span style={percent === null ? undefined : { width: `${percent}%` }} />
-      </div>
-
-      <div className="download-progress-metrics">
-        <ProgressMetric
-          label="Completos"
-          value={progress.tilesCompleted.toLocaleString("es-GT")}
-        />
-        <ProgressMetric
-          label={progress.status === "discovering" ? "Grupos restantes" : "Restantes"}
-          value={progress.remainingRequests.toLocaleString("es-GT")}
-        />
-        <ProgressMetric label="Velocidad" value={speed} />
-        <ProgressMetric
-          label="Datos"
-          value={formatBytes(progress.downloadedBytes)}
-        />
-        <ProgressMetric label="ETA" value={formatDuration(progress.etaSeconds)} />
-        <ProgressMetric
-          label="Ausentes"
-          value={progress.tilesAbsent.toLocaleString("es-GT")}
-        />
-      </div>
-
-      <div className={`download-progress-updated ${isStale ? "is-stale" : ""}`}>
-        <span className="source-dot" />
-        <span>{isStale ? "Actualización atrasada" : "Actualizado"}</span>
-        <time dateTime={progress.updatedAt ?? undefined}>
-          {formatUpdatedAt(progress)}
-        </time>
-        <small>Se revisa cada 5 s</small>
-      </div>
-
-      {hasProblems && (
-        <div
-          className="download-progress-errors"
-          aria-label="Errores reportados"
-          role="status"
-        >
-          <AlertTriangle size={15} aria-hidden="true" />
-          <div>
-            {progress.reason && <p>{progress.reason}</p>}
-            {(progress.tilesCorrupt > 0 || progress.tilesFailed > 0) && (
-              <p>
-                Corruptos: {progress.tilesCorrupt.toLocaleString("es-GT")} ·
-                Fallidos: {progress.tilesFailed.toLocaleString("es-GT")}
-              </p>
-            )}
-            {httpErrors.length > 0 && (
-              <p>
-                HTTP{" "}
-                {httpErrors
-                  .map(
-                    ({ code, count }) =>
-                      `${code} × ${count.toLocaleString("es-GT")}`,
-                  )
-                  .join(" · ")}
-              </p>
-            )}
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function ProgressMetric({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <span>{label}</span>
-      <strong title={value}>{value}</strong>
-    </div>
-  );
+function formatSignedBytes(value: number | null) {
+  if (value === null) return "—";
+  return `${value >= 0 ? "+" : "−"}${formatBytes(Math.abs(value))}`;
 }
 
 function Metric({
