@@ -4,9 +4,13 @@ import test from "node:test";
 import {
   isLoopbackAddress,
   isLoopbackHost,
+  parseLocalCoverageRequest,
   parseRegionDownloadRequest,
 } from "../build/local-atlas-vite-plugin.ts";
-import { parseLocalAtlasRuntime } from "../app/lib/local-atlas-runtime.ts";
+import {
+  parseLocalAtlasCoverage,
+  parseLocalAtlasRuntime,
+} from "../app/lib/local-atlas-runtime.ts";
 
 test("local atlas accepts one aligned regional cell and a bounded rate", () => {
   assert.deepEqual(
@@ -117,6 +121,81 @@ test("browser runtime accepts only the projected local capability", () => {
     parseLocalAtlasRuntime({
       ...runtime,
       mutationToken: "short",
+    }),
+    null,
+  );
+});
+
+test("coverage requests accept only the fixed base layer and LOD 0 to 3", () => {
+  assert.deepEqual(
+    parseLocalCoverageRequest(
+      "/api/local-atlas/coverage?layer=base&lod=0",
+    ),
+    { lod: 0 },
+  );
+  assert.deepEqual(
+    parseLocalCoverageRequest(
+      "/api/local-atlas/coverage?lod=3&layer=base",
+    ),
+    { lod: 3 },
+  );
+  for (const invalid of [
+    undefined,
+    "/api/local-atlas/coverage",
+    "/api/local-atlas/coverage?layer=overlay&lod=0",
+    "/api/local-atlas/coverage?layer=base&lod=-1",
+    "/api/local-atlas/coverage?layer=base&lod=4",
+    "/api/local-atlas/coverage?layer=base&lod=01",
+    "/api/local-atlas/status?layer=base&lod=0",
+  ]) {
+    assert.equal(
+      parseLocalCoverageRequest(invalid),
+      null,
+      String(invalid),
+    );
+  }
+});
+
+test("browser coverage parser rejects duplicate or non-canonical cells", () => {
+  const cell = {
+    row: 0,
+    column: 0,
+    completeCount: 32,
+    queuedCount: 1,
+    failedCount: 3,
+    absentCount: 4,
+  };
+  const snapshot = {
+    version: 1,
+    dimension: "overworld",
+    layer: "base",
+    lod: 3,
+    databaseUpdatedAt: "2026-07-25T00:00:00.000Z",
+    cells: [cell],
+  };
+  assert.deepEqual(parseLocalAtlasCoverage(snapshot), snapshot);
+  assert.equal(
+    parseLocalAtlasCoverage({ ...snapshot, cells: [cell, cell] }),
+    null,
+  );
+  assert.equal(
+    parseLocalAtlasCoverage({
+      ...snapshot,
+      cells: [{ ...cell, failedCount: -1 }],
+    }),
+    null,
+  );
+  assert.equal(
+    parseLocalAtlasCoverage({
+      ...snapshot,
+      cells: [{ ...cell, absentCount: -1 }],
+    }),
+    null,
+  );
+  assert.equal(
+    parseLocalAtlasCoverage({
+      ...snapshot,
+      databaseUpdatedAt: "not-a-timestamp",
     }),
     null,
   );

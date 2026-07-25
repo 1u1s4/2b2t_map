@@ -21,6 +21,9 @@ La versión actual admite únicamente **Overworld**.
 ## Qué incluye
 
 - visor canvas con coordenadas X/Z, zoom, LOD y bloques por píxel;
+- Atlas global con los 1,089 sectores visibles en una sola vista;
+- lentes separadas para terreno en disco, progreso revisado y fuente publicada;
+- filtros de sectores completos, en curso y pendientes para LOD `0..3`;
 - rejilla maestra 33×33 basada en la huella irregular real de 66,464 tiles LOD 3;
 - selección por arrastre de uno o varios sectores de 32,768×32,768 bloques;
 - regiones dibujadas, tomadas de la vista o introducidas por coordenadas;
@@ -89,22 +92,38 @@ PYTHON_BIN='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
 
 ## Flujo de exploración
 
-1. Abre **Explorar** y pulsa **Ver mapa completo y seleccionar**.
-2. Arrastra sobre la rejilla maestra para elegir una región. Los sectores
-   completos y parciales se muestran por separado.
-3. Usa **Encajar región**, **Preparar LOD 0**, **Dibujar región**, **Usar
-   vista** o escribe límites X/Z exactos.
-4. Ajusta el zoom deseado y crea la sesión; su zoom y LOD quedan fijados.
-5. Recorre la rejilla fina con clic, las flechas o la ruta serpentina.
-6. Usa **Marcar como revisada** o **Revisada y siguiente**.
-7. Si falta información local, elige el ritmo y pulsa
+1. Abre **Atlas** desde el dock o con `0` / `Home`.
+2. Elige **En disco**, **Revisado** o **Fuente** y, cuando corresponda, el LOD.
+3. Filtra sectores completos, en curso o pendientes. Haz clic en uno, usa
+   anterior/siguiente o arrastra sobre varios sectores.
+4. Abre **Explorar** y usa **Encajar región**, **Preparar LOD 0**,
+   **Dibujar región**, **Usar vista** o escribe límites X/Z exactos.
+5. Ajusta el zoom deseado y crea la sesión; su zoom y LOD quedan fijados.
+6. Recorre la rejilla fina con clic, las flechas o la ruta serpentina.
+7. Usa **Marcar como revisada** o **Revisada y siguiente**.
+8. Si falta información local, elige el ritmo y pulsa
    **Descargar celda actual**.
-8. **Pausar sesión** la conserva en LuisA; después puedes abrirla desde
+9. **Pausar sesión** la conserva en LuisA; después puedes abrirla desde
    **Workspace durable**. **Guardar ahora** fuerza una escritura inmediata.
 
 El progreso de revisión y la presencia del tile son conceptos distintos.
 Descargar una celda no la marca como revisada, y navegar no inicia solicitudes
 en segundo plano.
+
+El Atlas se puede abrir mientras una sesión está activa. La cámara y el zoom
+regionales se conservan y se restauran al volver. En móvil, el primer toque
+enfoca un sector y el segundo lo elige; el inspector ofrece
+anterior/siguiente y límites X/Z exactos.
+
+La lente **En disco** consulta `tiles.sqlite3` en modo lectura y respeta la
+huella irregular publicada. **Revisado** une sesiones superpuestas sin contar
+dos veces una misma zona. **Fuente** describe disponibilidad, no trabajo
+pendiente: sus 961 sectores completos y 128 parciales contienen los 66,464
+tiles LOD 3 publicados.
+
+En LOD 0–2, esa huella LOD 3 funciona como envolvente de búsqueda. Los `404`
+confirmados se excluyen del objetivo fino, de modo que una descarga exhaustiva
+pueda alcanzar 100% sin presentar tiles no publicados como pendientes eternos.
 
 El orden serpentina avanza de izquierda a derecha en una fila y de derecha a
 izquierda en la siguiente. Así se cubre la región sin saltos largos.

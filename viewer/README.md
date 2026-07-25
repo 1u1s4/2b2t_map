@@ -66,12 +66,13 @@ servidor a `localhost`.
 
 ## Crear una sesión
 
-1. Abre **Explorar** con el dock o la tecla `E`.
-2. Pulsa **Ver mapa completo y seleccionar**.
-3. Arrastra uno o más sectores de la rejilla maestra 33×33.
-4. Encaja la región o prepara el detalle máximo LOD 0.
-5. También puedes dibujar una región, usar la vista o introducir coordenadas.
-6. Pulsa **Crear sesión de exploración**.
+1. Abre **Atlas** con el dock o `0` / `Home`.
+2. Alterna entre **En disco**, **Revisado** y **Fuente**.
+3. Elige el LOD `0..3` y filtra sectores completos, en curso o pendientes.
+4. Haz clic en un sector o arrastra uno o más sectores de la rejilla 33×33.
+5. Abre **Explorar**, encaja la región o prepara el detalle máximo LOD 0.
+6. También puedes dibujar una región, usar la vista o introducir coordenadas.
+7. Pulsa **Crear sesión de exploración**.
 
 La región usa límites semiabiertos:
 
@@ -87,6 +88,32 @@ El modelo expande esos límites a tiles enteros. Una celda mide:
 
 El zoom y el LOD quedan fijados durante la sesión. Los controles de rueda,
 doble clic, `+` y `-` no alteran la escala hasta cerrar la sesión.
+
+## Atlas global
+
+El Atlas encaja los 1,089 sectores del Overworld en una sola vista y permanece
+disponible durante una sesión activa. Al cerrarlo restaura exactamente la
+cámara, escala y celda regionales.
+
+- **En disco** consulta la capa `base` de `tiles.sqlite3` para el LOD elegido.
+- **Revisado** une el bitset de todas las sesiones compatibles y deduplica
+  solapamientos.
+- **Fuente** muestra la huella LOD 3 publicada: 961 sectores completos, 128
+  parciales y 66,464 tiles disponibles.
+
+En LOD 0–2, los descendientes de esa huella se consideran un objetivo
+provisional. Cada `404` confirmado se registra y se excluye del denominador:
+tras explorar toda la envolvente, el progreso puede llegar a 100% aunque el
+borde fino sea más irregular que su padre LOD 3.
+
+Los estados completos, en curso y pendientes funcionan como filtros. El
+inspector muestra sector, objetivo, porcentaje y límites X/Z. **Anterior**,
+**Siguiente**, flechas y `Enter` permiten operar sin apuntar a celdas pequeñas.
+En pantallas táctiles, el primer toque enfoca y el segundo confirma.
+
+La cobertura local se precarga para que **Explorar** no muestre ceros
+provisionales. Mientras existe un trabajo regional activo, el endpoint se
+actualiza cada 2.5 segundos.
 
 ## Navegación y progreso
 
@@ -166,6 +193,11 @@ composición de imágenes y cuadrículas de coordenadas.
 - margen y resultado de la comparación;
 - trabajo regional actual.
 
+`GET /api/local-atlas/coverage?layer=base&lod=0..3` consulta SQLite en modo
+solo lectura. La consulta se limita a las bandas publicadas: tiles ajenos a la
+huella no pueden completar un sector irregular. Los estados pendientes se
+separan de fallos, corrupción o protección.
+
 `GET /api/local-atlas/workspace` y `PUT /api/local-atlas/workspace` leen y
 guardan el workspace fijo de LuisA. `PUT` exige token local, `If-Match` y un
 write-id idempotente. El store valida el documento completo, limita tamaño y
@@ -238,6 +270,7 @@ desde su tarjeta.
 | --- | --- |
 | Mover libremente antes de una sesión | arrastrar o flechas |
 | Cambiar zoom antes de una sesión | rueda, pellizco, doble clic, `+`, `-` |
+| Abrir o volver a encajar el Atlas | `0` o `Home` |
 | Saltar entre celdas | flechas |
 | Abrir exploración | `E` |
 | Ir a coordenadas/highlight | `G` |
@@ -255,6 +288,7 @@ Rutas:
 | Método | Ruta | Función |
 | --- | --- | --- |
 | `GET` | `/api/local-atlas/status` | capacidad y trabajo actual |
+| `GET` | `/api/local-atlas/coverage?layer=base&lod=0..3` | cobertura exacta del terreno local |
 | `POST` | `/api/local-atlas/download` | iniciar una celda validada |
 | `POST` | `/api/local-atlas/stop` | detener el trabajo activo |
 | `GET`/`HEAD` | `/api/tile` | servir un tile local o la vista opcional |

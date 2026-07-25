@@ -54,6 +54,25 @@ export interface LocalAtlasRuntime {
   readonly job: LocalRegionJob | null;
 }
 
+export interface LocalAtlasCoverageCell {
+  readonly row: number;
+  readonly column: number;
+  readonly completeCount: number;
+  readonly queuedCount: number;
+  readonly failedCount: number;
+  /** Target-LOD tiles excluded by confirmed 404s at this or an ancestor LOD. */
+  readonly absentCount: number;
+}
+
+export interface LocalAtlasCoverageSnapshot {
+  readonly version: 1;
+  readonly dimension: "overworld";
+  readonly layer: "base";
+  readonly lod: number;
+  readonly databaseUpdatedAt: string;
+  readonly cells: readonly LocalAtlasCoverageCell[];
+}
+
 export interface LocalAtlasWorkspaceExploration {
   readonly id: string;
   readonly createdAt: string;
@@ -452,6 +471,74 @@ export function localAtlasWorkspaceContent(
   };
 }
 
+export function parseLocalAtlasCoverage(
+  value: unknown,
+): LocalAtlasCoverageSnapshot | null {
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    value.dimension !== "overworld" ||
+    value.layer !== "base" ||
+    typeof value.lod !== "number" ||
+    !Number.isSafeInteger(value.lod) ||
+    value.lod < 0 ||
+    value.lod > 3 ||
+    !canonicalTimestamp(value.databaseUpdatedAt) ||
+    !Array.isArray(value.cells) ||
+    value.cells.length > 1_089
+  ) {
+    return null;
+  }
+  const cells: LocalAtlasCoverageCell[] = [];
+  const indexes = new Set<number>();
+  for (const cell of value.cells) {
+    if (
+      !isRecord(cell) ||
+      typeof cell.row !== "number" ||
+      !Number.isSafeInteger(cell.row) ||
+      cell.row < 0 ||
+      cell.row >= 33 ||
+      typeof cell.column !== "number" ||
+      !Number.isSafeInteger(cell.column) ||
+      cell.column < 0 ||
+      cell.column >= 33 ||
+      typeof cell.completeCount !== "number" ||
+      !Number.isSafeInteger(cell.completeCount) ||
+      cell.completeCount < 0 ||
+      typeof cell.queuedCount !== "number" ||
+      !Number.isSafeInteger(cell.queuedCount) ||
+      cell.queuedCount < 0 ||
+      typeof cell.failedCount !== "number" ||
+      !Number.isSafeInteger(cell.failedCount) ||
+      cell.failedCount < 0 ||
+      typeof cell.absentCount !== "number" ||
+      !Number.isSafeInteger(cell.absentCount) ||
+      cell.absentCount < 0
+    ) {
+      return null;
+    }
+    const index = cell.row * 33 + cell.column;
+    if (indexes.has(index)) return null;
+    indexes.add(index);
+    cells.push({
+      row: cell.row,
+      column: cell.column,
+      completeCount: cell.completeCount,
+      queuedCount: cell.queuedCount,
+      failedCount: cell.failedCount,
+      absentCount: cell.absentCount,
+    });
+  }
+  return {
+    version: 1,
+    dimension: "overworld",
+    layer: "base",
+    lod: value.lod,
+    databaseUpdatedAt: value.databaseUpdatedAt,
+    cells,
+  };
+}
+
 export async function readLocalAtlasRuntime(
   signal?: AbortSignal,
 ): Promise<LocalAtlasRuntime | null> {
@@ -462,6 +549,31 @@ export async function readLocalAtlasRuntime(
   if (response.status === 204 || response.status === 404) return null;
   if (!response.ok) throw new Error("No se pudo leer el runtime local");
   return parseLocalAtlasRuntime(await response.json());
+}
+
+export async function readLocalAtlasCoverage(
+  lod: number,
+  signal?: AbortSignal,
+): Promise<LocalAtlasCoverageSnapshot | null> {
+  if (!Number.isSafeInteger(lod) || lod < 0 || lod > 3) {
+    throw new RangeError("La cobertura local solo admite LOD 0 a 3");
+  }
+  const response = await fetch(
+    `/api/local-atlas/coverage?layer=base&lod=${lod}`,
+    {
+      cache: "no-store",
+      signal,
+    },
+  );
+  if (response.status === 204 || response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error("No se pudo leer la cobertura del mapa local");
+  }
+  const coverage = parseLocalAtlasCoverage(await response.json());
+  if (!coverage || coverage.lod !== lod) {
+    throw new Error("El catálogo devolvió una cobertura local no válida");
+  }
+  return coverage;
 }
 
 export async function readLocalAtlasWorkspace(

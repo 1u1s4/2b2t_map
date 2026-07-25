@@ -10,9 +10,10 @@ import type {
   IncomingMessage,
   ServerResponse,
 } from "node:http";
-import { basename, resolve } from "node:path";
+import { resolve } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Plugin } from "vite";
+import { OVERWORLD_LOD3_AVAILABLE_BANDS } from "../app/lib/overworld-coverage-data.ts";
 import {
   AtlasWorkspaceError,
   LocalAtlasWorkspaceStore,
@@ -22,6 +23,7 @@ import {
 } from "./local-atlas-workspace.ts";
 
 const STATUS_ENDPOINT = "/api/local-atlas/status";
+const COVERAGE_ENDPOINT = "/api/local-atlas/coverage";
 const DOWNLOAD_ENDPOINT = "/api/local-atlas/download";
 const STOP_ENDPOINT = "/api/local-atlas/stop";
 const WORKSPACE_ENDPOINT = "/api/local-atlas/workspace";
@@ -36,6 +38,227 @@ const DEFAULT_OVERWORLD_REQUIREMENT_BYTES = 1_458_909_433_254;
 const STOP_GRACE_PERIOD_MS = 15_000;
 const ALLOWED_LAYERS = new Set(["base", "overlay", "newchunks"]);
 const INTEGER_PATTERN = /^[+-]?\d+$/;
+const LOCAL_COVERAGE_QUERY = String.raw`
+import json
+import sqlite3
+import sys
+
+database_path = sys.argv[1]
+lod = int(sys.argv[2])
+target_runs = json.loads(sys.argv[3])
+tile_span = 512 * (2 ** lod)
+sector_tiles = 32768 // tile_span
+grid_min_tile = -540672 // tile_span
+grid_max_tile = grid_min_tile + (33 * sector_tiles)
+run_placeholders = ",".join("(?, ?, ?, ?, ?)" for _ in target_runs)
+run_parameters = [
+    coordinate
+    for target_run in target_runs
+    for coordinate in target_run
+]
+
+connection = sqlite3.connect(
+    f"file:{database_path}?mode=ro",
+    uri=True,
+    timeout=2.5,
+)
+connection.execute("PRAGMA query_only = ON")
+rows = connection.execute(
+    f"""
+    WITH target_runs(
+      target_lod,
+      min_tile_z,
+      max_tile_z_exclusive,
+      min_tile_x,
+      max_tile_x_exclusive
+    ) AS (
+      VALUES {run_placeholders}
+    )
+    SELECT
+      CAST((tile_z - ?) / ? AS INTEGER) AS sector_row,
+      CAST((tile_x - ?) / ? AS INTEGER) AS sector_column,
+      SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) AS complete_count,
+      SUM(
+        CASE
+          WHEN status IN ('pending', 'downloading', 'retry', 'running')
+          THEN 1 ELSE 0
+        END
+      ) AS queued_count,
+      SUM(
+        CASE
+          WHEN status NOT IN (
+            'complete',
+            'absent',
+            'pending',
+            'downloading',
+            'retry',
+            'running'
+          )
+          THEN 1 ELSE 0
+        END
+      ) AS failed_count,
+      SUM(CASE WHEN status = 'absent' THEN 1 ELSE 0 END) AS absent_count
+    FROM tiles AS tile
+    INNER JOIN target_runs AS target
+      ON tile.lod = target.target_lod
+      AND tile.tile_z >= target.min_tile_z
+      AND tile.tile_z < target.max_tile_z_exclusive
+      AND tile.tile_x >= target.min_tile_x
+      AND tile.tile_x < target.max_tile_x_exclusive
+    WHERE tile.dimension = 'overworld'
+      AND tile.layer = 'base'
+      AND tile.lod = ?
+      AND tile.tile_x >= ?
+      AND tile.tile_x < ?
+      AND tile.tile_z >= ?
+      AND tile.tile_z < ?
+    GROUP BY sector_row, sector_column
+    ORDER BY sector_row, sector_column
+    """,
+    (
+      *run_parameters,
+      grid_min_tile,
+      sector_tiles,
+      grid_min_tile,
+      sector_tiles,
+      lod,
+      grid_min_tile,
+      grid_max_tile,
+      grid_min_tile,
+      grid_max_tile,
+    ),
+).fetchall()
+absent_rows = connection.execute(
+    f"""
+    WITH target_runs(
+      target_lod,
+      min_tile_z,
+      max_tile_z_exclusive,
+      min_tile_x,
+      max_tile_x_exclusive
+    ) AS (
+      VALUES {run_placeholders}
+    )
+    SELECT tile.lod, tile.tile_x, tile.tile_z
+    FROM tiles AS tile
+    INNER JOIN target_runs AS target
+      ON tile.lod = target.target_lod
+      AND tile.tile_z >= target.min_tile_z
+      AND tile.tile_z < target.max_tile_z_exclusive
+      AND tile.tile_x >= target.min_tile_x
+      AND tile.tile_x < target.max_tile_x_exclusive
+    WHERE tile.dimension = 'overworld'
+      AND tile.layer = 'base'
+      AND tile.lod >= ?
+      AND tile.lod <= 3
+      AND tile.status = 'absent'
+    """,
+    (*run_parameters, lod),
+).fetchall()
+connection.close()
+
+counts_by_cell = {
+    (int(row), int(column)): {
+        "completeCount": int(complete_count or 0),
+        "queuedCount": int(queued_count or 0),
+        "failedCount": int(failed_count or 0),
+    }
+    for (
+        row,
+        column,
+        complete_count,
+        queued_count,
+        failed_count,
+        absent_count,
+    ) in rows
+    if 0 <= row < 33 and 0 <= column < 33
+}
+
+# An absent ancestor prunes its entire descendant branch, so those finer rows
+# are intentionally never materialized. Project every non-shadowed 404 into
+# target-LOD tile equivalents and deduplicate stale nested absences.
+absent_by_lod = {
+    ancestor_lod: set()
+    for ancestor_lod in range(lod, 4)
+}
+for ancestor_lod, tile_x, tile_z in absent_rows:
+    absent_by_lod[int(ancestor_lod)].add((int(tile_x), int(tile_z)))
+
+excluded_by_cell = {}
+for ancestor_lod in range(3, lod - 1, -1):
+    descendant_scale = 2 ** (ancestor_lod - lod)
+    excluded_weight = descendant_scale * descendant_scale
+    for tile_x, tile_z in absent_by_lod[ancestor_lod]:
+        shadowed = any(
+            (
+                tile_x // (2 ** (parent_lod - ancestor_lod)),
+                tile_z // (2 ** (parent_lod - ancestor_lod)),
+            )
+            in absent_by_lod[parent_lod]
+            for parent_lod in range(ancestor_lod + 1, 4)
+        )
+        if shadowed:
+            continue
+        target_tile_x = tile_x * descendant_scale
+        target_tile_z = tile_z * descendant_scale
+        column = (target_tile_x - grid_min_tile) // sector_tiles
+        row = (target_tile_z - grid_min_tile) // sector_tiles
+        if 0 <= row < 33 and 0 <= column < 33:
+            key = (row, column)
+            excluded_by_cell[key] = (
+                excluded_by_cell.get(key, 0) + excluded_weight
+            )
+
+cells = []
+for row, column in sorted(set(counts_by_cell) | set(excluded_by_cell)):
+    counts = counts_by_cell.get(
+        (row, column),
+        {
+            "completeCount": 0,
+            "queuedCount": 0,
+            "failedCount": 0,
+        },
+    )
+    cells.append(
+        {
+            "row": row,
+            "column": column,
+            **counts,
+            "absentCount": excluded_by_cell.get((row, column), 0),
+        }
+    )
+print(json.dumps(cells, separators=(",", ":")))
+`;
+const MAX_LOCAL_COVERAGE_BYTES = 512 * 1024;
+const LOCAL_COVERAGE_QUERY_TIMEOUT_MS = 5_000;
+
+function localCoverageTargetRuns(
+  lod: number,
+): readonly (readonly [
+  targetLod: number,
+  minTileZ: number,
+  maxTileZExclusive: number,
+  minTileX: number,
+  maxTileXExclusive: number,
+])[] {
+  return Array.from({ length: 4 - lod }, (_, offset) => lod + offset).flatMap(
+    (targetLod) => {
+      const scale = 2 ** (3 - targetLod);
+      return OVERWORLD_LOD3_AVAILABLE_BANDS.flatMap((band) =>
+        band.xRuns.map(
+          ([minTileX, maxTileXExclusive]) =>
+            [
+              targetLod,
+              band.minTileZ * scale,
+              band.maxTileZExclusive * scale,
+              minTileX * scale,
+              maxTileXExclusive * scale,
+            ] as const,
+        ),
+      );
+    },
+  );
+}
 
 type MiddlewareNext = (error?: unknown) => void;
 
@@ -78,6 +301,22 @@ interface RuntimeState {
   job: LocalJob | null;
   child: ChildProcess | null;
   stopTimer: NodeJS.Timeout | null;
+}
+
+interface LocalCoverageResult {
+  readonly version: 1;
+  readonly dimension: "overworld";
+  readonly layer: "base";
+  readonly lod: number;
+  readonly databaseUpdatedAt: string;
+  readonly cells: readonly {
+    readonly row: number;
+    readonly column: number;
+    readonly completeCount: number;
+    readonly queuedCount: number;
+    readonly failedCount: number;
+    readonly absentCount: number;
+  }[];
 }
 
 function writeJson(
@@ -336,6 +575,24 @@ export function parseRegionDownloadRequest(
   };
 }
 
+export function parseLocalCoverageRequest(
+  url: string | undefined,
+): { readonly lod: number } | null {
+  if (!url) return null;
+  const parsed = new URL(url, "http://localhost");
+  if (parsed.pathname !== COVERAGE_ENDPOINT) return null;
+  const lodText = parsed.searchParams.get("lod");
+  if (
+    lodText === null ||
+    !/^\d$/.test(lodText) ||
+    parsed.searchParams.get("layer") !== "base"
+  ) {
+    return null;
+  }
+  const lod = Number(lodText);
+  return lod >= 0 && lod <= 3 ? { lod } : null;
+}
+
 async function readRequestBody(
   request: IncomingMessage,
   maximumBytes = MAX_REQUEST_BODY_BYTES,
@@ -378,6 +635,159 @@ async function readArchiveBytes(tileRoot: string): Promise<number> {
     // A capacity snapshot can still be useful without legacy size metadata.
   }
   return 0;
+}
+
+async function optionalFileFingerprint(path: string): Promise<string> {
+  try {
+    const metadata = await stat(path);
+    return `${metadata.size}:${metadata.mtimeMs}`;
+  } catch {
+    return "missing";
+  }
+}
+
+function isCoverageCell(value: unknown): value is LocalCoverageResult["cells"][number] {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.row === "number" &&
+    Number.isSafeInteger(value.row) &&
+    value.row >= 0 &&
+    value.row < 33 &&
+    typeof value.column === "number" &&
+    Number.isSafeInteger(value.column) &&
+    value.column >= 0 &&
+    value.column < 33 &&
+    typeof value.completeCount === "number" &&
+    Number.isSafeInteger(value.completeCount) &&
+    value.completeCount >= 0 &&
+    typeof value.queuedCount === "number" &&
+    Number.isSafeInteger(value.queuedCount) &&
+    value.queuedCount >= 0 &&
+    typeof value.failedCount === "number" &&
+    Number.isSafeInteger(value.failedCount) &&
+    value.failedCount >= 0 &&
+    typeof value.absentCount === "number" &&
+    Number.isSafeInteger(value.absentCount) &&
+    value.absentCount >= 0
+  );
+}
+
+async function queryLocalCoverage(
+  tileRoot: string,
+  pythonBin: string,
+  lod: number,
+): Promise<LocalCoverageResult> {
+  const databasePath = resolve(tileRoot, "tiles.sqlite3");
+  const databaseStat = await stat(databasePath);
+  if (!databaseStat.isFile()) {
+    throw new Error("El catálogo local de tiles no es un archivo");
+  }
+
+  const cells = await new Promise<LocalCoverageResult["cells"]>(
+    (resolvePromise, rejectPromise) => {
+      const child: ChildProcess = spawn(
+        pythonBin,
+        [
+          "-c",
+          LOCAL_COVERAGE_QUERY,
+          databasePath,
+          String(lod),
+          JSON.stringify(localCoverageTargetRuns(lod)),
+        ],
+        {
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            NODE_ENV: process.env.NODE_ENV,
+            PATH: process.env.PATH,
+            LANG: process.env.LANG,
+            LC_ALL: process.env.LC_ALL,
+            VIRTUAL_ENV: process.env.VIRTUAL_ENV,
+            SSL_CERT_FILE: process.env.SSL_CERT_FILE,
+            REQUESTS_CA_BUNDLE: process.env.REQUESTS_CA_BUNDLE,
+            HTTP_PROXY: process.env.HTTP_PROXY,
+            HTTPS_PROXY: process.env.HTTPS_PROXY,
+            NO_PROXY: process.env.NO_PROXY,
+            PYTHONUNBUFFERED: "1",
+          },
+        },
+      );
+      const stdout: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderr = "";
+      let settled = false;
+      const finish = (
+        callback: () => void,
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        callback();
+      };
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        finish(() =>
+          rejectPromise(
+            new Error("La lectura de cobertura local superó el tiempo límite"),
+          ),
+        );
+      }, LOCAL_COVERAGE_QUERY_TIMEOUT_MS);
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdoutBytes += chunk.byteLength;
+        if (stdoutBytes > MAX_LOCAL_COVERAGE_BYTES) {
+          child.kill("SIGTERM");
+          finish(() =>
+            rejectPromise(
+              new Error("La cobertura local supera el tamaño permitido"),
+            ),
+          );
+          return;
+        }
+        stdout.push(chunk);
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        if (stderr.length < 4_096) stderr += chunk.toString("utf8");
+      });
+      child.once("error", (error) => {
+        finish(() => rejectPromise(error));
+      });
+      child.once("exit", (code) => {
+        finish(() => {
+          if (code !== 0) {
+            rejectPromise(
+              new Error(
+                stderr.trim() || "No se pudo leer el catálogo local de tiles",
+              ),
+            );
+            return;
+          }
+          try {
+            const parsed = JSON.parse(
+              Buffer.concat(stdout).toString("utf8"),
+            ) as unknown;
+            if (!Array.isArray(parsed) || !parsed.every(isCoverageCell)) {
+              throw new Error("La cobertura local no tiene un formato válido");
+            }
+            resolvePromise(Object.freeze(parsed));
+          } catch (error) {
+            rejectPromise(
+              error instanceof Error
+                ? error
+                : new Error("La cobertura local no contiene JSON válido"),
+            );
+          }
+        });
+      });
+    },
+  );
+
+  return Object.freeze({
+    version: 1,
+    dimension: "overworld",
+    layer: "base",
+    lod,
+    databaseUpdatedAt: databaseStat.mtime.toISOString(),
+    cells,
+  });
 }
 
 async function readCapacity(
@@ -694,6 +1104,39 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   const workspaceStore = backingRoot
     ? new LocalAtlasWorkspaceStore(backingRoot)
     : null;
+  const coverageCache = new Map<
+    number,
+    { readonly fingerprint: string; readonly result: LocalCoverageResult }
+  >();
+  const coverageQueries = new Map<string, Promise<LocalCoverageResult>>();
+
+  const readCachedLocalCoverage = async (
+    lod: number,
+  ): Promise<LocalCoverageResult> => {
+    if (!tileRoot) {
+      throw new Error("La biblioteca local no está configurada");
+    }
+    const databasePath = resolve(tileRoot, "tiles.sqlite3");
+    const fingerprint = [
+      await optionalFileFingerprint(databasePath),
+      await optionalFileFingerprint(`${databasePath}-wal`),
+    ].join("|");
+    const cached = coverageCache.get(lod);
+    if (cached?.fingerprint === fingerprint) return cached.result;
+    const queryKey = `${lod}:${fingerprint}`;
+    const existingQuery = coverageQueries.get(queryKey);
+    if (existingQuery) return existingQuery;
+    const query = queryLocalCoverage(tileRoot, pythonBin, lod)
+      .then((result) => {
+        coverageCache.set(lod, { fingerprint, result });
+        return result;
+      })
+      .finally(() => {
+        coverageQueries.delete(queryKey);
+      });
+    coverageQueries.set(queryKey, query);
+    return query;
+  };
 
   const middleware = async (
     request: IncomingMessage,
@@ -703,6 +1146,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     const path = requestPath(request);
     if (
       path !== STATUS_ENDPOINT &&
+      path !== COVERAGE_ENDPOINT &&
       path !== DOWNLOAD_ENDPOINT &&
       path !== STOP_ENDPOINT &&
       path !== WORKSPACE_ENDPOINT &&
@@ -713,6 +1157,34 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     }
 
     if (!requireLocalRequest(request, response)) return;
+
+    if (path === COVERAGE_ENDPOINT && request.method === "GET") {
+      const coverageRequest = parseLocalCoverageRequest(request.url);
+      if (!coverageRequest) {
+        writeJson(response, 400, {
+          error: "Usa layer=base y un LOD entre 0 y 3",
+        });
+        return;
+      }
+      if (!tileRoot) {
+        writeJson(response, 503, {
+          error: "La biblioteca local no está configurada",
+        });
+        return;
+      }
+      try {
+        writeJson(
+          response,
+          200,
+          await readCachedLocalCoverage(coverageRequest.lod),
+        );
+      } catch {
+        writeJson(response, 503, {
+          error: "No se pudo leer la cobertura del catálogo local",
+        });
+      }
+      return;
+    }
 
     if (
       path === TILE_ENDPOINT &&
@@ -948,6 +1420,8 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   return {
     middleware,
     close() {
+      coverageCache.clear();
+      coverageQueries.clear();
       if (state.stopTimer) clearTimeout(state.stopTimer);
       if (state.child) state.child.kill("SIGINT");
     },
