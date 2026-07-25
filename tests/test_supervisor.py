@@ -77,6 +77,50 @@ def margin_observation(
 
 
 class RestartDecisionTests(unittest.TestCase):
+    def test_healthy_active_heartbeat_rejects_every_safety_signal(
+        self,
+    ) -> None:
+        fresh = supervisor.dataclasses.replace(
+            observation("running"),
+            age_seconds=1,
+        )
+        self.assertTrue(
+            supervisor.healthy_active_heartbeat(
+                fresh,
+                maximum_age_seconds=30,
+            )
+        )
+        for unsafe in (
+            observation("running", errors={"403": 1}),
+            observation("running", errors={"429": 1}),
+            observation("running", reason="protection HTTP"),
+        ):
+            with self.subTest(unsafe=unsafe):
+                self.assertFalse(
+                    supervisor.healthy_active_heartbeat(
+                        supervisor.dataclasses.replace(
+                            unsafe,
+                            age_seconds=1,
+                        ),
+                        maximum_age_seconds=30,
+                    )
+                )
+        self.assertFalse(
+            supervisor.healthy_active_heartbeat(
+                supervisor.dataclasses.replace(
+                    observation("protection"),
+                    age_seconds=1,
+                ),
+                maximum_age_seconds=30,
+            )
+        )
+        self.assertFalse(
+            supervisor.healthy_active_heartbeat(
+                supervisor.dataclasses.replace(fresh, age_seconds=31),
+                maximum_age_seconds=30,
+            )
+        )
+
     def test_restart_budget_counts_each_launcher_invocation(self) -> None:
         restart_times: deque[float] = deque()
         for now in (10.0, 11.0, 12.0):
@@ -1523,6 +1567,114 @@ class StorageStopRunTests(unittest.TestCase):
             self.assertIsNotNone(latch)
             assert latch is not None
             self.assertEqual(latch.phase, "committed")
+            self.assertTrue(transition_path.exists())
+
+    def test_safe_margin_does_not_adopt_http_protected_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            output.mkdir()
+            old_identity = self._identity()
+            replacement = supervisor.ProcessIdentity(
+                pid=456,
+                started_at="Fri Jul 24 20:00:00 2026",
+                arguments="python download_all_2b2t.py --all",
+                headroom_percent=20,
+            )
+            transition = supervisor.TransitionJournal(
+                phase="stopped_clean",
+                old_identity=old_identity,
+                current_percent=18,
+                target_percent=20,
+                signalled_at=90,
+                selected_percent=20,
+                launch_started_at=100,
+            )
+            transition_path = output / "margin_transition.json"
+            self.assertTrue(
+                supervisor.write_transition_journal(
+                    transition_path,
+                    transition,
+                )
+            )
+            (output / "progress.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "reason": None,
+                        "http_errors": {"429": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            safe_margin = margin_observation(
+                configured_percent=20,
+                target_percent=20,
+                fits=True,
+            )
+            lock_handle = mock.Mock()
+            with (
+                mock.patch.object(
+                    supervisor,
+                    "acquire_supervisor_lock",
+                    return_value=lock_handle,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "process_identity_from_fields",
+                    return_value=old_identity,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "find_download_processes",
+                    return_value=[replacement.pid],
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_process_identity",
+                    return_value=replacement,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "owner_pid",
+                    return_value=replacement.pid,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "read_margin_observation",
+                    return_value=safe_margin,
+                ),
+                mock.patch.object(
+                    supervisor,
+                    "write_margin_observation",
+                    return_value=True,
+                ),
+                mock.patch.object(supervisor.subprocess, "Popen") as popen,
+                mock.patch.object(
+                    supervisor,
+                    "clear_stale_download_lock",
+                ) as clear_lock,
+                mock.patch.object(supervisor.os, "kill") as send_signal,
+            ):
+                result = supervisor.run(
+                    self._run_args(root, output)
+                    + [
+                        "--max-restarts",
+                        "1",
+                        "--margin-check-seconds",
+                        "0.001",
+                        "--poll-seconds",
+                        "0.001",
+                        "--target-validation-timeout",
+                        "1",
+                    ]
+                )
+            self.assertEqual(result, 11)
+            popen.assert_not_called()
+            clear_lock.assert_not_called()
+            send_signal.assert_not_called()
             self.assertTrue(transition_path.exists())
 
     def test_immediate_clean_stop_uses_pre_signal_timestamp(self) -> None:

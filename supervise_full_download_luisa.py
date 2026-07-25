@@ -226,6 +226,22 @@ def safety_signal(observation: ProgressObservation) -> str | None:
     return None
 
 
+def healthy_active_heartbeat(
+    observation: ProgressObservation,
+    *,
+    maximum_age_seconds: float,
+) -> bool:
+    """Accept only a fresh active heartbeat without a safety signal."""
+
+    return (
+        observation.valid
+        and observation.status in ACTIVE_STATUSES
+        and observation.age_seconds is not None
+        and observation.age_seconds <= maximum_age_seconds
+        and safety_signal(observation) is None
+    )
+
+
 def clean_planned_stop(observation: ProgressObservation) -> RestartDecision:
     """Accept only the exact final state produced by the requested SIGINT."""
 
@@ -2217,13 +2233,12 @@ def run(argv: Sequence[str] | None = None) -> int:
                     )
                     storage_stop_checks = 0
             if progress_is_new:
-                # http_errors is cumulative SQLite history. Repeated current
-                # 403/429 responses finalize as status=protection below.
-                if (
-                    progress.valid
-                    and progress.status in ACTIVE_STATUSES
-                    and progress.age_seconds is not None
-                    and progress.age_seconds <= args.maximum_heartbeat_age
+                signal_reason = safety_signal(progress)
+                if signal_reason:
+                    return signal_reason
+                if healthy_active_heartbeat(
+                    progress,
+                    maximum_age_seconds=args.maximum_heartbeat_age,
                 ):
                     healthy_extension = args.target_validation_timeout
                     if storage_stop_checks > 0:
@@ -2238,10 +2253,11 @@ def run(argv: Sequence[str] | None = None) -> int:
                     )
             if (
                 progress_is_new
-                and progress.valid
+                and healthy_active_heartbeat(
+                    progress,
+                    maximum_age_seconds=args.maximum_heartbeat_age,
+                )
                 and progress.status == "running"
-                and progress.age_seconds is not None
-                and progress.age_seconds <= args.maximum_heartbeat_age
             ):
                 process_percent = expected_identity.headroom_percent
                 if (
@@ -2355,14 +2371,12 @@ def run(argv: Sequence[str] | None = None) -> int:
                     storage_stop_checks = 0
                     storage_gate_is_safe = False
             if progress_is_new:
-                # Historical HTTP counters do not make a fresh active
-                # heartbeat unsafe; repeated live protection does change
-                # the status to protection and is rejected below.
-                heartbeat_is_healthy = (
-                    progress.valid
-                    and progress.status in ACTIVE_STATUSES
-                    and progress.age_seconds is not None
-                    and progress.age_seconds <= args.maximum_heartbeat_age
+                signal_reason = safety_signal(progress)
+                if signal_reason:
+                    return signal_reason
+                heartbeat_is_healthy = healthy_active_heartbeat(
+                    progress,
+                    maximum_age_seconds=args.maximum_heartbeat_age,
                 )
                 if heartbeat_is_healthy and storage_stop_checks > 0:
                     deadline = max(
