@@ -6,7 +6,7 @@ viewer_dir="${project_dir}/viewer"
 output_dir="/Volumes/2b2t Tiles/2b2t_tiles"
 progress_file="${output_dir}/progress.json"
 log_file="${output_dir}/progress_viewer.log"
-lock_dir="${output_dir}/.progress_viewer.lock"
+lock_file="${output_dir}/.progress_viewer.lock"
 session_name="obsidian_atlas_viewer"
 viewer_port="${OBSIDIAN_ATLAS_VIEWER_PORT:-3001}"
 python_bin="${PYTHON_BIN:-}"
@@ -40,8 +40,8 @@ supervisor_pid() {
   local owner_pid=""
   local owner_command=""
 
-  [[ -f "${lock_dir}/pid" ]] || return 1
-  owner_pid=$(<"${lock_dir}/pid")
+  [[ -f "${lock_file}" ]] || return 1
+  owner_pid=$(<"${lock_file}")
   [[ "${owner_pid}" =~ ^[0-9]+$ ]] || return 1
   kill -0 "${owner_pid}" 2>/dev/null || return 1
   owner_command=$(ps -o command= -p "${owner_pid}" 2>/dev/null || true)
@@ -117,40 +117,48 @@ validate_environment() {
 }
 
 acquire_lock() {
+  local candidate_lock="${lock_file}.candidate.$$"
   local owner_pid=""
   local stale_lock=""
   local attempt=0
-  local empty_lock_checks=0
 
+  printf '%s\n' "$$" >"${candidate_lock}"
   while (( attempt < 3 )); do
-    if mkdir "${lock_dir}" 2>/dev/null; then
-      printf '%s\n' "$$" >"${lock_dir}/pid"
+    if ln "${candidate_lock}" "${lock_file}" 2>/dev/null; then
+      rm -f "${candidate_lock}"
       return 0
     fi
 
     owner_pid=$(supervisor_pid || true)
     if [[ -n "${owner_pid}" ]]; then
+      rm -f "${candidate_lock}"
       echo "Ya existe un supervisor del visor con PID ${owner_pid}." >&2
       return 1
     fi
 
-    if [[ ! -f "${lock_dir}/pid" ]] && (( empty_lock_checks < 10 )); then
-      empty_lock_checks=$((empty_lock_checks + 1))
-      sleep 0.1
-      continue
+    stale_lock="${lock_file}.stale.$$"
+    if mv "${lock_file}" "${stale_lock}" 2>/dev/null; then
+      rm -f "${stale_lock}"
     fi
-
-    stale_lock="${lock_dir}.stale.$$"
-    if mv "${lock_dir}" "${stale_lock}" 2>/dev/null; then
-      rm -f "${stale_lock}/pid"
-      rmdir "${stale_lock}" 2>/dev/null || true
-    fi
-    empty_lock_checks=0
     attempt=$((attempt + 1))
   done
 
-  echo "No se pudo adquirir el bloqueo del visor: ${lock_dir}" >&2
+  rm -f "${candidate_lock}"
+  echo "No se pudo adquirir el bloqueo del visor: ${lock_file}" >&2
   return 1
+}
+
+rotate_log_if_needed() {
+  local log_size=0
+
+  if [[ -f "${log_file}" ]]; then
+    log_size=$(wc -c <"${log_file}" | tr -d '[:space:]')
+  fi
+  if [[ "${log_size}" =~ ^[0-9]+$ ]] && (( log_size > 10 * 1024 * 1024 )); then
+    if mv -f "${log_file}" "${log_file}.1"; then
+      exec >>"${log_file}" 2>&1
+    fi
+  fi
 }
 
 serve_loop() {
@@ -167,12 +175,11 @@ serve_loop() {
 
   cleanup() {
     local owner_pid=""
-    if [[ -f "${lock_dir}/pid" ]]; then
-      owner_pid=$(<"${lock_dir}/pid")
+    if [[ -f "${lock_file}" ]]; then
+      owner_pid=$(<"${lock_file}")
     fi
     if [[ "${owner_pid}" == "$$" ]]; then
-      rm -f "${lock_dir}/pid"
-      rmdir "${lock_dir}" 2>/dev/null || true
+      rm -f "${lock_file}"
     fi
   }
 
@@ -188,6 +195,7 @@ serve_loop() {
   trap cleanup EXIT
 
   while (( stop_requested == 0 )); do
+    rotate_log_if_needed
     started_at=$(date +%s)
     printf '%s Iniciando Obsidian Atlas en %s\n' \
       "$(date '+%Y-%m-%d %H:%M:%S')" "${viewer_url}"
@@ -308,7 +316,10 @@ stop_viewer() {
     exit 1
   fi
   owner_pid=$(supervisor_pid || true)
-  if [[ -z "${owner_pid}" ]] && ! screen_has_session && ! bridge_is_ready; then
+  if [[ -z "${owner_pid}" ]] &&
+    [[ ! -e "${lock_file}" ]] &&
+    ! screen_has_session &&
+    ! bridge_is_ready; then
     echo "Obsidian Atlas ya está detenido."
     return 0
   fi
@@ -332,6 +343,7 @@ stop_viewer() {
   attempt=0
   while (( attempt < 20 )); do
     if ! screen_has_session &&
+      [[ ! -e "${lock_file}" ]] &&
       [[ -z "$(supervisor_pid || true)" ]] &&
       ! bridge_is_ready; then
       echo "Obsidian Atlas detenido."
