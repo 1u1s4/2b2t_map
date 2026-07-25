@@ -7,6 +7,7 @@ output_dir="/Volumes/2b2t Tiles/2b2t_tiles"
 progress_file="${output_dir}/progress.json"
 log_file="${output_dir}/progress_viewer.log"
 lock_file="${output_dir}/.progress_viewer.lock"
+lock_guard="${lock_file}.guard"
 session_name="obsidian_atlas_viewer"
 viewer_port="${OBSIDIAN_ATLAS_VIEWER_PORT:-3001}"
 python_bin="${PYTHON_BIN:-}"
@@ -25,7 +26,7 @@ Uso:
 
 Inicia Obsidian Atlas en una sesión screen supervisada y limitada a localhost.
 La barra lee la descarga activa cada cinco segundos. El modo interno
---serve-loop no está pensado para ejecutarse directamente.
+--serve-loop y sus auxiliares no están pensados para ejecutarse directamente.
 EOF
 }
 
@@ -94,6 +95,10 @@ validate_commands() {
     echo "No se encontró npm en PATH." >&2
     exit 1
   fi
+  if [[ ! -x /usr/bin/lockf ]]; then
+    echo "No se encontró /usr/bin/lockf." >&2
+    exit 1
+  fi
   if [[ -z "${python_bin}" || ! -x "${python_bin}" ]]; then
     echo "No se encontró un intérprete Python 3 ejecutable." >&2
     exit 1
@@ -116,13 +121,31 @@ validate_environment() {
   fi
 }
 
-acquire_lock() {
-  local candidate_lock="${lock_file}.candidate.$$"
+acquire_lock_for_pid() {
+  local requested_pid="${1:-}"
+  local candidate_lock="${lock_file}.candidate.${requested_pid}.$$"
   local owner_pid=""
+  local requested_command=""
   local stale_lock=""
   local attempt=0
 
-  printf '%s\n' "$$" >"${candidate_lock}"
+  if [[ ! "${requested_pid}" =~ ^[0-9]+$ ]] ||
+    ! kill -0 "${requested_pid}" 2>/dev/null; then
+    echo "El PID solicitado para el bloqueo no está activo." >&2
+    return 2
+  fi
+  requested_command=$(
+    ps -o command= -p "${requested_pid}" 2>/dev/null || true
+  )
+  case "${requested_command}" in
+    *start_progress_viewer_luisa.sh*" --serve-loop"*) ;;
+    *)
+      echo "El PID solicitado no es el supervisor canónico del visor." >&2
+      return 2
+      ;;
+  esac
+
+  printf '%s\n' "${requested_pid}" >"${candidate_lock}"
   while (( attempt < 3 )); do
     if ln "${candidate_lock}" "${lock_file}" 2>/dev/null; then
       rm -f "${candidate_lock}"
@@ -136,7 +159,7 @@ acquire_lock() {
       return 1
     fi
 
-    stale_lock="${lock_file}.stale.$$"
+    stale_lock="${lock_file}.stale.${requested_pid}.$$"
     if mv "${lock_file}" "${stale_lock}" 2>/dev/null; then
       rm -f "${stale_lock}"
     fi
@@ -146,6 +169,11 @@ acquire_lock() {
   rm -f "${candidate_lock}"
   echo "No se pudo adquirir el bloqueo del visor: ${lock_file}" >&2
   return 1
+}
+
+acquire_lock() {
+  /usr/bin/lockf -t 10 "${lock_guard}" \
+    "${project_dir}/start_progress_viewer_luisa.sh" --acquire-lock "$$"
 }
 
 rotate_log_if_needed() {
@@ -379,6 +407,9 @@ case "${mode}" in
   --serve-loop)
     validate_environment
     serve_loop
+    ;;
+  --acquire-lock)
+    acquire_lock_for_pid "${2:-}"
     ;;
   -h | --help)
     usage
