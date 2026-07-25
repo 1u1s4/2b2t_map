@@ -14,9 +14,10 @@ detalle de la sesión.
 
 La aplicación se sirve únicamente en `localhost`. Los datos persistentes se
 guardan de forma atómica en LuisA y mantienen una copia de recuperación en el
-navegador. La biblioteca existente se conserva: el visor solo abre WebP locales
-válidos y la descarga regional solicita a la fuente únicamente los tiles que
-falten en la celda elegida.
+navegador. La biblioteca existente se conserva: el visor solo abre WebP
+locales válidos. Antes de explorar, comprueba la región exacta contra SQLite y
+el filesystem; si falta algo, descarga únicamente lo pendiente y reutiliza
+tanto los WebP válidos como los `404` ya confirmados.
 
 La versión actual admite únicamente **Overworld**.
 
@@ -28,7 +29,7 @@ La versión actual admite únicamente **Overworld**.
   explorar;
 - rejilla maestra 33×33 basada en la huella irregular real de 66,464 tiles LOD 3;
 - selección por arrastre de uno o varios sectores de 32,768×32,768 bloques;
-- inicio directo de una sesión LOD 0 desde el sector o la región seleccionada;
+- descarga completa obligatoria de una región antes de abrir su sesión LOD 0;
 - regiones dibujadas, tomadas de la vista o introducidas por coordenadas como
   alternativa avanzada;
 - una celda de 512×512 bloques por tile LOD 0;
@@ -37,9 +38,10 @@ La versión actual admite únicamente **Overworld**.
 - zoom acotado a un presupuesto seguro de tiles visibles y cámara contenida en
   la región;
 - varias sesiones pausables con progreso persistente y exportable;
-- ausencias `404` persistentes en un estado **Sin datos** separado de
-  **Revisadas**;
-- descarga explícita de la celda actual entre `0.25` y `2 req/s`;
+- revisión automática de cada celda al entrar o desplazarse a ella;
+- ausencias `404` persistentes y omitidas automáticamente, separadas de las
+  celdas revisadas;
+- descarga regional reanudable entre `0.25` y `2 req/s`;
 - capas `base`, `overlay` y `newchunks`;
 - puntos y áreas con nombre, color y notas privadas;
 - lectura exclusiva de la biblioteca local;
@@ -106,27 +108,29 @@ PYTHON_BIN='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
    o **Por explorar**.
 3. Haz clic en un sector o arrastra sobre varios. El panel muestra sus límites
    X/Z y la cantidad de filas y columnas LOD 0.
-4. Pulsa **Explorar esta región** o **Iniciar en LOD 0**. La primera celda se
-   abre directamente a 512×512 bloques.
-5. Recorre la región con la cruceta norte/sur/este/oeste, las flechas del
-   teclado o un clic en otra celda.
-6. Acerca, aleja o arrastra el mapa cuando necesites inspeccionar una
+4. El visor comprueba las tres capas. Si falta algo, elige el ritmo y pulsa
+   **Descargar región completa**. La exploración permanece bloqueada.
+5. Puedes detener el trabajo sin perder datos y usar **Reanudar descarga**
+   después. El progreso exacto incluye WebP guardados, `404`, pendientes,
+   faltantes y fallos.
+6. Cuando la región alcance 100%, pulsa **Explorar región**. La primera celda
+   se abre a 512×512 bloques y queda revisada automáticamente.
+7. Recorre la región con la cruceta norte/sur/este/oeste, las flechas del
+   teclado o un clic. Cada celda visitada queda revisada sin otro botón; un
+   `404` se omite automáticamente.
+8. Acerca, aleja o arrastra el mapa cuando necesites inspeccionar una
    estructura: los datos continúan en LOD 0.
-7. Si falta el tile local, elige el ritmo y pulsa
-   **Descargar celda actual**.
-8. Cuando el detalle LOD 0 esté guardado, usa **Marcar como revisada**.
-   Si la fuente confirma un `404`, usa **Omitir celda sin datos**.
 9. **Pausar sesión** la conserva en LuisA; después puedes abrirla desde
    **Workspace durable**. **Guardar ahora** fuerza una escritura inmediata.
 
-El progreso de revisión y la presencia del tile son conceptos distintos.
-Descargar una celda no la marca como revisada, y navegar no inicia solicitudes
-en segundo plano. Una ausencia `404` tampoco se disfraza de revisión: se guarda
-en su propio bitset y se excluye del total revisable.
+La descarga y la revisión siguen siendo conceptos distintos. La primera ocurre
+por región y debe terminar antes de entrar; la segunda se registra
+automáticamente al visitar celdas. Una ausencia `404` no se disfraza de
+revisión: se guarda en su propio bitset y se excluye del total revisable.
 
-No necesitas pausar manualmente para cambiar de zona: al pulsar **Explorar esta
-región**, la sesión activa se guarda en el workspace y la selección nueva se
-abre directamente.
+No necesitas pausar manualmente para cambiar de zona: al elegir otra región,
+la sesión activa se guarda en el workspace y la selección nueva pasa por la
+comprobación o descarga obligatoria antes de abrirse.
 
 El Atlas se puede abrir mientras una sesión está activa. La cámara y el zoom
 regionales se conservan y se restauran al volver. Un toque o clic selecciona el
@@ -158,13 +162,14 @@ El zoom del canvas no selecciona otra resolución durante una sesión: rueda,
 pellizco, doble clic, `+`, `-` y arrastre solo cambian la vista. La escala mínima
 mantiene como máximo 8×6 tiles dentro del viewport antes del margen de render y
 la cámara no puede perder la región seleccionada. El modelo admite hasta
-4,000,000 de celdas por sesión y avisa antes de iniciar una selección que supere
+1,048,576 celdas por sesión y avisa antes de iniciar una selección que supere
 ese límite.
 
 Las sesiones creadas por versiones anteriores conservan su LOD, escala, celda
-actual y progreso al restaurarlas o importarlas. Las sesiones con LOD heredado
-son de solo lectura; **Crear versión en LOD 0** conserva la original y abre una
-copia nueva en máximo detalle.
+actual y progreso al restaurarlas o importarlas. Antes de reabrir una sesión
+LOD 0, el visor vuelve a verificar su región completa. Las sesiones con LOD
+heredado son de solo lectura; **Crear versión en LOD 0** conserva la original y
+lleva la copia nueva al mismo paso obligatorio de descarga.
 
 ## Capacidad de LuisA
 
@@ -191,7 +196,7 @@ El resultado puede ser:
 Es un diagnóstico de almacenamiento. No crea trabajos ni recorre el mapa. La
 biblioteca actual, su SQLite y los WebP existentes permanecen en su lugar.
 
-## Descargar una celda desde la interfaz
+## Descargar una región desde la interfaz
 
 La UI ofrece cuatro ritmos:
 
@@ -199,11 +204,12 @@ La UI ofrece cuatro ritmos:
 0.25 req/s · 0.5 req/s · 1 req/s · 2 req/s
 ```
 
-Siempre se descarga la capa `base` de la celda actual LOD 0; `overlay` y
-`newchunks` se añaden cuando están visibles. El
-runtime permite un trabajo regional a la vez, valida espacio antes de iniciarlo
-y admite como máximo 64 combinaciones tile/capa por operación. **Detener
-celda** termina las solicitudes activas de forma segura.
+La descarga obligatoria incluye `base`, `overlay` y `newchunks` para todos los
+tiles LOD 0 de los límites seleccionados. El runtime permite un trabajo
+regional a la vez, calcula lo que realmente falta, valida espacio con margen y
+publica progreso durable desde SQLite. **Detener descarga** termina las
+solicitudes activas de forma segura; repetirla reanuda sin volver a pedir WebP
+válidos ni `404` conocidos.
 
 ## CLI regional
 
@@ -306,8 +312,8 @@ el CLI aplican cada regla en su lugar correspondiente.
 El visor consulta exclusivamente esta biblioteca. Chrome también puede abrir la
 carpeta `2b2t_tiles` con permiso de solo lectura desde **Explorar → Biblioteca
 local**. `/api/tile` nunca obtiene imágenes remotas: también ignora el parámetro
-heredado `online=1`. Un tile ausente se obtiene mediante **Descargar celda
-actual** y solo se muestra después de quedar guardado localmente.
+heredado `online=1`. Solo el trabajo regional explícito obtiene archivos de la
+fuente, y la sesión no se abre hasta resolver toda el área.
 
 ## Workspace, sesiones y highlights
 

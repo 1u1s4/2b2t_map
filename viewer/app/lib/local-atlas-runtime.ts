@@ -49,6 +49,45 @@ export interface LocalRegionJob {
   readonly finishedAt: string | null;
   readonly exitCode: number | null;
   readonly message: string;
+  readonly progress?: LocalRegionJobProgress;
+}
+
+export interface LocalRegionJobProgress {
+  readonly requested: number;
+  readonly processed: number;
+  readonly complete: number;
+  readonly absent: number;
+  readonly failed: number;
+  readonly reused: number;
+  readonly reusedAbsent: number;
+  readonly downloadedBytes: number;
+  readonly percent: number;
+  readonly status: "running" | "complete" | "error" | "interrupted";
+}
+
+export type LocalAtlasTileLayer = "base" | "overlay" | "newchunks";
+
+export interface LocalAtlasRegionStatus {
+  readonly version: 1;
+  readonly dimension: "overworld";
+  readonly lod: 0;
+  readonly bounds: WorldBounds;
+  readonly layers: readonly LocalAtlasTileLayer[];
+  readonly totalCount: number;
+  readonly resolvedCount: number;
+  readonly completeCount: number;
+  readonly absentCount: number;
+  readonly pendingCount: number;
+  readonly failedCount: number;
+  readonly missingCount: number;
+  readonly percent: number;
+  readonly ready: boolean;
+  readonly databaseUpdatedAt: string | null;
+  /** LOD 0 base cells that the source has durably confirmed as HTTP 404. */
+  readonly absentCells: readonly {
+    readonly tileX: number;
+    readonly tileZ: number;
+  }[];
 }
 
 export interface LocalAtlasRuntime {
@@ -77,6 +116,21 @@ export function isCompletedBaseCellRequest(
       request &&
       request.lod === lod &&
       request.layers.includes("base") &&
+      request.xMin <= bounds.minX &&
+      request.zMin <= bounds.minZ &&
+      request.xMaxExclusive >= bounds.maxXExclusive &&
+      request.zMaxExclusive >= bounds.maxZExclusive,
+  );
+}
+
+export function regionJobMatchesBounds(
+  job: LocalRegionJob | null,
+  bounds: WorldBounds,
+): boolean {
+  const request = job?.request;
+  return Boolean(
+    request &&
+      request.lod === 0 &&
       request.xMin === bounds.minX &&
       request.zMin === bounds.minZ &&
       request.xMaxExclusive === bounds.maxXExclusive &&
@@ -358,6 +412,49 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
       requestsPerSecond: value.request.requestsPerSecond,
     };
   }
+  let progress: LocalRegionJobProgress | undefined;
+  if (value.progress !== undefined) {
+    if (
+      !isRecord(value.progress) ||
+      !nonNegativeSafeInteger(value.progress.requested) ||
+      !nonNegativeSafeInteger(value.progress.processed) ||
+      !nonNegativeSafeInteger(value.progress.complete) ||
+      !nonNegativeSafeInteger(value.progress.absent) ||
+      !nonNegativeSafeInteger(value.progress.failed) ||
+      !nonNegativeSafeInteger(value.progress.reused) ||
+      !nonNegativeSafeInteger(value.progress.reusedAbsent) ||
+      !nonNegativeSafeInteger(value.progress.downloadedBytes) ||
+      typeof value.progress.percent !== "number" ||
+      !Number.isFinite(value.progress.percent) ||
+      value.progress.percent < 0 ||
+      value.progress.percent > 100 ||
+      (value.progress.status !== "running" &&
+        value.progress.status !== "complete" &&
+        value.progress.status !== "error" &&
+        value.progress.status !== "interrupted") ||
+      value.progress.processed > value.progress.requested ||
+      value.progress.complete +
+          value.progress.absent +
+          value.progress.failed >
+        value.progress.requested ||
+      value.progress.reused > value.progress.complete ||
+      value.progress.reusedAbsent > value.progress.absent
+    ) {
+      return undefined;
+    }
+    progress = {
+      requested: value.progress.requested,
+      processed: value.progress.processed,
+      complete: value.progress.complete,
+      absent: value.progress.absent,
+      failed: value.progress.failed,
+      reused: value.progress.reused,
+      reusedAbsent: value.progress.reusedAbsent,
+      downloadedBytes: value.progress.downloadedBytes,
+      percent: value.progress.percent,
+      status: value.progress.status,
+    };
+  }
   return {
     id: value.id,
     status: value.status as LocalJobStatus,
@@ -366,6 +463,7 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
     finishedAt: value.finishedAt,
     exitCode: value.exitCode,
     message: value.message,
+    ...(progress ? { progress } : {}),
   };
 }
 
@@ -613,6 +711,128 @@ export function parseLocalAtlasCoverage(
   };
 }
 
+function nonNegativeSafeInteger(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
+}
+
+export function parseLocalAtlasRegionStatus(
+  value: unknown,
+): LocalAtlasRegionStatus | null {
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    value.dimension !== "overworld" ||
+    value.lod !== 0 ||
+    !isRecord(value.bounds) ||
+    !safeMapCoordinate(value.bounds.minX) ||
+    !safeMapCoordinate(value.bounds.minZ) ||
+    !safeMapCoordinate(value.bounds.maxXExclusive) ||
+    !safeMapCoordinate(value.bounds.maxZExclusive) ||
+    value.bounds.maxXExclusive <= value.bounds.minX ||
+    value.bounds.maxZExclusive <= value.bounds.minZ ||
+    !Array.isArray(value.layers) ||
+    value.layers.length < 1 ||
+    value.layers.length > 3 ||
+    !value.layers.every(
+      (layer) =>
+        layer === "base" ||
+        layer === "overlay" ||
+        layer === "newchunks",
+    ) ||
+    new Set(value.layers).size !== value.layers.length ||
+    !nonNegativeSafeInteger(value.totalCount) ||
+    !nonNegativeSafeInteger(value.resolvedCount) ||
+    !nonNegativeSafeInteger(value.completeCount) ||
+    !nonNegativeSafeInteger(value.absentCount) ||
+    !nonNegativeSafeInteger(value.pendingCount) ||
+    !nonNegativeSafeInteger(value.failedCount) ||
+    !nonNegativeSafeInteger(value.missingCount) ||
+    typeof value.percent !== "number" ||
+    !Number.isFinite(value.percent) ||
+    value.percent < 0 ||
+    value.percent > 100 ||
+    typeof value.ready !== "boolean" ||
+    !(
+      value.databaseUpdatedAt === null ||
+      canonicalTimestamp(value.databaseUpdatedAt)
+    ) ||
+    !Array.isArray(value.absentCells)
+  ) {
+    return null;
+  }
+  if (
+    value.totalCount !==
+      value.completeCount +
+        value.absentCount +
+        value.pendingCount +
+        value.failedCount +
+        value.missingCount ||
+    value.resolvedCount !== value.completeCount + value.absentCount ||
+    value.resolvedCount > value.totalCount ||
+    value.ready !==
+      (value.resolvedCount === value.totalCount &&
+        value.pendingCount === 0 &&
+        value.failedCount === 0 &&
+        value.missingCount === 0)
+  ) {
+    return null;
+  }
+  const expectedPercent =
+    value.totalCount === 0
+      ? 100
+      : (value.resolvedCount / value.totalCount) * 100;
+  if (Math.abs(value.percent - expectedPercent) > 0.01) return null;
+
+  const absentCells: Array<{ tileX: number; tileZ: number }> = [];
+  const absentKeys = new Set<string>();
+  for (const cell of value.absentCells) {
+    if (
+      !isRecord(cell) ||
+      typeof cell.tileX !== "number" ||
+      typeof cell.tileZ !== "number" ||
+      !Number.isSafeInteger(cell.tileX) ||
+      !Number.isSafeInteger(cell.tileZ) ||
+      Math.abs(cell.tileX) > 30_000_000 ||
+      Math.abs(cell.tileZ) > 30_000_000
+    ) {
+      return null;
+    }
+    const key = `${cell.tileX}:${cell.tileZ}`;
+    if (absentKeys.has(key)) return null;
+    absentKeys.add(key);
+    absentCells.push({ tileX: cell.tileX, tileZ: cell.tileZ });
+  }
+  if (absentCells.length > value.absentCount) return null;
+
+  return {
+    version: 1,
+    dimension: "overworld",
+    lod: 0,
+    bounds: {
+      minX: value.bounds.minX,
+      minZ: value.bounds.minZ,
+      maxXExclusive: value.bounds.maxXExclusive,
+      maxZExclusive: value.bounds.maxZExclusive,
+    },
+    layers: value.layers as LocalAtlasTileLayer[],
+    totalCount: value.totalCount,
+    resolvedCount: value.resolvedCount,
+    completeCount: value.completeCount,
+    absentCount: value.absentCount,
+    pendingCount: value.pendingCount,
+    failedCount: value.failedCount,
+    missingCount: value.missingCount,
+    percent: value.percent,
+    ready: value.ready,
+    databaseUpdatedAt: value.databaseUpdatedAt as string | null,
+    absentCells,
+  };
+}
+
 export async function readLocalAtlasRuntime(
   signal?: AbortSignal,
 ): Promise<LocalAtlasRuntime | null> {
@@ -648,6 +868,39 @@ export async function readLocalAtlasCoverage(
     throw new Error("El catálogo devolvió una cobertura local no válida");
   }
   return coverage;
+}
+
+export async function readLocalAtlasRegionStatus(
+  bounds: WorldBounds,
+  layers: readonly LocalAtlasTileLayer[],
+  signal?: AbortSignal,
+): Promise<LocalAtlasRegionStatus | null> {
+  const query = new URLSearchParams({
+    xMin: String(bounds.minX),
+    zMin: String(bounds.minZ),
+    xMaxExclusive: String(bounds.maxXExclusive),
+    zMaxExclusive: String(bounds.maxZExclusive),
+    lod: "0",
+    layers: [...layers].join(","),
+  });
+  const response = await fetch(`/api/local-atlas/region-status?${query}`, {
+    cache: "no-store",
+    signal,
+  });
+  if (response.status === 204 || response.status === 404) return null;
+  const payload = (await response.json().catch(() => null)) as unknown;
+  if (!response.ok) {
+    throw new Error(
+      isRecord(payload) && typeof payload.error === "string"
+        ? payload.error
+        : "No se pudo comprobar la descarga completa de la región",
+    );
+  }
+  const status = parseLocalAtlasRegionStatus(payload);
+  if (!status) {
+    throw new Error("El catálogo devolvió un estado regional no válido");
+  }
+  return status;
 }
 
 export async function readLocalAtlasWorkspace(
@@ -731,12 +984,12 @@ export async function writeLocalAtlasWorkspace(
   return workspace;
 }
 
-export async function downloadExplorationCell(
+export async function downloadExplorationRegion(
   runtime: LocalAtlasRuntime,
   bounds: WorldBounds,
-  layers: readonly ("base" | "overlay" | "newchunks")[],
+  layers: readonly LocalAtlasTileLayer[],
   requestsPerSecond: number,
-): Promise<void> {
+): Promise<LocalRegionJob> {
   const response = await fetch("/api/local-atlas/download", {
     method: "POST",
     headers: {
@@ -753,14 +1006,35 @@ export async function downloadExplorationCell(
       requestsPerSecond,
     }),
   });
+  const payload = (await response.json().catch(() => null)) as unknown;
   if (!response.ok) {
-    const payload = (await response.json().catch(() => null)) as unknown;
     throw new Error(
       isRecord(payload) && typeof payload.error === "string"
         ? payload.error
         : "No se pudo iniciar la descarga regional",
     );
   }
+  const job =
+    isRecord(payload) && "job" in payload ? readJob(payload.job) : undefined;
+  if (!job) {
+    throw new Error("El runtime no devolvió una descarga regional válida");
+  }
+  return job;
+}
+
+/** @deprecated Use the mandatory full-region workflow instead. */
+export async function downloadExplorationCell(
+  runtime: LocalAtlasRuntime,
+  bounds: WorldBounds,
+  layers: readonly LocalAtlasTileLayer[],
+  requestsPerSecond: number,
+): Promise<void> {
+  await downloadExplorationRegion(
+    runtime,
+    bounds,
+    layers,
+    requestsPerSecond,
+  );
 }
 
 export async function stopLocalRegionJob(

@@ -27,9 +27,12 @@ import {
   serializeExplorationState,
   withCellReviewed,
   withCellSkipped,
+  withCellsSkipped,
+  withCurrentCellVisited,
   withCurrentCellReviewed,
   withCurrentCellSkipped,
   withCurrentIndex,
+  withVisitedIndex,
   worldBlockToExplorationTile,
 } from "../app/lib/exploration-grid.ts";
 
@@ -240,6 +243,43 @@ test("cardinal navigation respects every edge", () => {
   assert.equal(moveCurrentCardinal(state, "south"), state);
 });
 
+test("cardinal cross auto-marks only newly visited cells", () => {
+  const grid = region({
+    bounds: {
+      minX: 0,
+      minZ: 0,
+      maxXExclusive: 3 * 512,
+      maxZExclusive: 2 * 512,
+    },
+  });
+  let state = createExplorationState(grid);
+  const route = [
+    ["east", 1],
+    ["south", 4],
+    ["west", 3],
+    ["north", 0],
+  ];
+
+  for (const [direction, expectedIndex] of route) {
+    state = moveCurrentCardinal(state, direction);
+    assert.equal(state.currentIndex, expectedIndex);
+    assert.equal(isCellReviewed(state, expectedIndex), true);
+  }
+  assert.equal(state.reviewedCount, 4);
+
+  state = moveCurrentCardinal(state, "east");
+  assert.equal(state.currentIndex, 1);
+  assert.equal(state.reviewedCount, 4);
+
+  const topEdge = moveCurrentCardinal(
+    moveCurrentCardinal(state, "west"),
+    "north",
+  );
+  assert.equal(topEdge.currentIndex, 0);
+  assert.equal(topEdge.reviewedCount, 4);
+  assert.equal(moveCurrentCardinal(topEdge, "north"), topEdge);
+});
+
 test("maximum-detail navigation moves one 512-block tile in every direction", () => {
   const initial = createMaxDetailExplorationState({
     id: "cardinal-lod0",
@@ -363,6 +403,39 @@ test("confirmed no-data cells use a separate durable bitset", () => {
   const restored = withCurrentCellSkipped(skippedInstead, false);
   assert.equal(isCellSkipped(restored, 5), false);
   assert.equal(restored.skippedCount, 0);
+});
+
+test("visiting a cell selects and reviews it exactly once", () => {
+  const initial = createExplorationState(region());
+  const firstVisit = withCurrentCellVisited(initial);
+  const distantVisit = withVisitedIndex(firstVisit, 7);
+  const repeatedVisit = withVisitedIndex(distantVisit, 7);
+  const returnVisit = withVisitedIndex(repeatedVisit, 0);
+
+  assert.equal(firstVisit.currentIndex, 0);
+  assert.equal(firstVisit.reviewedCount, 1);
+  assert.equal(distantVisit.currentIndex, 7);
+  assert.equal(distantVisit.reviewedCount, 2);
+  assert.equal(isCellReviewed(distantVisit, 7), true);
+  assert.equal(repeatedVisit, distantVisit);
+  assert.equal(returnVisit.reviewedCount, 2);
+});
+
+test("regional absences are seeded together and protected from visits", () => {
+  let state = createExplorationState(region());
+  state = withCellReviewed(state, 5);
+  const seeded = withCellsSkipped(state, [5, 7, 7]);
+  const visitedAbsent = withVisitedIndex(seeded, 7);
+  const visitedAvailable = withVisitedIndex(visitedAbsent, 8);
+
+  assert.equal(seeded.skippedCount, 2);
+  assert.equal(seeded.reviewedCount, 0);
+  assert.equal(isCellSkipped(seeded, 5), true);
+  assert.equal(isCellSkipped(seeded, 7), true);
+  assert.equal(isCellReviewed(visitedAbsent, 7), false);
+  assert.equal(visitedAbsent.currentIndex, 7);
+  assert.equal(visitedAvailable.reviewedCount, 1);
+  assert.equal(isCellReviewed(visitedAvailable, 8), true);
 });
 
 test("serialization round-trips region, fixed scale, cursor, and bitset", () => {

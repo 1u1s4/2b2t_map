@@ -24,6 +24,7 @@ import {
 
 const STATUS_ENDPOINT = "/api/local-atlas/status";
 const COVERAGE_ENDPOINT = "/api/local-atlas/coverage";
+const REGION_STATUS_ENDPOINT = "/api/local-atlas/region-status";
 const DOWNLOAD_ENDPOINT = "/api/local-atlas/download";
 const STOP_ENDPOINT = "/api/local-atlas/stop";
 const WORKSPACE_ENDPOINT = "/api/local-atlas/workspace";
@@ -33,10 +34,15 @@ const TILES_PER_SHARD = 32;
 const WORLD_BORDER_BLOCKS = 30_000_000;
 const MAX_REQUEST_BODY_BYTES = 32_768;
 const MAX_TILE_BYTES = 16 * 1024 * 1024;
-const MAX_JOB_TILES = 64;
+const MAX_REGION_CELLS = 1_048_576;
+const MAX_REGION_TILES = MAX_REGION_CELLS * 3;
+const DEFAULT_ESTIMATED_TILE_BYTES = 512 * 1024;
+const MIN_ESTIMATED_TILE_BYTES = 64 * 1024;
+const MAX_ESTIMATED_TILE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_OVERWORLD_REQUIREMENT_BYTES = 1_458_909_433_254;
 const STOP_GRACE_PERIOD_MS = 15_000;
 const ALLOWED_LAYERS = new Set(["base", "overlay", "newchunks"]);
+const CANONICAL_LAYERS = ["base", "overlay", "newchunks"] as const;
 const INTEGER_PATTERN = /^[+-]?\d+$/;
 const LOCAL_COVERAGE_QUERY = String.raw`
 import json
@@ -154,8 +160,7 @@ absent_rows = connection.execute(
       AND tile.status = 'absent'
     """,
     (*run_parameters, lod),
-).fetchall()
-connection.close()
+)
 
 counts_by_cell = {
     (int(row), int(column)): {
@@ -231,6 +236,152 @@ print(json.dumps(cells, separators=(",", ":")))
 `;
 const MAX_LOCAL_COVERAGE_BYTES = 512 * 1024;
 const LOCAL_COVERAGE_QUERY_TIMEOUT_MS = 5_000;
+const MAX_LOCAL_REGION_STATUS_BYTES = 64 * 1024 * 1024;
+const LOCAL_REGION_STATUS_QUERY_TIMEOUT_MS = 120_000;
+const LOCAL_REGION_STATUS_CACHE_MS = 5_000;
+
+const LOCAL_REGION_STATUS_QUERY = String.raw`
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+database_path = sys.argv[1]
+tile_root = Path(sys.argv[2]).resolve()
+min_tile_x = int(sys.argv[3])
+min_tile_z = int(sys.argv[4])
+max_tile_x_exclusive = int(sys.argv[5])
+max_tile_z_exclusive = int(sys.argv[6])
+layers = json.loads(sys.argv[7])
+maximum_tile_bytes = int(sys.argv[8])
+
+placeholders = ",".join("?" for _ in layers)
+connection = sqlite3.connect(
+    f"file:{database_path}?mode=ro",
+    uri=True,
+    timeout=5,
+)
+connection.execute("PRAGMA query_only = ON")
+rows = connection.execute(
+    f"""
+    SELECT
+      layer,
+      tile_x,
+      tile_z,
+      status,
+      relative_path,
+      size_bytes
+    FROM tiles
+    WHERE dimension = 'overworld'
+      AND lod = 0
+      AND layer IN ({placeholders})
+      AND tile_x >= ?
+      AND tile_x < ?
+      AND tile_z >= ?
+      AND tile_z < ?
+    ORDER BY tile_z, tile_x, layer
+    """,
+    (
+      *layers,
+      min_tile_x,
+      max_tile_x_exclusive,
+      min_tile_z,
+      max_tile_z_exclusive,
+    ),
+).fetchall()
+connection.close()
+
+pending_statuses = {
+    "pending",
+    "downloading",
+    "retry",
+    "running",
+}
+complete_count = 0
+absent_count = 0
+pending_count = 0
+failed_count = 0
+missing_complete_count = 0
+valid_complete_bytes = 0
+absent_cells = []
+row_count = 0
+
+def validate_complete(relative_path, expected_size):
+    try:
+        candidate = (tile_root / str(relative_path)).resolve()
+        candidate.relative_to(tile_root)
+    except (OSError, ValueError):
+        return ("failed", 0)
+    try:
+        metadata = candidate.stat()
+    except FileNotFoundError:
+        return ("missing", 0)
+    except OSError:
+        return ("failed", 0)
+    if (
+        not candidate.is_file()
+        or metadata.st_size < 12
+        or metadata.st_size > maximum_tile_bytes
+    ):
+        return ("failed", 0)
+    if expected_size is not None and int(expected_size) != metadata.st_size:
+        return ("failed", 0)
+    try:
+        with candidate.open("rb") as handle:
+            header = handle.read(12)
+    except OSError:
+        return ("failed", 0)
+    if (
+        len(header) != 12
+        or header[:4] != b"RIFF"
+        or header[8:12] != b"WEBP"
+        or int.from_bytes(header[4:8], "little") + 8 != metadata.st_size
+    ):
+        return ("failed", 0)
+    return ("complete", metadata.st_size)
+
+for layer, tile_x, tile_z, status, relative_path, size_bytes in rows:
+    row_count += 1
+    if status == "complete":
+        file_status, file_size = validate_complete(relative_path, size_bytes)
+        if file_status == "complete":
+            complete_count += 1
+            valid_complete_bytes += file_size
+        elif file_status == "missing":
+            missing_complete_count += 1
+        else:
+            failed_count += 1
+    elif status == "absent":
+        absent_count += 1
+        if layer == "base":
+            absent_cells.append(
+                {
+                    "tileX": int(tile_x),
+                    "tileZ": int(tile_z),
+                }
+            )
+    elif status in pending_statuses:
+        pending_count += 1
+    else:
+        failed_count += 1
+
+connection.close()
+print(
+    json.dumps(
+        {
+            "rowCount": row_count,
+            "completeCount": complete_count,
+            "absentCount": absent_count,
+            "pendingCount": pending_count,
+            "failedCount": failed_count,
+            "missingCompleteCount": missing_complete_count,
+            "validCompleteBytes": valid_complete_bytes,
+            "absentCells": absent_cells,
+        },
+        separators=(",", ":"),
+    )
+)
+`;
 
 function localCoverageTargetRuns(
   lod: number,
@@ -280,12 +431,77 @@ export interface RegionDownloadRequest {
   readonly requestsPerSecond: number;
 }
 
+export interface LocalRegionStatusRequest {
+  readonly bounds: {
+    readonly minX: number;
+    readonly minZ: number;
+    readonly maxXExclusive: number;
+    readonly maxZExclusive: number;
+  };
+  readonly lod: 0;
+  readonly layers: readonly ("base" | "overlay" | "newchunks")[];
+}
+
+export interface LocalRegionStatusResult {
+  readonly version: 1;
+  readonly dimension: "overworld";
+  readonly lod: 0;
+  readonly bounds: LocalRegionStatusRequest["bounds"];
+  readonly layers: LocalRegionStatusRequest["layers"];
+  readonly totalCount: number;
+  readonly resolvedCount: number;
+  readonly completeCount: number;
+  readonly absentCount: number;
+  readonly pendingCount: number;
+  readonly failedCount: number;
+  readonly missingCount: number;
+  readonly percent: number;
+  readonly ready: boolean;
+  readonly databaseUpdatedAt: string | null;
+  readonly absentCells: readonly {
+    readonly tileX: number;
+    readonly tileZ: number;
+  }[];
+}
+
+interface LocalRegionStatusInventory {
+  readonly result: LocalRegionStatusResult;
+  readonly validCompleteBytes: number;
+}
+
+interface LocalRegionStatusQueryPayload {
+  readonly rowCount: number;
+  readonly completeCount: number;
+  readonly absentCount: number;
+  readonly pendingCount: number;
+  readonly failedCount: number;
+  readonly missingCompleteCount: number;
+  readonly validCompleteBytes: number;
+  readonly absentCells: readonly {
+    readonly tileX: number;
+    readonly tileZ: number;
+  }[];
+}
+
 type JobStatus =
   | "running"
   | "stopping"
   | "complete"
   | "stopped"
   | "error";
+
+interface LocalJobProgress {
+  readonly requested: number;
+  readonly processed: number;
+  readonly complete: number;
+  readonly absent: number;
+  readonly failed: number;
+  readonly reused: number;
+  readonly reusedAbsent: number;
+  readonly downloadedBytes: number;
+  readonly percent: number;
+  readonly status: "running" | "complete" | "error" | "interrupted";
+}
 
 interface LocalJob {
   readonly id: string;
@@ -295,6 +511,7 @@ interface LocalJob {
   finishedAt: string | null;
   exitCode: number | null;
   message: string;
+  progress: LocalJobProgress;
 }
 
 interface RuntimeState {
@@ -484,6 +701,94 @@ function safeInteger(
   return value;
 }
 
+function canonicalRegionLayers(
+  value: unknown,
+): LocalRegionStatusRequest["layers"] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new TypeError("Selecciona al menos una capa");
+  }
+  const requested = new Set(value);
+  if (
+    requested.size > ALLOWED_LAYERS.size ||
+    [...requested].some(
+      (layer) => typeof layer !== "string" || !ALLOWED_LAYERS.has(layer),
+    )
+  ) {
+    throw new TypeError("Las capas solicitadas no son válidas");
+  }
+  if (!requested.has("base")) {
+    throw new TypeError("La descarga regional siempre incluye la capa base");
+  }
+  return CANONICAL_LAYERS.filter((layer) => requested.has(layer));
+}
+
+function validateLod0Region(
+  minXValue: unknown,
+  minZValue: unknown,
+  maxXExclusiveValue: unknown,
+  maxZExclusiveValue: unknown,
+): {
+  readonly bounds: LocalRegionStatusRequest["bounds"];
+  readonly cellCount: number;
+} {
+  const minX = safeInteger(
+    minXValue,
+    "minX",
+    -WORLD_BORDER_BLOCKS,
+    WORLD_BORDER_BLOCKS,
+  );
+  const minZ = safeInteger(
+    minZValue,
+    "minZ",
+    -WORLD_BORDER_BLOCKS,
+    WORLD_BORDER_BLOCKS,
+  );
+  const maxXExclusive = safeInteger(
+    maxXExclusiveValue,
+    "maxXExclusive",
+    -WORLD_BORDER_BLOCKS,
+    WORLD_BORDER_BLOCKS,
+  );
+  const maxZExclusive = safeInteger(
+    maxZExclusiveValue,
+    "maxZExclusive",
+    -WORLD_BORDER_BLOCKS,
+    WORLD_BORDER_BLOCKS,
+  );
+  if (maxXExclusive <= minX || maxZExclusive <= minZ) {
+    throw new TypeError("La región debe tener ancho y alto positivos");
+  }
+  if (
+    minX % TILE_SIZE_PIXELS !== 0 ||
+    minZ % TILE_SIZE_PIXELS !== 0 ||
+    maxXExclusive % TILE_SIZE_PIXELS !== 0 ||
+    maxZExclusive % TILE_SIZE_PIXELS !== 0
+  ) {
+    throw new TypeError("La región debe estar alineada con su rejilla de tiles");
+  }
+  const columns = (maxXExclusive - minX) / TILE_SIZE_PIXELS;
+  const rows = (maxZExclusive - minZ) / TILE_SIZE_PIXELS;
+  const cellCount = columns * rows;
+  if (
+    !Number.isSafeInteger(cellCount) ||
+    cellCount <= 0 ||
+    cellCount > MAX_REGION_CELLS
+  ) {
+    throw new TypeError(
+      `Una región local admite como máximo ${MAX_REGION_CELLS.toLocaleString("en-US")} celdas LOD 0`,
+    );
+  }
+  return {
+    bounds: {
+      minX,
+      minZ,
+      maxXExclusive,
+      maxZExclusive,
+    },
+    cellCount,
+  };
+}
+
 export function parseRegionDownloadRequest(
   value: unknown,
 ): RegionDownloadRequest {
@@ -491,54 +796,18 @@ export function parseRegionDownloadRequest(
     throw new TypeError("La solicitud debe ser un objeto JSON");
   }
 
-  const xMin = safeInteger(
-    value.xMin,
-    "xMin",
-    -WORLD_BORDER_BLOCKS,
-    WORLD_BORDER_BLOCKS,
-  );
-  const zMin = safeInteger(
-    value.zMin,
-    "zMin",
-    -WORLD_BORDER_BLOCKS,
-    WORLD_BORDER_BLOCKS,
-  );
-  const xMaxExclusive = safeInteger(
-    value.xMaxExclusive,
-    "xMaxExclusive",
-    -WORLD_BORDER_BLOCKS,
-    WORLD_BORDER_BLOCKS,
-  );
-  const zMaxExclusive = safeInteger(
-    value.zMaxExclusive,
-    "zMaxExclusive",
-    -WORLD_BORDER_BLOCKS,
-    WORLD_BORDER_BLOCKS,
-  );
   const requestedLod = safeInteger(value.lod, "lod", 0, 10);
   if (requestedLod !== 0) {
     throw new TypeError("La descarga regional usa únicamente LOD 0");
   }
   const lod = 0 as const;
-  if (xMaxExclusive <= xMin || zMaxExclusive <= zMin) {
-    throw new TypeError("La región debe tener ancho y alto positivos");
-  }
-
-  if (!Array.isArray(value.layers) || value.layers.length === 0) {
-    throw new TypeError("Selecciona al menos una capa");
-  }
-  const layers = [...new Set(value.layers)];
-  if (
-    layers.length > ALLOWED_LAYERS.size ||
-    layers.some(
-      (layer) => typeof layer !== "string" || !ALLOWED_LAYERS.has(layer),
-    )
-  ) {
-    throw new TypeError("Las capas solicitadas no son válidas");
-  }
-  if (!layers.includes("base")) {
-    throw new TypeError("La descarga regional siempre incluye la capa base");
-  }
+  const { bounds, cellCount } = validateLod0Region(
+    value.xMin,
+    value.zMin,
+    value.xMaxExclusive,
+    value.zMaxExclusive,
+  );
+  const layers = canonicalRegionLayers(value.layers);
 
   const requestsPerSecond = value.requestsPerSecond;
   if (
@@ -552,34 +821,82 @@ export function parseRegionDownloadRequest(
     );
   }
 
-  const tileSpan = TILE_SIZE_PIXELS * 2 ** lod;
-  if (
-    xMin % tileSpan !== 0 ||
-    zMin % tileSpan !== 0 ||
-    xMaxExclusive % tileSpan !== 0 ||
-    zMaxExclusive % tileSpan !== 0
-  ) {
-    throw new TypeError("La región debe estar alineada con su rejilla de tiles");
-  }
-  const tileCount =
-    ((xMaxExclusive - xMin) / tileSpan) *
-    ((zMaxExclusive - zMin) / tileSpan) *
-    layers.length;
-  if (tileCount > MAX_JOB_TILES) {
+  const tileCount = cellCount * layers.length;
+  if (tileCount > MAX_REGION_TILES) {
     throw new TypeError(
-      `Una operación local admite como máximo ${MAX_JOB_TILES} tiles`,
+      `Una operación local admite como máximo ${MAX_REGION_TILES.toLocaleString("en-US")} tiles`,
     );
   }
 
   return {
-    xMin,
-    zMin,
-    xMaxExclusive,
-    zMaxExclusive,
+    xMin: bounds.minX,
+    zMin: bounds.minZ,
+    xMaxExclusive: bounds.maxXExclusive,
+    zMaxExclusive: bounds.maxZExclusive,
     lod,
-    layers: layers as RegionDownloadRequest["layers"],
+    layers,
     requestsPerSecond,
   };
+}
+
+export function parseLocalRegionStatusRequest(
+  url: string | undefined,
+): LocalRegionStatusRequest | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url, "http://localhost");
+    if (parsed.pathname !== REGION_STATUS_ENDPOINT) return null;
+    const expectedParameters = new Set([
+      "xMin",
+      "zMin",
+      "xMaxExclusive",
+      "zMaxExclusive",
+      "lod",
+      "layers",
+    ]);
+    if (
+      [...parsed.searchParams.keys()].some(
+        (parameter) => !expectedParameters.has(parameter),
+      ) ||
+      [...expectedParameters].some(
+        (parameter) => parsed.searchParams.getAll(parameter).length !== 1,
+      )
+    ) {
+      return null;
+    }
+    const readInteger = (name: string): number | null => {
+      const value = parsed.searchParams.get(name);
+      if (value === null || !INTEGER_PATTERN.test(value)) return null;
+      const number = Number(value);
+      return Number.isSafeInteger(number) ? number : null;
+    };
+    const lod = readInteger("lod");
+    if (lod !== 0) return null;
+    const minX = readInteger("xMin");
+    const minZ = readInteger("zMin");
+    const maxXExclusive = readInteger("xMaxExclusive");
+    const maxZExclusive = readInteger("zMaxExclusive");
+    if (
+      minX === null ||
+      minZ === null ||
+      maxXExclusive === null ||
+      maxZExclusive === null
+    ) {
+      return null;
+    }
+    const layersText = parsed.searchParams.get("layers");
+    if (layersText === null) return null;
+    const layers = canonicalRegionLayers(layersText.split(","));
+    const { bounds } = validateLod0Region(
+      minX,
+      minZ,
+      maxXExclusive,
+      maxZExclusive,
+    );
+    return { bounds, lod: 0, layers };
+  } catch {
+    return null;
+  }
 }
 
 export function parseLocalCoverageRequest(
@@ -651,6 +968,41 @@ async function optionalFileFingerprint(path: string): Promise<string> {
   } catch {
     return "missing";
   }
+}
+
+async function readLocalCatalogSnapshot(
+  tileRoot: string,
+): Promise<{
+  readonly fingerprint: string;
+  readonly updatedAt: string;
+} | null> {
+  const databasePath = resolve(tileRoot, "tiles.sqlite3");
+  let databaseStat: Awaited<ReturnType<typeof stat>>;
+  try {
+    databaseStat = await stat(databasePath);
+  } catch {
+    return null;
+  }
+  if (!databaseStat.isFile()) {
+    throw new Error("El catálogo local de tiles no es un archivo");
+  }
+  let walStat: Awaited<ReturnType<typeof stat>> | null;
+  try {
+    walStat = await stat(`${databasePath}-wal`);
+  } catch {
+    walStat = null;
+  }
+  const updatedAtMs = Math.max(
+    databaseStat.mtimeMs,
+    walStat?.mtimeMs ?? 0,
+  );
+  return {
+    fingerprint: [
+      `${databaseStat.size}:${databaseStat.mtimeMs}`,
+      walStat ? `${walStat.size}:${walStat.mtimeMs}` : "missing",
+    ].join("|"),
+    updatedAt: new Date(updatedAtMs).toISOString(),
+  };
 }
 
 function isCoverageCell(value: unknown): value is LocalCoverageResult["cells"][number] {
@@ -797,6 +1149,288 @@ async function queryLocalCoverage(
   });
 }
 
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
+}
+
+function parseLocalRegionStatusQueryPayload(
+  value: unknown,
+  request: LocalRegionStatusRequest,
+  totalCount: number,
+): LocalRegionStatusQueryPayload {
+  if (
+    !isRecord(value) ||
+    !isNonNegativeSafeInteger(value.rowCount) ||
+    !isNonNegativeSafeInteger(value.completeCount) ||
+    !isNonNegativeSafeInteger(value.absentCount) ||
+    !isNonNegativeSafeInteger(value.pendingCount) ||
+    !isNonNegativeSafeInteger(value.failedCount) ||
+    !isNonNegativeSafeInteger(value.missingCompleteCount) ||
+    !isNonNegativeSafeInteger(value.validCompleteBytes) ||
+    !Array.isArray(value.absentCells)
+  ) {
+    throw new Error("El estado regional local no tiene un formato válido");
+  }
+  const classifiedRows =
+    value.completeCount +
+    value.absentCount +
+    value.pendingCount +
+    value.failedCount +
+    value.missingCompleteCount;
+  if (
+    value.rowCount > totalCount ||
+    classifiedRows !== value.rowCount ||
+    value.validCompleteBytes > value.completeCount * MAX_TILE_BYTES
+  ) {
+    throw new Error("El estado regional local contiene contadores inválidos");
+  }
+  const seenAbsentCells = new Set<string>();
+  const absentCells: Array<{ readonly tileX: number; readonly tileZ: number }> =
+    [];
+  const minTileX = request.bounds.minX / TILE_SIZE_PIXELS;
+  const minTileZ = request.bounds.minZ / TILE_SIZE_PIXELS;
+  const maxTileXExclusive =
+    request.bounds.maxXExclusive / TILE_SIZE_PIXELS;
+  const maxTileZExclusive =
+    request.bounds.maxZExclusive / TILE_SIZE_PIXELS;
+  for (const cell of value.absentCells) {
+    if (
+      !isRecord(cell) ||
+      typeof cell.tileX !== "number" ||
+      !Number.isSafeInteger(cell.tileX) ||
+      typeof cell.tileZ !== "number" ||
+      !Number.isSafeInteger(cell.tileZ) ||
+      cell.tileX < minTileX ||
+      cell.tileX >= maxTileXExclusive ||
+      cell.tileZ < minTileZ ||
+      cell.tileZ >= maxTileZExclusive
+    ) {
+      throw new Error("El estado regional contiene una ausencia fuera de rango");
+    }
+    const key = `${cell.tileX}:${cell.tileZ}`;
+    if (seenAbsentCells.has(key)) {
+      throw new Error("El estado regional contiene ausencias duplicadas");
+    }
+    seenAbsentCells.add(key);
+    absentCells.push({ tileX: cell.tileX, tileZ: cell.tileZ });
+  }
+  if (absentCells.length > value.absentCount) {
+    throw new Error("El estado regional contiene demasiadas ausencias base");
+  }
+  return {
+    rowCount: value.rowCount,
+    completeCount: value.completeCount,
+    absentCount: value.absentCount,
+    pendingCount: value.pendingCount,
+    failedCount: value.failedCount,
+    missingCompleteCount: value.missingCompleteCount,
+    validCompleteBytes: value.validCompleteBytes,
+    absentCells: Object.freeze(absentCells),
+  };
+}
+
+function emptyLocalRegionStatus(
+  request: LocalRegionStatusRequest,
+): LocalRegionStatusInventory {
+  const columns =
+    (request.bounds.maxXExclusive - request.bounds.minX) / TILE_SIZE_PIXELS;
+  const rows =
+    (request.bounds.maxZExclusive - request.bounds.minZ) / TILE_SIZE_PIXELS;
+  const totalCount = columns * rows * request.layers.length;
+  return Object.freeze({
+    result: Object.freeze({
+      version: 1,
+      dimension: "overworld",
+      lod: 0,
+      bounds: request.bounds,
+      layers: request.layers,
+      totalCount,
+      resolvedCount: 0,
+      completeCount: 0,
+      absentCount: 0,
+      pendingCount: 0,
+      failedCount: 0,
+      missingCount: totalCount,
+      percent: 0,
+      ready: false,
+      databaseUpdatedAt: null,
+      absentCells: Object.freeze([]),
+    }),
+    validCompleteBytes: 0,
+  });
+}
+
+async function queryLocalRegionStatus(
+  tileRoot: string,
+  pythonBin: string,
+  request: LocalRegionStatusRequest,
+  databaseUpdatedAt: string,
+): Promise<LocalRegionStatusInventory> {
+  const databasePath = resolve(tileRoot, "tiles.sqlite3");
+  const minTileX = request.bounds.minX / TILE_SIZE_PIXELS;
+  const minTileZ = request.bounds.minZ / TILE_SIZE_PIXELS;
+  const maxTileXExclusive =
+    request.bounds.maxXExclusive / TILE_SIZE_PIXELS;
+  const maxTileZExclusive =
+    request.bounds.maxZExclusive / TILE_SIZE_PIXELS;
+  const columns = maxTileXExclusive - minTileX;
+  const rows = maxTileZExclusive - minTileZ;
+  const totalCount = columns * rows * request.layers.length;
+  const payload = await new Promise<LocalRegionStatusQueryPayload>(
+    (resolvePromise, rejectPromise) => {
+      const child: ChildProcess = spawn(
+        pythonBin,
+        [
+          "-c",
+          LOCAL_REGION_STATUS_QUERY,
+          databasePath,
+          tileRoot,
+          String(minTileX),
+          String(minTileZ),
+          String(maxTileXExclusive),
+          String(maxTileZExclusive),
+          JSON.stringify(request.layers),
+          String(MAX_TILE_BYTES),
+        ],
+        {
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            NODE_ENV: process.env.NODE_ENV,
+            PATH: process.env.PATH,
+            LANG: process.env.LANG,
+            LC_ALL: process.env.LC_ALL,
+            VIRTUAL_ENV: process.env.VIRTUAL_ENV,
+            SSL_CERT_FILE: process.env.SSL_CERT_FILE,
+            REQUESTS_CA_BUNDLE: process.env.REQUESTS_CA_BUNDLE,
+            HTTP_PROXY: process.env.HTTP_PROXY,
+            HTTPS_PROXY: process.env.HTTPS_PROXY,
+            NO_PROXY: process.env.NO_PROXY,
+            PYTHONUNBUFFERED: "1",
+          },
+        },
+      );
+      const stdout: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderr = "";
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        callback();
+      };
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        finish(() =>
+          rejectPromise(
+            new Error("La lectura regional local superó el tiempo límite"),
+          ),
+        );
+      }, LOCAL_REGION_STATUS_QUERY_TIMEOUT_MS);
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdoutBytes += chunk.byteLength;
+        if (stdoutBytes > MAX_LOCAL_REGION_STATUS_BYTES) {
+          child.kill("SIGTERM");
+          finish(() =>
+            rejectPromise(
+              new Error("El estado regional local supera el tamaño permitido"),
+            ),
+          );
+          return;
+        }
+        stdout.push(chunk);
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        if (stderr.length < 4_096) stderr += chunk.toString("utf8");
+      });
+      child.once("error", (error) => {
+        finish(() => rejectPromise(error));
+      });
+      child.once("exit", (code) => {
+        finish(() => {
+          if (code !== 0) {
+            rejectPromise(
+              new Error(
+                stderr.trim() ||
+                  "No se pudo leer el estado regional del catálogo local",
+              ),
+            );
+            return;
+          }
+          try {
+            resolvePromise(
+              parseLocalRegionStatusQueryPayload(
+                JSON.parse(Buffer.concat(stdout).toString("utf8")) as unknown,
+                request,
+                totalCount,
+              ),
+            );
+          } catch (error) {
+            rejectPromise(
+              error instanceof Error
+                ? error
+                : new Error("El estado regional local no contiene JSON válido"),
+            );
+          }
+        });
+      });
+    },
+  );
+
+  const missingCount =
+    totalCount - payload.rowCount + payload.missingCompleteCount;
+  const resolvedCount = payload.completeCount + payload.absentCount;
+  const percent = (resolvedCount / totalCount) * 100;
+  const result: LocalRegionStatusResult = Object.freeze({
+    version: 1,
+    dimension: "overworld",
+    lod: 0,
+    bounds: request.bounds,
+    layers: request.layers,
+    totalCount,
+    resolvedCount,
+    completeCount: payload.completeCount,
+    absentCount: payload.absentCount,
+    pendingCount: payload.pendingCount,
+    failedCount: payload.failedCount,
+    missingCount,
+    percent,
+    ready:
+      resolvedCount === totalCount &&
+      payload.pendingCount === 0 &&
+      payload.failedCount === 0 &&
+      missingCount === 0,
+    databaseUpdatedAt,
+    absentCells: payload.absentCells,
+  });
+  return Object.freeze({
+    result,
+    validCompleteBytes: payload.validCompleteBytes,
+  });
+}
+
+function estimateRegionDownloadBytes(
+  inventory: LocalRegionStatusInventory,
+): number {
+  const { result, validCompleteBytes } = inventory;
+  const unresolvedCount =
+    result.pendingCount + result.failedCount + result.missingCount;
+  if (unresolvedCount === 0) return 0;
+  const observedAverage =
+    result.completeCount > 0
+      ? Math.ceil(validCompleteBytes / result.completeCount)
+      : DEFAULT_ESTIMATED_TILE_BYTES;
+  const estimatedTileBytes = Math.min(
+    MAX_ESTIMATED_TILE_BYTES,
+    Math.max(MIN_ESTIMATED_TILE_BYTES, observedAverage),
+  );
+  return Math.ceil(unresolvedCount * estimatedTileBytes * 1.2);
+}
+
 async function readCapacity(
   tileRoot: string | undefined,
   backingRoot: string | undefined,
@@ -869,7 +1503,59 @@ function publicJob(job: LocalJob | null) {
     finishedAt: job.finishedAt,
     exitCode: job.exitCode,
     message: job.message,
+    progress: job.progress,
   };
+}
+
+function parseJobProgressLine(
+  line: string,
+  expectedRequested: number,
+): LocalJobProgress | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(line) as unknown;
+  } catch {
+    return null;
+  }
+  if (
+    !isRecord(value) ||
+    value.type !== "region-download" ||
+    value.version !== 1 ||
+    value.requested !== expectedRequested ||
+    !isNonNegativeSafeInteger(value.processed) ||
+    !isNonNegativeSafeInteger(value.complete) ||
+    !isNonNegativeSafeInteger(value.absent) ||
+    !isNonNegativeSafeInteger(value.failed) ||
+    !isNonNegativeSafeInteger(value.reused) ||
+    !isNonNegativeSafeInteger(value.reusedAbsent) ||
+    !isNonNegativeSafeInteger(value.downloadedBytes) ||
+    typeof value.percent !== "number" ||
+    !Number.isFinite(value.percent) ||
+    value.percent < 0 ||
+    value.percent > 100 ||
+    (value.status !== "running" &&
+      value.status !== "complete" &&
+      value.status !== "error" &&
+    value.status !== "interrupted") ||
+    value.processed > expectedRequested ||
+    value.complete + value.absent + value.failed > expectedRequested ||
+    value.reused > value.complete ||
+    value.reusedAbsent > value.absent
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    requested: expectedRequested,
+    processed: value.processed,
+    complete: value.complete,
+    absent: value.absent,
+    failed: value.failed,
+    reused: value.reused,
+    reusedAbsent: value.reusedAbsent,
+    downloadedBytes: value.downloadedBytes,
+    percent: value.percent,
+    status: value.status,
+  });
 }
 
 function startRegionJob(
@@ -879,6 +1565,10 @@ function startRegionJob(
     Pick<LocalAtlasOptions, "tileRoot" | "pythonBin" | "projectRoot">
   >,
 ) {
+  const tileCount =
+    ((request.xMaxExclusive - request.xMin) / TILE_SIZE_PIXELS) *
+    ((request.zMaxExclusive - request.zMin) / TILE_SIZE_PIXELS) *
+    request.layers.length;
   const job: LocalJob = {
     id: randomUUID(),
     status: "running",
@@ -886,14 +1576,21 @@ function startRegionJob(
     startedAt: new Date().toISOString(),
     finishedAt: null,
     exitCode: null,
-    message: "Descargando la celda seleccionada",
+    message: "Descargando la región seleccionada",
+    progress: {
+      requested: tileCount,
+      processed: 0,
+      complete: 0,
+      absent: 0,
+      failed: 0,
+      reused: 0,
+      reusedAbsent: 0,
+      downloadedBytes: 0,
+      percent: 0,
+      status: "running",
+    },
   };
   const script = resolve(options.projectRoot, "download_region_2b2t.py");
-  const tileSpan = TILE_SIZE_PIXELS * 2 ** request.lod;
-  const tileCount =
-    ((request.xMaxExclusive - request.xMin) / tileSpan) *
-    ((request.zMaxExclusive - request.zMin) / tileSpan) *
-    request.layers.length;
   const workers = Math.max(
     1,
     Math.min(4, Math.ceil(request.requestsPerSecond)),
@@ -926,6 +1623,7 @@ function startRegionJob(
       "3",
       "--max-tiles",
       String(tileCount),
+      "--progress-jsonl",
     ],
     {
       cwd: options.projectRoot,
@@ -948,16 +1646,53 @@ function startRegionJob(
   state.job = job;
   state.child = child;
 
-  // Drain both pipes so a verbose Python failure can never block the process.
-  child.stdout.resume();
+  let stdoutBuffer = "";
+  const consumeProgressLine = (line: string) => {
+    const progress = parseJobProgressLine(line, tileCount);
+    if (
+      !progress ||
+      progress.processed < job.progress.processed ||
+      progress.complete < job.progress.complete ||
+      progress.absent < job.progress.absent ||
+      progress.failed < job.progress.failed ||
+      progress.reused < job.progress.reused ||
+      progress.reusedAbsent < job.progress.reusedAbsent ||
+      progress.downloadedBytes < job.progress.downloadedBytes
+    ) {
+      return;
+    }
+    job.progress = progress;
+    if (job.status === "running") {
+      job.message =
+        progress.processed === 0
+          ? "Preparando la descarga regional"
+          : `Descargando región · ${progress.percent.toFixed(1)}%`;
+    }
+  };
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdoutBuffer += chunk;
+    if (stdoutBuffer.length > 128 * 1024) {
+      stdoutBuffer = stdoutBuffer.slice(-64 * 1024);
+    }
+    let newline = stdoutBuffer.indexOf("\n");
+    while (newline !== -1) {
+      consumeProgressLine(stdoutBuffer.slice(0, newline).trim());
+      stdoutBuffer = stdoutBuffer.slice(newline + 1);
+      newline = stdoutBuffer.indexOf("\n");
+    }
+  });
+  // Drain stderr so verbose human diagnostics can never block the process.
   child.stderr.resume();
   child.once("error", () => {
     job.status = "error";
     job.finishedAt = new Date().toISOString();
     job.message = "No se pudo iniciar el descargador regional";
+    job.progress = { ...job.progress, status: "error" };
     state.child = null;
   });
   child.once("exit", (code, signal) => {
+    if (stdoutBuffer.trim()) consumeProgressLine(stdoutBuffer.trim());
     if (state.stopTimer) {
       clearTimeout(state.stopTimer);
       state.stopTimer = null;
@@ -967,12 +1702,15 @@ function startRegionJob(
     if (job.status === "stopping" || code === 130 || signal === "SIGINT") {
       job.status = "stopped";
       job.message = "Descarga regional detenida de forma segura";
+      job.progress = { ...job.progress, status: "interrupted" };
     } else if (code === 0) {
       job.status = "complete";
-      job.message = "Celda disponible en la biblioteca local";
+      job.message = "Región disponible en la biblioteca local";
+      job.progress = { ...job.progress, status: "complete" };
     } else {
       job.status = "error";
       job.message = "La descarga regional terminó con errores";
+      job.progress = { ...job.progress, status: "error" };
     }
     state.child = null;
   });
@@ -1115,6 +1853,18 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     { readonly fingerprint: string; readonly result: LocalCoverageResult }
   >();
   const coverageQueries = new Map<string, Promise<LocalCoverageResult>>();
+  const regionStatusCache = new Map<
+    string,
+    {
+      readonly fingerprint: string;
+      readonly checkedAt: number;
+      readonly inventory: LocalRegionStatusInventory;
+    }
+  >();
+  const regionStatusQueries = new Map<
+    string,
+    Promise<LocalRegionStatusInventory>
+  >();
 
   const readCachedLocalCoverage = async (
     lod: number,
@@ -1144,6 +1894,51 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     return query;
   };
 
+  const readCachedLocalRegionStatus = async (
+    request: LocalRegionStatusRequest,
+  ): Promise<LocalRegionStatusInventory> => {
+    if (!tileRoot) {
+      throw new Error("La biblioteca local no está configurada");
+    }
+    const requestKey = [
+      request.bounds.minX,
+      request.bounds.minZ,
+      request.bounds.maxXExclusive,
+      request.bounds.maxZExclusive,
+      request.layers.join(","),
+    ].join(":");
+    const snapshot = await readLocalCatalogSnapshot(tileRoot);
+    if (!snapshot) return emptyLocalRegionStatus(request);
+    const cached = regionStatusCache.get(requestKey);
+    if (
+      cached?.fingerprint === snapshot.fingerprint &&
+      Date.now() - cached.checkedAt < LOCAL_REGION_STATUS_CACHE_MS
+    ) {
+      return cached.inventory;
+    }
+    const existingQuery = regionStatusQueries.get(requestKey);
+    if (existingQuery) return existingQuery;
+    const query = queryLocalRegionStatus(
+      tileRoot,
+      pythonBin,
+      request,
+      snapshot.updatedAt,
+    )
+      .then((inventory) => {
+        regionStatusCache.set(requestKey, {
+          fingerprint: snapshot.fingerprint,
+          checkedAt: Date.now(),
+          inventory,
+        });
+        return inventory;
+      })
+      .finally(() => {
+        regionStatusQueries.delete(requestKey);
+      });
+    regionStatusQueries.set(requestKey, query);
+    return query;
+  };
+
   const middleware = async (
     request: IncomingMessage,
     response: ServerResponse,
@@ -1153,6 +1948,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     if (
       path !== STATUS_ENDPOINT &&
       path !== COVERAGE_ENDPOINT &&
+      path !== REGION_STATUS_ENDPOINT &&
       path !== DOWNLOAD_ENDPOINT &&
       path !== STOP_ENDPOINT &&
       path !== WORKSPACE_ENDPOINT &&
@@ -1163,6 +1959,32 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     }
 
     if (!requireLocalRequest(request, response)) return;
+
+    if (path === REGION_STATUS_ENDPOINT && request.method === "GET") {
+      const regionRequest = parseLocalRegionStatusRequest(request.url);
+      if (!regionRequest) {
+        writeJson(response, 400, {
+          error:
+            "Usa bounds LOD 0 alineados y layers=base[,overlay,newchunks]",
+        });
+        return;
+      }
+      if (!tileRoot) {
+        writeJson(response, 503, {
+          error: "La biblioteca local no está configurada",
+        });
+        return;
+      }
+      try {
+        const inventory = await readCachedLocalRegionStatus(regionRequest);
+        writeJson(response, 200, inventory.result);
+      } catch {
+        writeJson(response, 503, {
+          error: "No se pudo leer el estado regional del catálogo local",
+        });
+      }
+      return;
+    }
 
     if (path === COVERAGE_ENDPOINT && request.method === "GET") {
       const coverageRequest = parseLocalCoverageRequest(request.url);
@@ -1340,21 +2162,38 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
           backingRoot,
           requirementBytes,
         );
-        const tileSpan = TILE_SIZE_PIXELS * 2 ** region.lod;
-        const jobTiles =
-          ((region.xMaxExclusive - region.xMin) / tileSpan) *
-          ((region.zMaxExclusive - region.zMin) / tileSpan) *
-          region.layers.length;
-        const strictJobUpperBound = Math.ceil(
-          jobTiles * MAX_TILE_BYTES * 1.2,
-        );
+        let inventory: LocalRegionStatusInventory;
+        try {
+          inventory = await readCachedLocalRegionStatus({
+            bounds: {
+              minX: region.xMin,
+              minZ: region.zMin,
+              maxXExclusive: region.xMaxExclusive,
+              maxZExclusive: region.zMaxExclusive,
+            },
+            lod: 0,
+            layers: region.layers,
+          });
+        } catch {
+          writeJson(response, 503, {
+            error: "No se pudo comprobar el inventario regional local",
+          });
+          return;
+        }
+        const estimatedRequiredBytes =
+          estimateRegionDownloadBytes(inventory);
         if (
-          capacity.freeBytes === null ||
-          capacity.freeBytes < strictJobUpperBound
+          estimatedRequiredBytes > 0 &&
+          (capacity.freeBytes === null ||
+            capacity.freeBytes < estimatedRequiredBytes)
         ) {
           writeJson(response, 507, {
-            error: "No hay espacio verificado para esta celda",
-            requiredBytes: strictJobUpperBound,
+            error: "No hay espacio verificado para esta región",
+            requiredBytes: estimatedRequiredBytes,
+            unresolvedCount:
+              inventory.result.pendingCount +
+              inventory.result.failedCount +
+              inventory.result.missingCount,
           });
           return;
         }
@@ -1424,6 +2263,8 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     close() {
       coverageCache.clear();
       coverageQueries.clear();
+      regionStatusCache.clear();
+      regionStatusQueries.clear();
       if (state.stopTimer) clearTimeout(state.stopTimer);
       if (state.child) state.child.kill("SIGINT");
     },

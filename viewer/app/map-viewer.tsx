@@ -16,7 +16,6 @@ import {
   Eye,
   EyeOff,
   FolderOpen,
-  Gauge,
   Grid3X3,
   HardDrive,
   HelpCircle,
@@ -68,9 +67,9 @@ import {
   minimumSafeExplorationScale,
   moveCurrentCardinal,
   serializeExplorationState,
-  withCurrentCellReviewed,
-  withCurrentCellSkipped,
-  withCurrentIndex,
+  withCellsSkipped,
+  withCurrentCellVisited,
+  withVisitedIndex,
   type CardinalDirection,
   type ExplorationState,
   type WorldBounds,
@@ -95,17 +94,19 @@ import {
   type OverworldProgressStatus,
 } from "./lib/overworld-progress";
 import {
-  downloadExplorationCell,
-  isCompletedBaseCellRequest,
+  downloadExplorationRegion,
   LocalAtlasWorkspaceConflictError,
   localAtlasWorkspaceContent,
   parseLocalAtlasWorkspaceContent,
   parseLocalAtlasWorkspaceExplorations,
   readLocalAtlasCoverage,
+  readLocalAtlasRegionStatus,
   readLocalAtlasRuntime,
   readLocalAtlasWorkspace,
+  regionJobMatchesBounds,
   stopLocalRegionJob,
   writeLocalAtlasWorkspace,
+  type LocalAtlasRegionStatus,
   type LocalAtlasRuntime,
   type LocalAtlasCoverageSnapshot,
   type LocalAtlasWorkspaceContent,
@@ -144,6 +145,11 @@ const WORKSPACE_TAB_ID_SESSION_KEY = "obsidian-atlas-workspace-tab-id-v1";
 const COVERAGE_SELECTION_STORAGE_KEY =
   "obsidian-atlas-overworld-selection-v1";
 const COLORS = ["#ff5f57", "#ffbd4a", "#26d9c7", "#62a8ff", "#c58cff"];
+const REGIONAL_DOWNLOAD_LAYERS = [
+  "base",
+  "overlay",
+  "newchunks",
+] as const satisfies readonly TileLayer[];
 
 type Drawer =
   | "atlas"
@@ -198,6 +204,16 @@ type TileStats = {
   missing: number;
 };
 
+type ExplorationPlan = {
+  readonly state: ExplorationState;
+  readonly source: "new" | "restored" | "imported" | "legacy";
+};
+
+type RegionStatusSnapshot = {
+  readonly key: string;
+  readonly status: LocalAtlasRegionStatus;
+};
+
 type PersistenceState =
   | "checking"
   | "saving"
@@ -228,6 +244,15 @@ const activeBrowserWorkspaceBranches = new Set<string>();
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));
+}
+
+function boundsKey(bounds: WorldBounds): string {
+  return [
+    bounds.minX,
+    bounds.minZ,
+    bounds.maxXExclusive,
+    bounds.maxZExclusive,
+  ].join(":");
 }
 
 function parseBrowserWorkspaceRecovery(
@@ -788,9 +813,6 @@ export function MapViewer() {
   const [loadedTileKeys, setLoadedTileKeys] = useState<ReadonlySet<string>>(
     new Set(),
   );
-  const [missingTileKeys, setMissingTileKeys] = useState<ReadonlySet<string>>(
-    new Set(),
-  );
   const [renderVersion, setRenderVersion] = useState(0);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [selectedHighlightId, setSelectedHighlightId] = useState<string | null>(
@@ -799,6 +821,14 @@ export function MapViewer() {
   const [highlightsReady, setHighlightsReady] = useState(false);
   const [explorationState, setExplorationState] =
     useState<ExplorationState | null>(null);
+  const [explorationPlan, setExplorationPlan] =
+    useState<ExplorationPlan | null>(null);
+  const [regionStatusSnapshot, setRegionStatusSnapshot] =
+    useState<RegionStatusSnapshot | null>(null);
+  const [regionStatusLoading, setRegionStatusLoading] = useState(false);
+  const [regionStatusError, setRegionStatusError] = useState<string | null>(
+    null,
+  );
   const [confirmCloseExploration, setConfirmCloseExploration] =
     useState(false);
   const [pauseBusy, setPauseBusy] = useState(false);
@@ -865,20 +895,8 @@ export function MapViewer() {
     explorationState?.region.lod === MAX_DETAIL_EXPLORATION_LOD &&
     currentDetailKey !== null &&
     loadedTileKeys.has(currentDetailKey);
-  const currentDetailMissing =
-    currentDetailKey !== null && missingTileKeys.has(currentDetailKey);
   const activeExplorationIsMaxDetail =
     explorationState?.region.lod === MAX_DETAIL_EXPLORATION_LOD;
-  const currentDetailConfirmedAbsent =
-    activeExplorationIsMaxDetail &&
-    !currentDetailReady &&
-    currentDetailMissing &&
-    currentExplorationCell !== null &&
-    isCompletedBaseCellRequest(
-      localRuntime?.job ?? null,
-      currentExplorationCell.bounds,
-      MAX_DETAIL_EXPLORATION_LOD,
-    );
   const explorationMinimumScale =
     explorationState && !atlasMode
       ? minimumSafeExplorationScale(explorationState.region.tileSpan, viewSize)
@@ -886,17 +904,54 @@ export function MapViewer() {
   const currentCellSkipped =
     explorationState !== null &&
     isCellSkipped(explorationState, explorationState.currentIndex);
-  const canReviewCurrentCell =
-    Boolean(explorationState) &&
-    activeExplorationIsMaxDetail &&
-    currentDetailReady &&
-    !currentCellSkipped;
-  const canSkipCurrentCell =
-    activeExplorationIsMaxDetail &&
-    (currentDetailConfirmedAbsent || currentCellSkipped);
-  const currentDetailDownloading =
+  const regionStatusBounds =
+    explorationPlan?.state.region.bounds ??
+    (atlasMode || (!explorationState && drawer === "exploration")
+      ? coverageSelection?.bounds ?? null
+      : null);
+  const regionStatusKey = regionStatusBounds
+    ? boundsKey(regionStatusBounds)
+    : null;
+  const regionStatus =
+    regionStatusKey !== null && regionStatusSnapshot?.key === regionStatusKey
+      ? regionStatusSnapshot.status
+      : null;
+  const regionStatusDisplayError =
+    regionStatusBounds &&
+    runtimeChecked &&
+    !localRuntime?.capacity.configured
+      ? "La biblioteca local no está disponible"
+      : regionStatusError;
+  const anyRegionDownloadRunning =
     localRuntime?.job?.status === "running" ||
     localRuntime?.job?.status === "stopping";
+  const matchingRegionDownloadRunning =
+    Boolean(
+      anyRegionDownloadRunning &&
+        regionStatusBounds &&
+        regionJobMatchesBounds(localRuntime?.job ?? null, regionStatusBounds),
+    );
+  const anotherRegionDownloadRunning =
+    anyRegionDownloadRunning && !matchingRegionDownloadRunning;
+  const coverageRegionKey = coverageSelection
+    ? boundsKey(coverageSelection.bounds)
+    : null;
+  const coverageRegionStatus =
+    coverageRegionKey !== null &&
+    regionStatusSnapshot?.key === coverageRegionKey
+      ? regionStatusSnapshot.status
+      : null;
+  const coverageRegionDownloadRunning =
+    Boolean(
+      anyRegionDownloadRunning &&
+        coverageSelection &&
+        regionJobMatchesBounds(
+          localRuntime?.job ?? null,
+          coverageSelection.bounds,
+        ),
+    );
+  const coverageRegionBlockedByOther =
+    anyRegionDownloadRunning && !coverageRegionDownloadRunning;
   const reviewableCellCount = explorationState
     ? explorationState.region.cellCount - explorationState.skippedCount
     : 0;
@@ -927,13 +982,17 @@ export function MapViewer() {
   const workspaceContent = useMemo<LocalAtlasWorkspaceContent>(
     () => ({
       schemaVersion: 1,
-      activeExplorationId: explorationState?.region.id ?? null,
+      activeExplorationId:
+        explorationState?.region.id ??
+        explorationPlan?.state.region.id ??
+        null,
       explorations: savedExplorations,
       highlights,
       coverageSelection,
     }),
     [
       coverageSelection,
+      explorationPlan?.state.region.id,
       explorationState?.region.id,
       highlights,
       savedExplorations,
@@ -1085,7 +1144,6 @@ export function MapViewer() {
     tileCacheRef.current.clear();
     setTileStats({ local: 0, missing: 0 });
     setLoadedTileKeys(new Set());
-    setMissingTileKeys(new Set());
     setRenderVersion((version) => version + 1);
   }, []);
 
@@ -1153,7 +1211,7 @@ export function MapViewer() {
         notify("Ese punto queda fuera de la sesión activa");
         return false;
       }
-      const next = withCurrentIndex(explorationState, index);
+      const next = withVisitedIndex(explorationState, index);
       setExplorationState(next);
       focusExploration(next);
       return true;
@@ -1166,6 +1224,128 @@ export function MapViewer() {
       upsertWorkspaceExploration(items, state),
     );
   }, []);
+
+  const stageExplorationPlan = useCallback(
+    (
+      requestedState: ExplorationState,
+      source: ExplorationPlan["source"],
+    ) => {
+      const state =
+        requestedState.region.lod === MAX_DETAIL_EXPLORATION_LOD
+          ? requestedState
+          : createMaxDetailExplorationState({
+              id: `region-${Date.now().toString(36)}`,
+              name: `${requestedState.region.name} · LOD 0`,
+              bounds: requestedState.region.bounds,
+            });
+      const active = explorationStateRef.current;
+      if (active && active.region.id !== state.region.id) {
+        setSavedExplorations((items) =>
+          upsertWorkspaceExploration(items, active),
+        );
+      }
+      setSavedExplorations((items) =>
+        upsertWorkspaceExploration(items, state),
+      );
+      explorationStateRef.current = null;
+      setExplorationState(null);
+      setExplorationPlan({
+        state,
+        source:
+          requestedState.region.lod === MAX_DETAIL_EXPLORATION_LOD
+            ? source
+            : "legacy",
+      });
+      setRegionStatusSnapshot(null);
+      setRegionStatusError(null);
+      setConfirmCloseExploration(false);
+      setMarkMode(null);
+      clearTileCache();
+      setDrawer(
+        window.matchMedia("(max-width: 720px)").matches
+          ? null
+          : "exploration",
+      );
+    },
+    [clearTileCache],
+  );
+
+  const activateDownloadedExploration = useCallback(
+    (plan: ExplorationPlan, status: LocalAtlasRegionStatus) => {
+      if (!status.ready) return;
+      const absentIndexes: number[] = [];
+      for (const absent of status.absentCells) {
+        const index = cellIndexAtTile(
+          plan.state.region,
+          absent.tileX,
+          absent.tileZ,
+        );
+        if (index !== null) absentIndexes.push(index);
+      }
+      let next = withCellsSkipped(plan.state, absentIndexes);
+      next = withCurrentCellVisited(next);
+      explorationStateRef.current = next;
+      setExplorationState(next);
+      setExplorationPlan(null);
+      setRegionStatusSnapshot(null);
+      setRegionStatusError(null);
+      clearTileCache();
+      focusExploration(next);
+      setDrawer(
+        window.matchMedia("(max-width: 720px)").matches
+          ? null
+          : "exploration",
+      );
+      notify(
+        `${next.region.name} lista · la primera celda quedó explorada`,
+      );
+    },
+    [clearTileCache, focusExploration, notify],
+  );
+
+  const startRegionDownload = useCallback(
+    async (plan: ExplorationPlan) => {
+      if (!localRuntime?.capacity.configured) {
+        notify("Inicia el visor con la biblioteca local de LuisA");
+        return;
+      }
+      if (
+        localRuntime.job &&
+        (localRuntime.job.status === "running" ||
+          localRuntime.job.status === "stopping")
+      ) {
+        notify(
+          regionJobMatchesBounds(
+            localRuntime.job,
+            plan.state.region.bounds,
+          )
+            ? "La descarga completa de esta región ya está en curso"
+            : "Hay otra región descargándose; espera o detén ese trabajo",
+        );
+        return;
+      }
+      setRuntimeBusy(true);
+      try {
+        await downloadExplorationRegion(
+          localRuntime,
+          plan.state.region.bounds,
+          REGIONAL_DOWNLOAD_LAYERS,
+          requestsPerSecond,
+        );
+        setLocalRuntime(await readLocalAtlasRuntime());
+        notify("Descarga completa de la región iniciada");
+      } catch (error) {
+        notify(
+          error instanceof Error
+            ? error.message
+            : "No se pudo iniciar la descarga regional",
+        );
+      } finally {
+        setRuntimeBusy(false);
+      }
+    },
+    [localRuntime, notify, requestsPerSecond],
+  );
 
   useEffect(() => {
     workspaceContentRef.current = workspaceContent;
@@ -1229,7 +1409,7 @@ export function MapViewer() {
         const stored = window.localStorage.getItem(EXPLORATION_STORAGE_KEY);
         if (stored) {
           restoredExploration = deserializeExplorationState(stored);
-          setExplorationState(restoredExploration);
+          stageExplorationPlan(restoredExploration, "restored");
         }
       } catch {
         // Invalid or obsolete sessions are ignored instead of blocking the map.
@@ -1271,7 +1451,7 @@ export function MapViewer() {
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, []);
+  }, [stageExplorationPlan]);
 
   useEffect(() => {
     if (!highlightsReady) return;
@@ -1292,10 +1472,11 @@ export function MapViewer() {
   useEffect(() => {
     if (!explorationReady) return;
     try {
-      if (explorationState) {
+      const durableState = explorationState ?? explorationPlan?.state ?? null;
+      if (durableState) {
         window.localStorage.setItem(
           EXPLORATION_STORAGE_KEY,
-          serializeExplorationState(explorationState),
+          serializeExplorationState(durableState),
         );
       } else {
         window.localStorage.removeItem(EXPLORATION_STORAGE_KEY);
@@ -1307,7 +1488,7 @@ export function MapViewer() {
       );
       return () => window.clearTimeout(timeout);
     }
-  }, [explorationReady, explorationState, notify]);
+  }, [explorationPlan?.state, explorationReady, explorationState, notify]);
 
   useEffect(() => {
     if (!explorationReady) return;
@@ -1377,7 +1558,7 @@ export function MapViewer() {
           location.z,
         );
         if (index === null) return;
-        const next = withCurrentIndex(explorationState, index);
+        const next = withVisitedIndex(explorationState, index);
         setExplorationState(next);
         focusExploration(next);
         return;
@@ -1464,7 +1645,7 @@ export function MapViewer() {
           lastTerminalJobRef.current = terminalJob.id;
           clearTileCache();
           if (terminalJob.status === "complete") {
-            notify("La celda ya está disponible localmente");
+            notify("La región ya está disponible localmente");
           }
         }
       } catch {
@@ -1530,6 +1711,71 @@ export function MapViewer() {
       window.clearInterval(interval);
     };
   }, [localRuntime?.job?.id, localRuntime?.job?.status]);
+
+  useEffect(() => {
+    if (!regionStatusBounds || !localRuntime?.capacity.configured) {
+      return;
+    }
+    const key = boundsKey(regionStatusBounds);
+    const bounds = { ...regionStatusBounds };
+    const controller = new AbortController();
+    let reading = false;
+    let disposed = false;
+    const refresh = async () => {
+      if (reading) return;
+      reading = true;
+      setRegionStatusLoading(true);
+      try {
+        const status = await readLocalAtlasRegionStatus(
+          bounds,
+          REGIONAL_DOWNLOAD_LAYERS,
+          controller.signal,
+        );
+        if (disposed || controller.signal.aborted) return;
+        if (!status) {
+          throw new Error("La biblioteca no devolvió el estado de la región");
+        }
+        setRegionStatusSnapshot({ key, status });
+        setRegionStatusError(null);
+        if (
+          status.ready &&
+          explorationPlan &&
+          boundsKey(explorationPlan.state.region.bounds) === key
+        ) {
+          activateDownloadedExploration(explorationPlan, status);
+        }
+      } catch (error) {
+        if (disposed || controller.signal.aborted) return;
+        setRegionStatusError(
+          error instanceof Error
+            ? error.message
+            : "No se pudo comprobar la región",
+        );
+      } finally {
+        if (!disposed) setRegionStatusLoading(false);
+        reading = false;
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(
+      () => void refresh(),
+      anyRegionDownloadRunning ? 2_500 : 15_000,
+    );
+    return () => {
+      disposed = true;
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [
+    activateDownloadedExploration,
+    anyRegionDownloadRunning,
+    explorationPlan,
+    localRuntime?.capacity.configured,
+    localRuntime?.job?.id,
+    localRuntime?.job?.status,
+    regionStatusBounds,
+    regionStatusKey,
+  ]);
 
   const flushWorkspace = useCallback(async (): Promise<boolean> => {
     const inFlight = workspaceSavePromiseRef.current;
@@ -1827,8 +2073,12 @@ export function MapViewer() {
             ]);
             setHighlights(recoveredHighlights);
             setCoverageSelection(browserRecovery.content.coverageSelection);
-            setExplorationState(recoveredExploration);
-            if (recoveredExploration) focusExploration(recoveredExploration);
+            if (recoveredExploration) {
+              stageExplorationPlan(recoveredExploration, "restored");
+            } else {
+              setExplorationPlan(null);
+              setExplorationState(null);
+            }
             setWorkspaceReady(true);
             if (!runtime.persistence.writable && baseMatchesDisk) {
               setPersistenceState("readonly");
@@ -1946,8 +2196,12 @@ export function MapViewer() {
         setSavedExplorations([...diskWorkspace.explorations]);
         setHighlights(restoredHighlights);
         setCoverageSelection(diskWorkspace.coverageSelection);
-        setExplorationState(restoredExploration);
-        if (restoredExploration) focusExploration(restoredExploration);
+        if (restoredExploration) {
+          stageExplorationPlan(restoredExploration, "restored");
+        } else {
+          setExplorationPlan(null);
+          setExplorationState(null);
+        }
         setWorkspaceReady(true);
         if (runtime.persistence.writable) {
           setPersistenceState("saved");
@@ -1992,9 +2246,11 @@ export function MapViewer() {
               setSavedExplorations([...recovery.content.explorations]);
               setHighlights(recoveredHighlights);
               setCoverageSelection(recovery.content.coverageSelection);
-              setExplorationState(recoveredExploration);
               if (recoveredExploration) {
-                focusExploration(recoveredExploration);
+                stageExplorationPlan(recoveredExploration, "restored");
+              } else {
+                setExplorationPlan(null);
+                setExplorationState(null);
               }
               setWorkspaceReady(true);
               setPersistenceState("conflict");
@@ -2029,13 +2285,13 @@ export function MapViewer() {
   }, [
     coverageSelectionReady,
     explorationReady,
-    focusExploration,
     flushWorkspace,
     highlightsReady,
     runtimeMutationToken,
     runtimePersistenceConfigured,
     runtimePersistenceWritable,
     runtimeChecked,
+    stageExplorationPlan,
     workspaceBranchReady,
   ]);
 
@@ -2105,12 +2361,6 @@ export function MapViewer() {
         }
         tileCacheRef.current.set(cacheKey, record);
         if (record.status === "loaded" && record.source) {
-          setMissingTileKeys((current) => {
-            if (!current.has(cacheKey)) return current;
-            const next = new Set(current);
-            next.delete(cacheKey);
-            return next;
-          });
           setLoadedTileKeys((current) => {
             if (current.has(cacheKey)) return current;
             const next = new Set(current);
@@ -2119,15 +2369,9 @@ export function MapViewer() {
           });
           setTileStats((stats) => ({
             ...stats,
-            [record.source!]: stats[record.source!] + 1,
-          }));
+              [record.source!]: stats[record.source!] + 1,
+            }));
         } else if (record.status === "missing") {
-          setMissingTileKeys((current) => {
-            if (current.has(cacheKey)) return current;
-            const next = new Set(current);
-            next.add(cacheKey);
-            return next;
-          });
           setLoadedTileKeys((current) => {
             if (!current.has(cacheKey)) return current;
             const next = new Set(current);
@@ -2915,6 +3159,16 @@ export function MapViewer() {
 
   const commitCoverageSelection = useCallback(
     (selection: OverworldCoverageSelection) => {
+      const nextKey = boundsKey(selection.bounds);
+      setExplorationPlan((current) =>
+        current && boundsKey(current.state.region.bounds) === nextKey
+          ? current
+          : null,
+      );
+      setRegionStatusSnapshot((current) =>
+        current?.key === nextKey ? current : null,
+      );
+      setRegionStatusError(null);
       setCoverageSelection(selection);
       setCoveragePreview(null);
       applyCoverageSelectionToRegion(selection);
@@ -3018,7 +3272,7 @@ export function MapViewer() {
         notify(
           "El workspace alcanzó el límite de 128 sesiones; exporta una antes de crear otra",
         );
-        return;
+        return null;
       }
       try {
         const next = createMaxDetailExplorationState({
@@ -3026,37 +3280,24 @@ export function MapViewer() {
           name: name.trim() || "Región de análisis",
           bounds,
         });
-        const replacedActiveExploration = explorationState !== null;
-        if (explorationState) archiveExploration(explorationState);
-        setExplorationState(next);
-        focusExploration(next);
-        setConfirmCloseExploration(false);
-        setMarkMode(null);
+        stageExplorationPlan(next, "new");
         atlasReturnViewRef.current = null;
-        clearTileCache();
-        setDrawer(
-          window.matchMedia("(max-width: 720px)").matches
-            ? null
-            : "exploration",
-        );
         notify(
-          replacedActiveExploration
-            ? `${next.region.cellCount.toLocaleString("es-GT")} celdas · sesión anterior guardada`
-            : `${next.region.cellCount.toLocaleString("es-GT")} celdas · LOD 0 · usa las flechas`,
+          `${next.region.cellCount.toLocaleString("es-GT")} celdas · comprobando descarga completa`,
         );
+        return next;
       } catch (error) {
         notify(
           error instanceof Error ? error.message : "La región no es válida",
         );
+        return null;
       }
     },
     [
-      archiveExploration,
-      clearTileCache,
       explorationState,
-      focusExploration,
       notify,
       savedExplorations,
+      stageExplorationPlan,
     ],
   );
 
@@ -3079,17 +3320,9 @@ export function MapViewer() {
         bounds: explorationState.region.bounds,
       });
       archiveExploration(explorationState);
-      setExplorationState(next);
-      focusExploration(next);
-      setConfirmCloseExploration(false);
-      clearTileCache();
-      setDrawer(
-        window.matchMedia("(max-width: 720px)").matches
-          ? null
-          : "exploration",
-      );
+      stageExplorationPlan(next, "legacy");
       notify(
-        `Versión LOD 0 creada · la sesión heredada se conservó sin cambios`,
+        `Versión LOD 0 preparada · completa la descarga regional para abrirla`,
       );
     } catch (error) {
       notify(
@@ -3101,11 +3334,10 @@ export function MapViewer() {
   }, [
     activeExplorationIsMaxDetail,
     archiveExploration,
-    clearTileCache,
     explorationState,
-    focusExploration,
     notify,
     savedExplorations,
+    stageExplorationPlan,
   ]);
 
   const startCoverageSelection = useCallback(() => {
@@ -3116,16 +3348,31 @@ export function MapViewer() {
       );
       return;
     }
+    if (!coverageRegionStatus || regionStatusLoading) {
+      notify("Espera a que termine la comprobación local de la región");
+      return;
+    }
     const name =
       coverageSelection.cellCount === 1
         ? `Sector F${coverageSelection.minRow + 1} · C${coverageSelection.minColumn + 1}`
         : `Región ${coverageSelection.rows}×${coverageSelection.columns}`;
-    startMaxDetailExploration(coverageSelection.bounds, name);
+    const next = startMaxDetailExploration(coverageSelection.bounds, name);
+    if (!next) return;
+    const plan: ExplorationPlan = { state: next, source: "new" };
+    if (coverageRegionStatus.ready) {
+      activateDownloadedExploration(plan, coverageRegionStatus);
+    } else {
+      void startRegionDownload(plan);
+    }
   }, [
+    activateDownloadedExploration,
     coverageSelection,
     coverageSelectionTooLarge,
+    coverageRegionStatus,
     notify,
+    regionStatusLoading,
     selectedLod0CellCount,
+    startRegionDownload,
     startMaxDetailExploration,
   ]);
 
@@ -3438,7 +3685,7 @@ export function MapViewer() {
             point.z,
           );
           if (index !== null) {
-            const next = withCurrentIndex(explorationState, index);
+            const next = withVisitedIndex(explorationState, index);
             setExplorationState(next);
             focusExploration(next);
           }
@@ -3511,7 +3758,7 @@ export function MapViewer() {
         notify("Esa ubicación queda fuera de la sesión activa");
         return;
       }
-      const next = withCurrentIndex(explorationState, index);
+      const next = withVisitedIndex(explorationState, index);
       setExplorationState(next);
       focusExploration(next);
       notify(`Celda centrada en ${Math.round(result.x)}, ${Math.round(result.z)}`);
@@ -3893,16 +4140,10 @@ export function MapViewer() {
           "El workspace alcanzó el límite de 128 sesiones; exporta una antes de importar otra",
         );
       }
-      if (explorationState) archiveExploration(explorationState);
-      setExplorationState(next);
-      focusExploration(next);
-      clearTileCache();
-      setDrawer(
-        window.matchMedia("(max-width: 720px)").matches
-          ? null
-          : "exploration",
+      stageExplorationPlan(next, "imported");
+      notify(
+        `${next.reviewedCount.toLocaleString("es-GT")} celdas restauradas · verificando descarga regional`,
       );
-      notify(`${next.reviewedCount.toLocaleString("es-GT")} celdas restauradas`);
     } catch (error) {
       notify(
         error instanceof Error ? error.message : "Sesión de exploración inválida",
@@ -3914,17 +4155,9 @@ export function MapViewer() {
     exploration: LocalAtlasWorkspaceExploration,
   ) => {
     try {
-      if (explorationState) archiveExploration(explorationState);
       const next = explorationStateFromWorkspace(exploration);
-      setExplorationState(next);
-      focusExploration(next);
-      clearTileCache();
-      setDrawer(
-        window.matchMedia("(max-width: 720px)").matches
-          ? null
-          : "exploration",
-      );
-      notify(`Sesión “${next.region.name}” restaurada`);
+      stageExplorationPlan(next, "restored");
+      notify(`Verificando la descarga completa de “${next.region.name}”`);
     } catch {
       notify("La sesión guardada ya no es compatible");
     }
@@ -3947,66 +4180,13 @@ export function MapViewer() {
     notify(`Sesión “${exploration.state.region.name}” eliminada`);
   };
 
-  const toggleCurrentReviewed = () => {
-    if (!canReviewCurrentCell) return;
-    setExplorationState((current) =>
-      current
-        ? withCurrentCellReviewed(
-            current,
-            !isCellReviewed(current, current.currentIndex),
-          )
-        : current,
-    );
-  };
-
-  const toggleCurrentSkipped = () => {
-    if (!canSkipCurrentCell) return;
-    setExplorationState((current) =>
-      current
-        ? withCurrentCellSkipped(
-            current,
-            !isCellSkipped(current, current.currentIndex),
-          )
-        : current,
-    );
-  };
-
-  const downloadCurrentCell = async () => {
-    if (!localRuntime?.capacity.configured || !currentExplorationCell) {
-      notify("Inicia el visor con la biblioteca local de LuisA");
+  const continueExplorationPlan = () => {
+    if (!explorationPlan || !regionStatus || regionStatusLoading) return;
+    if (regionStatus.ready) {
+      activateDownloadedExploration(explorationPlan, regionStatus);
       return;
     }
-    if (!activeExplorationIsMaxDetail) {
-      notify("Crea una versión LOD 0 para descargar o revisar esta región");
-      return;
-    }
-    if (currentDetailConfirmedAbsent || currentCellSkipped) {
-      notify("La fuente ya confirmó que este tile no existe");
-      return;
-    }
-    const selectedLayers: TileLayer[] = [
-      "base",
-      ...layers
-        .filter((layer) => layer.id !== "base" && layer.visible)
-        .map((layer) => layer.id),
-    ];
-    setRuntimeBusy(true);
-    try {
-      await downloadExplorationCell(
-        localRuntime,
-        currentExplorationCell.bounds,
-        selectedLayers,
-        requestsPerSecond,
-      );
-      setLocalRuntime(await readLocalAtlasRuntime());
-      notify("Descarga regional iniciada");
-    } catch (error) {
-      notify(
-        error instanceof Error ? error.message : "No se pudo iniciar la celda",
-      );
-    } finally {
-      setRuntimeBusy(false);
-    }
+    void startRegionDownload(explorationPlan);
   };
 
   const stopCurrentJob = async () => {
@@ -4326,8 +4506,8 @@ export function MapViewer() {
                   <span className="coverage-overview-status">33 × 33</span>
                 </div>
                 <p>
-                  Elige una región y explórala celda por celda. Cada sesión
-                  nueva usa siempre el detalle original LOD 0.
+                  Elige una región, descárgala completa y después recórrela
+                  celda por celda con el detalle original LOD 0.
                 </p>
                 {explorationState ? (
                   <button
@@ -4365,18 +4545,34 @@ export function MapViewer() {
                   </div>
                   <button
                     type="button"
-                    disabled={coverageSelectionTooLarge}
+                    disabled={
+                      coverageSelectionTooLarge ||
+                      regionStatusLoading ||
+                      !coverageRegionStatus ||
+                      coverageRegionBlockedByOther ||
+                      coverageRegionDownloadRunning
+                    }
                     title={
                       coverageSelectionTooLarge
-                        ? "Reduce la región para mantener una sesión segura"
-                        : explorationState
-                          ? "Guardar la sesión actual e iniciar esta región"
-                          : "Iniciar la región en máximo detalle"
+                        ? "Reduce la región para mantener una descarga segura"
+                        : coverageRegionStatus?.ready
+                          ? "Abrir la región ya descargada"
+                          : "Descargar las tres capas de toda la región"
                     }
                     onClick={startCoverageSelection}
                   >
-                    <ScanSearch size={15} />
-                    Explorar esta región
+                    {coverageRegionStatus?.ready ? (
+                      <ScanSearch size={15} />
+                    ) : (
+                      <Download size={15} />
+                    )}
+                    {coverageRegionDownloadRunning
+                      ? "Descargando región…"
+                      : coverageRegionStatus?.ready
+                        ? "Explorar región"
+                        : (coverageRegionStatus?.resolvedCount ?? 0) > 0
+                          ? "Reanudar descarga"
+                          : "Descargar región completa"}
                   </button>
                   {coverageSelectionTooLarge ? (
                     <small className="atlas-selection-warning">
@@ -4386,7 +4582,22 @@ export function MapViewer() {
                     </small>
                   ) : explorationState ? (
                     <small>La sesión actual se guardará automáticamente.</small>
-                  ) : null}
+                  ) : regionStatusDisplayError ? (
+                    <small className="atlas-selection-warning">
+                      {regionStatusDisplayError}
+                    </small>
+                  ) : coverageRegionStatus ? (
+                    <small>
+                      {coverageRegionStatus.resolvedCount.toLocaleString(
+                        "es-GT",
+                      )}{" "}
+                      /{" "}
+                      {coverageRegionStatus.totalCount.toLocaleString("es-GT")}{" "}
+                      archivos resueltos · 3 capas
+                    </small>
+                  ) : (
+                    <small>Comprobando archivos locales…</small>
+                  )}
                 </section>
               ) : null}
 
@@ -4822,8 +5033,8 @@ export function MapViewer() {
                   <span className="coverage-overview-status">33 × 33</span>
                 </div>
                 <p>
-                  Abre el mapa completo, selecciona una región e inicia su
-                  recorrido directamente en LOD 0.
+                  Abre el mapa completo, selecciona una región y guarda sus tres
+                  capas antes de iniciar el recorrido en LOD 0.
                 </p>
                 {atlasProgress ? (
                   <>
@@ -4938,18 +5149,34 @@ export function MapViewer() {
                       <button
                         type="button"
                         data-primary="true"
-                        disabled={coverageSelectionTooLarge}
+                        disabled={
+                          coverageSelectionTooLarge ||
+                          regionStatusLoading ||
+                          !coverageRegionStatus ||
+                          coverageRegionBlockedByOther ||
+                          coverageRegionDownloadRunning
+                        }
                         title={
                           coverageSelectionTooLarge
-                            ? "Reduce la selección para iniciar LOD 0"
-                            : explorationState
-                              ? "Guardar la sesión actual e iniciar esta región"
-                              : "Crear una sesión LOD 0 y abrir su primera celda"
+                            ? "Reduce la selección para descargarla en LOD 0"
+                            : coverageRegionStatus?.ready
+                              ? "Abrir la región ya descargada"
+                              : "Descargar las tres capas de toda la región"
                         }
                         onClick={startCoverageSelection}
                       >
-                        <ScanSearch size={15} />
-                        Explorar esta región
+                        {coverageRegionStatus?.ready ? (
+                          <ScanSearch size={15} />
+                        ) : (
+                          <Download size={15} />
+                        )}
+                        {coverageRegionDownloadRunning
+                          ? "Descargando región…"
+                          : coverageRegionStatus?.ready
+                            ? "Explorar región"
+                            : (coverageRegionStatus?.resolvedCount ?? 0) > 0
+                              ? "Reanudar descarga"
+                              : "Descargar región completa"}
                       </button>
                     </div>
                     {explorationState && !coverageSelectionTooLarge ? (
@@ -5198,82 +5425,242 @@ export function MapViewer() {
 
               {!explorationState ? (
                 <>
-                  <details className="manual-region-details">
-                    <summary>
-                      <SquareDashedMousePointer size={17} />
-                      <span>
-                        <strong>Definir otra región</strong>
-                        <small>Dibujo, vista actual o coordenadas exactas</small>
-                      </span>
-                    </summary>
-                    <div className="manual-region-content">
-                      <div className="region-actions">
-                        <button
-                          type="button"
-                          onClick={() => beginMarkMode("region")}
-                        >
-                          <SquareMousePointer size={16} />
-                          Dibujar región
-                        </button>
-                        <button type="button" onClick={useCurrentViewForRegion}>
-                          <Crosshair size={16} />
-                          Usar vista
-                        </button>
+                  {explorationPlan ? (
+                    <section
+                      className="region-download-gate"
+                      data-state={
+                        regionStatus?.ready
+                          ? "ready"
+                          : matchingRegionDownloadRunning
+                            ? "running"
+                            : regionStatusDisplayError
+                              ? "error"
+                              : "pending"
+                      }
+                    >
+                      <div className="region-download-gate-heading">
+                        <span className="region-download-gate-icon">
+                          {regionStatus?.ready ? (
+                            <CheckCircle2 size={20} />
+                          ) : (
+                            <Download size={20} />
+                          )}
+                        </span>
+                        <div>
+                          <span>DESCARGA OBLIGATORIA · 3 CAPAS</span>
+                          <h3>{explorationPlan.state.region.name}</h3>
+                        </div>
+                        <strong>
+                          {regionStatus
+                            ? `${formatProgressPercent(regionStatus.percent)}%`
+                            : "—"}
+                        </strong>
                       </div>
-                      <label className="region-name-field">
-                        <span>Nombre</span>
-                        <input
-                          value={regionForm.name}
-                          maxLength={200}
-                          onChange={(event) =>
-                            setRegionForm((current) => ({
-                              ...current,
-                              name: event.target.value,
-                            }))
-                          }
+                      <p>
+                        {regionStatusLoading && !regionStatus
+                          ? "Comprobando cada archivo de la región…"
+                          : regionStatusDisplayError
+                            ? regionStatusDisplayError
+                            : matchingRegionDownloadRunning
+                              ? localRuntime?.job?.message ??
+                                "Descargando toda la región…"
+                              : regionStatus?.ready
+                                ? "La región completa está guardada. Ya puede abrirse."
+                                : "La exploración se habilita cuando toda el área queda resuelta localmente."}
+                      </p>
+                      <div
+                        className="region-download-progress"
+                        role="progressbar"
+                        aria-label="Descarga completa de la región"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={regionStatus?.percent ?? 0}
+                      >
+                        <span
+                          style={{ width: `${regionStatus?.percent ?? 0}%` }}
                         />
-                      </label>
-                      <div className="region-coordinate-grid">
-                        {(
-                          [
-                            ["minX", "X mínima"],
-                            ["minZ", "Z mínima"],
-                            ["maxXExclusive", "X máxima"],
-                            ["maxZExclusive", "Z máxima"],
-                          ] as const
-                        ).map(([field, label]) => (
-                          <label key={field}>
-                            <span>{label}</span>
-                            <input
-                              inputMode="numeric"
-                              value={regionForm[field]}
-                              onChange={(event) =>
-                                setRegionForm((current) => ({
-                                  ...current,
-                                  [field]: event.target.value,
-                                }))
-                              }
-                            />
-                          </label>
-                        ))}
                       </div>
-                      <div className="fixed-zoom-card">
-                        <LockKeyhole size={17} />
+                      <div className="region-download-metrics">
                         <span>
-                          <strong>Detalle original garantizado</strong>
-                          <small>LOD 0 · 512 bloques por celda</small>
+                          Resueltos
+                          <strong>
+                            {regionStatus?.resolvedCount.toLocaleString(
+                              "es-GT",
+                            ) ?? "—"}
+                          </strong>
+                        </span>
+                        <span>
+                          Faltantes
+                          <strong>
+                            {regionStatus?.missingCount.toLocaleString(
+                              "es-GT",
+                            ) ?? "—"}
+                          </strong>
+                        </span>
+                        <span>
+                          Sin imagen
+                          <strong>
+                            {regionStatus?.absentCount.toLocaleString(
+                              "es-GT",
+                            ) ?? "—"}
+                          </strong>
                         </span>
                       </div>
+                      {(regionStatus?.failedCount ?? 0) > 0 ? (
+                        <p className="region-download-warning" role="alert">
+                          <AlertTriangle size={14} />
+                          {regionStatus?.failedCount.toLocaleString("es-GT")}{" "}
+                          archivos fallaron; reanuda para volver a intentarlos.
+                        </p>
+                      ) : null}
+                      <label className="region-download-rate">
+                        <span>Ritmo seguro</span>
+                        <select
+                          value={requestsPerSecond}
+                          disabled={
+                            matchingRegionDownloadRunning ||
+                            anotherRegionDownloadRunning ||
+                            regionStatus?.ready
+                          }
+                          onChange={(event) =>
+                            setRequestsPerSecond(Number(event.target.value))
+                          }
+                        >
+                          <option value="0.25">0.25 req/s</option>
+                          <option value="0.5">0.5 req/s</option>
+                          <option value="1">1 req/s</option>
+                          <option value="2">2 req/s</option>
+                        </select>
+                      </label>
+                      {matchingRegionDownloadRunning ? (
+                        <button
+                          type="button"
+                          className="stop-job-button"
+                          disabled={runtimeBusy}
+                          onClick={stopCurrentJob}
+                        >
+                          <X size={16} />
+                          Detener descarga
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="primary-button region-download-primary"
+                          disabled={
+                            runtimeBusy ||
+                            regionStatusLoading ||
+                            !regionStatus ||
+                            anotherRegionDownloadRunning ||
+                            !localRuntime?.capacity.configured
+                          }
+                          onClick={continueExplorationPlan}
+                        >
+                          {regionStatus?.ready ? (
+                            <Navigation size={17} />
+                          ) : (
+                            <Download size={17} />
+                          )}
+                          {anotherRegionDownloadRunning
+                            ? "Otra región en descarga"
+                            : regionStatus?.ready
+                              ? "Explorar región"
+                              : (regionStatus?.resolvedCount ?? 0) > 0
+                                ? "Reanudar descarga"
+                                : "Descargar región completa"}
+                        </button>
+                      )}
                       <button
                         type="button"
-                        className="primary-button"
-                        onClick={startExploration}
+                        className="region-download-cancel"
+                        disabled={matchingRegionDownloadRunning}
+                        onClick={() => {
+                          setExplorationPlan(null);
+                          viewFullCoverage();
+                        }}
                       >
-                        <Navigation size={17} />
-                        Iniciar en LOD 0
+                        Elegir otra región
                       </button>
-                    </div>
-                  </details>
+                    </section>
+                  ) : (
+                    <details className="manual-region-details">
+                      <summary>
+                        <SquareDashedMousePointer size={17} />
+                        <span>
+                          <strong>Definir otra región</strong>
+                          <small>
+                            Dibujo, vista actual o coordenadas exactas
+                          </small>
+                        </span>
+                      </summary>
+                      <div className="manual-region-content">
+                        <div className="region-actions">
+                          <button
+                            type="button"
+                            onClick={() => beginMarkMode("region")}
+                          >
+                            <SquareMousePointer size={16} />
+                            Dibujar región
+                          </button>
+                          <button type="button" onClick={useCurrentViewForRegion}>
+                            <Crosshair size={16} />
+                            Usar vista
+                          </button>
+                        </div>
+                        <label className="region-name-field">
+                          <span>Nombre</span>
+                          <input
+                            value={regionForm.name}
+                            maxLength={200}
+                            onChange={(event) =>
+                              setRegionForm((current) => ({
+                                ...current,
+                                name: event.target.value,
+                              }))
+                            }
+                          />
+                        </label>
+                        <div className="region-coordinate-grid">
+                          {(
+                            [
+                              ["minX", "X mínima"],
+                              ["minZ", "Z mínima"],
+                              ["maxXExclusive", "X máxima"],
+                              ["maxZExclusive", "Z máxima"],
+                            ] as const
+                          ).map(([field, label]) => (
+                            <label key={field}>
+                              <span>{label}</span>
+                              <input
+                                inputMode="numeric"
+                                value={regionForm[field]}
+                                onChange={(event) =>
+                                  setRegionForm((current) => ({
+                                    ...current,
+                                    [field]: event.target.value,
+                                  }))
+                                }
+                              />
+                            </label>
+                          ))}
+                        </div>
+                        <div className="fixed-zoom-card">
+                          <LockKeyhole size={17} />
+                          <span>
+                            <strong>Detalle original garantizado</strong>
+                            <small>LOD 0 · 512 bloques por celda</small>
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="primary-button"
+                          onClick={startExploration}
+                        >
+                          <Download size={17} />
+                          Preparar descarga regional
+                        </button>
+                      </div>
+                    </details>
+                  )}
                   <button
                     type="button"
                     className="secondary-button"
@@ -5305,7 +5692,7 @@ export function MapViewer() {
                     </div>
                     <div className="exploration-summary-grid">
                       <span>
-                        Revisadas
+                        Exploradas
                         <strong>
                           {explorationState.reviewedCount.toLocaleString("es-GT")}
                         </strong>
@@ -5356,35 +5743,24 @@ export function MapViewer() {
                               ? "absent"
                             : currentDetailReady
                               ? "ready"
-                              : currentDetailConfirmedAbsent
-                                ? "absent"
-                              : currentDetailDownloading
-                                ? "loading"
-                                : "missing"
+                              : "loading"
                         }
                       >
                         {activeExplorationIsMaxDetail ? (
                           currentCellSkipped ? (
                             <>
                               <CheckCircle2 size={15} />
-                              Celda omitida por ausencia confirmada en la fuente
+                              Sin imagen confirmada (404) · excluida del recorrido
                             </>
                           ) : currentDetailReady ? (
                             <>
                               <CheckCircle2 size={15} />
-                              LOD 0 local listo para revisar
-                            </>
-                          ) : currentDetailConfirmedAbsent ? (
-                            <>
-                              <CheckCircle2 size={15} />
-                              La fuente confirmó que este tile no existe (404)
+                              Celda explorada automáticamente · LOD 0 local
                             </>
                           ) : (
                             <>
-                              <Download size={15} />
-                              {currentDetailDownloading
-                                ? "Descargando el detalle LOD 0…"
-                                : "Descarga esta celda antes de revisarla"}
+                              <RotateCcw size={15} />
+                              Cargando desde la región ya descargada…
                             </>
                           )
                         ) : (
@@ -5405,41 +5781,6 @@ export function MapViewer() {
                           Crear versión en LOD 0
                         </button>
                       ) : null}
-                      <button
-                        type="button"
-                        className={`review-toggle ${
-                          isCellReviewed(
-                            explorationState,
-                            explorationState.currentIndex,
-                          )
-                            ? "reviewed"
-                            : ""
-                        }`}
-                        disabled={
-                          !canReviewCurrentCell && !canSkipCurrentCell
-                        }
-                        onClick={
-                          canSkipCurrentCell
-                            ? toggleCurrentSkipped
-                            : toggleCurrentReviewed
-                        }
-                      >
-                        <CheckCircle2 size={17} />
-                        {currentCellSkipped
-                          ? "Restaurar celda al recorrido"
-                          : currentDetailConfirmedAbsent
-                            ? "Omitir celda sin datos"
-                            : isCellReviewed(
-                          explorationState,
-                          explorationState.currentIndex,
-                        )
-                          ? "Celda revisada"
-                          : !activeExplorationIsMaxDetail
-                            ? "Solo lectura · crea versión LOD 0"
-                            : canReviewCurrentCell
-                              ? "Marcar como revisada"
-                              : "Esperando detalle LOD 0"}
-                      </button>
                       <div
                         className="direction-pad direction-pad-inline"
                         aria-label="Mover a una celda vecina"
@@ -5514,84 +5855,6 @@ export function MapViewer() {
                       </small>
                     </section>
                   )}
-
-                  <section className="regional-download-card">
-                    <div className="regional-download-heading">
-                      <Gauge size={18} />
-                      <div>
-                        <span>DATOS BAJO DEMANDA</span>
-                        <strong>
-                          {localRuntime?.job?.status === "running" ||
-                          localRuntime?.job?.status === "stopping"
-                            ? localRuntime.job.message
-                            : "Guardar únicamente esta celda"}
-                        </strong>
-                      </div>
-                    </div>
-                    <label>
-                      <span>Ritmo seguro</span>
-                      <select
-                        value={requestsPerSecond}
-                        disabled={
-                          !activeExplorationIsMaxDetail ||
-                          currentDetailConfirmedAbsent ||
-                          currentCellSkipped ||
-                          localRuntime?.job?.status === "running" ||
-                          localRuntime?.job?.status === "stopping"
-                        }
-                        onChange={(event) =>
-                          setRequestsPerSecond(Number(event.target.value))
-                        }
-                      >
-                        <option value="0.25">0.25 req/s</option>
-                        <option value="0.5">0.5 req/s</option>
-                        <option value="1">1 req/s</option>
-                        <option value="2">2 req/s</option>
-                      </select>
-                    </label>
-                    {localRuntime?.job?.status === "running" ||
-                    localRuntime?.job?.status === "stopping" ? (
-                      <button
-                        type="button"
-                        className="stop-job-button"
-                        disabled={runtimeBusy}
-                        onClick={stopCurrentJob}
-                      >
-                        <X size={16} />
-                        Detener celda
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        className="primary-button"
-                        disabled={
-                          runtimeBusy ||
-                          !activeExplorationIsMaxDetail ||
-                          currentDetailConfirmedAbsent ||
-                          currentCellSkipped ||
-                          !localRuntime?.capacity.configured
-                        }
-                        onClick={downloadCurrentCell}
-                      >
-                        {activeExplorationIsMaxDetail ? (
-                          <Download size={16} />
-                        ) : (
-                          <LockKeyhole size={16} />
-                        )}
-                        {activeExplorationIsMaxDetail
-                          ? currentDetailConfirmedAbsent
-                            ? "Sin datos confirmado"
-                            : currentCellSkipped
-                              ? "Celda omitida"
-                            : "Descargar celda actual"
-                          : "Solo disponible en LOD 0"}
-                      </button>
-                    )}
-                    <small>
-                      El límite de 2 req/s se comparte dentro del trabajo
-                      regional. La navegación no descarga en segundo plano.
-                    </small>
-                  </section>
 
                   <div className="exploration-transfer">
                     <button type="button" onClick={exportExploration}>
@@ -6015,62 +6278,10 @@ export function MapViewer() {
             </span>
             <strong>{formatProgressPercent(explorationPercent)}%</strong>
           </div>
-          {!activeExplorationIsMaxDetail ? (
-            <button
-              type="button"
-              className="navigation-review needs-download"
-              onClick={createMaxDetailVersionOfLegacy}
-            >
-              <Sparkles />
-              Crear L0
-            </button>
-          ) : !currentDetailReady &&
-            !currentDetailConfirmedAbsent &&
-            !currentCellSkipped ? (
-            <button
-              type="button"
-              className="navigation-review needs-download"
-              disabled={
-                runtimeBusy ||
-                currentDetailDownloading ||
-                !localRuntime?.capacity.configured
-              }
-              onClick={downloadCurrentCell}
-            >
-              <Download />
-              {currentDetailDownloading ? "Descargando…" : "Descargar L0"}
-            </button>
-          ) : (
-            <button
-              type="button"
-              className={`navigation-review ${
-                isCellReviewed(
-                  explorationState,
-                  explorationState.currentIndex,
-                )
-                  ? "reviewed"
-                  : ""
-              }`}
-              disabled={!canReviewCurrentCell && !canSkipCurrentCell}
-              onClick={
-                canSkipCurrentCell
-                  ? toggleCurrentSkipped
-                  : toggleCurrentReviewed
-              }
-            >
-              <CheckCircle2 />
-              {currentCellSkipped
-                ? "Restaurar celda"
-                : currentDetailConfirmedAbsent
-                  ? "Omitir sin datos"
-                  : isCellReviewed(
-                explorationState,
-                explorationState.currentIndex,
-              )
-                ? "Revisada"
-                : "Marcar revisada"}
-            </button>
-          )}
+          <span className="navigation-auto-state">
+            <CheckCircle2 />
+            {currentCellSkipped ? "Sin imagen" : "Auto"}
+          </span>
           <div className="direction-pad">
             <button
               type="button"

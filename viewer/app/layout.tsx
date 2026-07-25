@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 const title = "Obsidian Atlas — visor del Overworld de 2b2t";
 const description =
-  "Explora el Overworld de 2b2t por regiones, avanza celda por celda y guarda tu progreso local.";
+  "Descarga regiones completas del Overworld de 2b2t, explóralas celda por celda y guarda el progreso automáticamente.";
 const localOrigin = new URL("http://localhost:3001");
 
 export const metadata: Metadata = {

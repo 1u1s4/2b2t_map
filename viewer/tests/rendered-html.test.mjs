@@ -38,7 +38,7 @@ test("server-renders the Obsidian Atlas product shell and metadata", async () =>
   );
   assert.match(
     html,
-    /<meta name="description" content="Explora el Overworld de 2b2t por regiones, avanza celda por celda y guarda tu progreso local\."/i,
+    /<meta name="description" content="Descarga regiones completas del Overworld de 2b2t, explóralas celda por celda y guarda el progreso automáticamente\."/i,
   );
   assert.match(
     html,
@@ -57,7 +57,7 @@ test("server-renders the Obsidian Atlas product shell and metadata", async () =>
   assert.match(html, /Ir a coordenadas o highlight/);
   assert.match(html, /Solo local/);
   assert.match(html, /Explorar/);
-  assert.doesNotMatch(html, /DESCARGA COMPLETA|mchinchimoran\.chatgpt\.site/i);
+  assert.doesNotMatch(html, /mchinchimoran\.chatgpt\.site/i);
   assert.doesNotMatch(
     html,
     /codex-preview|Building your site|Your site is taking shape|SkeletonPreview/i,

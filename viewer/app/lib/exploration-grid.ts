@@ -22,11 +22,11 @@ export const MIN_EXPLORATION_SCALE = 1 / 1_500;
 export const MAX_EXPLORATION_SCALE = 8;
 
 /**
- * Four million cells use a 500 KB bitset (about 667 KB when exported as
- * base64url). This keeps a complete session comfortably below common browser
- * storage and JSON parsing limits.
+ * 1,048,576 cells use a 128 KB bitset (about 171 KB when exported as
+ * base64url). This matches the bounded regional downloader while keeping a
+ * complete session comfortably below browser storage and JSON parsing limits.
  */
-export const MAX_EXPLORATION_CELLS = 4_000_000;
+export const MAX_EXPLORATION_CELLS = 1_048_576;
 export const MAX_SERIALIZED_EXPLORATION_CHARS = 2_000_000;
 
 const MAX_REGION_ID_LENGTH = 100;
@@ -719,6 +719,46 @@ export function withCurrentCellSkipped(
   return withCellSkipped(state, state.currentIndex, skipped);
 }
 
+/**
+ * Apply a known-absent inventory in one immutable update. This is used when a
+ * complete regional download has already resolved every 404 before exploration
+ * begins, so no per-cell confirmation is necessary.
+ */
+export function withCellsSkipped(
+  state: ExplorationState,
+  indexes: Iterable<number>,
+): ExplorationState {
+  assertExplorationState(state);
+  const nextSkipped = state.skipped.slice();
+  const nextReviewed = state.reviewed.slice();
+  let skippedCount = state.skippedCount;
+  let reviewedCount = state.reviewedCount;
+  let changed = false;
+
+  for (const index of indexes) {
+    assertCellIndex(state.region, index);
+    const location = bitLocation(index);
+    if ((nextSkipped[location.byte] & location.mask) !== 0) continue;
+    nextSkipped[location.byte] |= location.mask;
+    skippedCount += 1;
+    changed = true;
+    if ((nextReviewed[location.byte] & location.mask) !== 0) {
+      nextReviewed[location.byte] &= ~location.mask;
+      reviewedCount -= 1;
+    }
+  }
+
+  return changed
+    ? Object.freeze({
+        ...state,
+        reviewed: nextReviewed,
+        reviewedCount,
+        skipped: nextSkipped,
+        skippedCount,
+      })
+    : state;
+}
+
 export function withCurrentIndex(
   state: ExplorationState,
   index: number,
@@ -730,6 +770,26 @@ export function withCurrentIndex(
     : Object.freeze({ ...state, currentIndex: index });
 }
 
+/**
+ * Select a cell and count that visit exactly once. Known-absent cells remain
+ * skipped and are never converted into reviewed cells.
+ */
+export function withVisitedIndex(
+  state: ExplorationState,
+  index: number,
+): ExplorationState {
+  const selected = withCurrentIndex(state, index);
+  return isCellSkipped(selected, index)
+    ? selected
+    : withCellReviewed(selected, index);
+}
+
+export function withCurrentCellVisited(
+  state: ExplorationState,
+): ExplorationState {
+  return withVisitedIndex(state, state.currentIndex);
+}
+
 export function moveCurrentCardinal(
   state: ExplorationState,
   direction: CardinalDirection,
@@ -739,7 +799,7 @@ export function moveCurrentCardinal(
     state.currentIndex,
     direction,
   );
-  return neighbor === null ? state : withCurrentIndex(state, neighbor);
+  return neighbor === null ? state : withVisitedIndex(state, neighbor);
 }
 
 export function moveCurrentSerpentine(

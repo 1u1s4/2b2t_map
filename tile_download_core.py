@@ -20,6 +20,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -228,6 +229,10 @@ class DownloadTask:
     row_id: int
     spec: TileSpec
     selected: bool
+    # Snapshot captured while the task is prepared. Regional downloads use it
+    # to reuse durable 404s without issuing the same request on every resume.
+    catalog_status: str | None = None
+    catalog_http_code: int | None = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -313,7 +318,13 @@ class TileDatabase:
         )
         self.connection.commit()
 
-    def add_tile(self, spec: TileSpec, output_root: Path, *, selected: bool) -> int:
+    def _upsert_tile(
+        self,
+        spec: TileSpec,
+        output_root: Path,
+        *,
+        selected: bool,
+    ) -> sqlite3.Row:
         relative_path = str(spec.path(output_root).relative_to(output_root))
         self.connection.execute(
             """
@@ -355,7 +366,7 @@ class TileDatabase:
         )
         row = self.connection.execute(
             """
-            SELECT id FROM tiles
+            SELECT id, status, http_code FROM tiles
             WHERE layer=? AND lod=? AND dimension=? AND tile_x=? AND tile_z=?
             """,
             (
@@ -367,7 +378,110 @@ class TileDatabase:
             ),
         ).fetchone()
         assert row is not None
-        return int(row["id"])
+        return row
+
+    def add_tile(self, spec: TileSpec, output_root: Path, *, selected: bool) -> int:
+        """Insert or select a tile while preserving the historic integer API."""
+
+        return int(
+            self._upsert_tile(
+                spec,
+                output_root,
+                selected=selected,
+            )["id"]
+        )
+
+    def prepare_download_task(
+        self,
+        spec: TileSpec,
+        output_root: Path,
+        *,
+        selected: bool,
+    ) -> DownloadTask:
+        """Create a task with the tile's pre-download catalog state attached."""
+
+        row = self._upsert_tile(
+            spec,
+            output_root,
+            selected=selected,
+        )
+        return DownloadTask(
+            row_id=int(row["id"]),
+            spec=spec,
+            selected=selected,
+            catalog_status=str(row["status"]),
+            catalog_http_code=(
+                int(row["http_code"])
+                if row["http_code"] is not None
+                else None
+            ),
+        )
+
+    def average_complete_tile_bytes(
+        self,
+        *,
+        maximum: int,
+    ) -> int | None:
+        """Return a bounded archive average for storage estimation."""
+
+        row = self.connection.execute(
+            """
+            SELECT AVG(size_bytes) AS average_bytes
+            FROM tiles
+            WHERE status='complete'
+              AND size_bytes IS NOT NULL
+              AND size_bytes >= 16
+              AND size_bytes <= ?
+            """,
+            (maximum,),
+        ).fetchone()
+        if row is None or row["average_bytes"] is None:
+            return None
+        return max(16, min(maximum, math.ceil(float(row["average_bytes"]))))
+
+    def count_reusable_absent_tiles(
+        self,
+        *,
+        output_root: Path,
+        dimension: str,
+        lod: int,
+        layers: Sequence[str],
+        tile_x_min: int,
+        tile_x_max: int,
+        tile_z_min: int,
+        tile_z_max: int,
+    ) -> int:
+        """Count confirmed 404 rows that still have no conflicting local file."""
+
+        if not layers:
+            return 0
+        placeholders = ",".join("?" for _ in layers)
+        rows = self.connection.execute(
+            f"""
+            SELECT relative_path
+            FROM tiles
+            WHERE dimension=?
+              AND lod=?
+              AND layer IN ({placeholders})
+              AND tile_x BETWEEN ? AND ?
+              AND tile_z BETWEEN ? AND ?
+              AND status='absent'
+              AND http_code=404
+            """,
+            (
+                dimension,
+                lod,
+                *layers,
+                tile_x_min,
+                tile_x_max,
+                tile_z_min,
+                tile_z_max,
+            ),
+        )
+        return sum(
+            not (output_root / str(row["relative_path"])).exists()
+            for row in rows
+        )
 
 
     def record_result(

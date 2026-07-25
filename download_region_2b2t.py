@@ -22,8 +22,10 @@ import shutil
 import signal
 import sys
 import threading
+import time
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
-from typing import Iterable, Sequence, TextIO
+from typing import TextIO
 
 from compose_mosaic import (
     DEFAULT_MAX_PIXELS,
@@ -53,7 +55,12 @@ DEFAULT_REQUESTS_PER_SECOND = 2.0
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_RETRIES = 5
 DEFAULT_MAX_TILE_BYTES = 10 * 1024 * 1024
-DEFAULT_MAX_TILES = 10_000
+DEFAULT_MAX_TILES = 100_000
+DEFAULT_PENDING_TASKS_PER_WORKER = 2
+DEFAULT_ESTIMATED_TILE_BYTES = 1 * 1024 * 1024
+DEFAULT_STORAGE_MARGIN = 1.20
+DEFAULT_RUNTIME_DISK_RESERVE_BYTES = 256 * 1024 * 1024
+DEFAULT_DISK_CHECK_INTERVAL = 32
 REGION_DOWNLOAD_LOCK_NAME = ".region-download.lock"
 
 
@@ -159,6 +166,103 @@ class RegionDownloadSummary:
     reused: int
     downloaded_bytes: int
     interrupted: bool
+    processed: int = 0
+    reused_absent: int = 0
+    stop_reason: str | None = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RegionStorageEstimate:
+    requested: int
+    existing_complete: int
+    reusable_absent: int
+    missing: int
+    estimated_tile_bytes: int
+    required_bytes: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RegionDownloadProgress:
+    """Monotonic snapshot suitable for a UI or another supervising process."""
+
+    event: str
+    requested: int | None
+    processed: int
+    complete: int
+    absent: int
+    failed: int
+    reused: int
+    reused_absent: int
+    downloaded_bytes: int
+    interrupted: bool
+    status: str
+    stop_reason: str | None = None
+
+    @property
+    def percent(self) -> float:
+        if self.requested is None or self.requested <= 0:
+            return 0.0
+        return min(100.0, self.processed * 100.0 / self.requested)
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "type": "region-download",
+            "version": 1,
+            "event": self.event,
+            "status": self.status,
+            "requested": self.requested,
+            "processed": self.processed,
+            "complete": self.complete,
+            "absent": self.absent,
+            "failed": self.failed,
+            "reused": self.reused,
+            "reusedAbsent": self.reused_absent,
+            "downloadedBytes": self.downloaded_bytes,
+            "interrupted": self.interrupted,
+            "percent": round(self.percent, 4),
+            "stopReason": self.stop_reason,
+        }
+
+
+class JsonlProgressReporter:
+    """Write one compact, flushed JSON object per progress snapshot."""
+
+    def __init__(
+        self,
+        stream: TextIO,
+        *,
+        minimum_interval: float = 0.25,
+    ) -> None:
+        if minimum_interval < 0:
+            raise ValueError("minimum_interval must not be negative")
+        self.stream = stream
+        self.minimum_interval = minimum_interval
+        self.available = True
+        self.last_progress_at = 0.0
+
+    def __call__(self, progress: RegionDownloadProgress) -> None:
+        if not self.available:
+            return
+        now = time.monotonic()
+        if (
+            progress.event == "progress"
+            and now - self.last_progress_at < self.minimum_interval
+        ):
+            return
+        try:
+            print(
+                json.dumps(
+                    progress.as_json(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                file=self.stream,
+                flush=True,
+            )
+            self.last_progress_at = now
+        except BrokenPipeError:
+            # Losing an optional observer must not corrupt a long local job.
+            self.available = False
 
 
 def parse_layers(value: str) -> tuple[str, ...]:
@@ -219,14 +323,71 @@ def resolve_region(args: argparse.Namespace) -> BlockRange:
     )
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class RegionSpecInventory(Sequence[TileSpec]):
+    """Reiterable, indexable regional inventory that allocates no TileSpecs."""
+
+    dimension: str
+    lod: int
+    layers: tuple[str, ...]
+    tile_x_min: int
+    tile_z_min: int
+    tile_x_max: int
+    tile_z_max: int
+
+    @property
+    def columns(self) -> int:
+        return self.tile_x_max - self.tile_x_min + 1
+
+    @property
+    def rows(self) -> int:
+        return self.tile_z_max - self.tile_z_min + 1
+
+    def __len__(self) -> int:
+        return self.columns * self.rows * len(self.layers)
+
+    def __iter__(self) -> Iterator[TileSpec]:
+        for layer in self.layers:
+            for tile_z in range(self.tile_z_min, self.tile_z_max + 1):
+                for tile_x in range(self.tile_x_min, self.tile_x_max + 1):
+                    yield TileSpec(
+                        self.dimension,
+                        layer,
+                        self.lod,
+                        tile_x,
+                        tile_z,
+                    )
+
+    def __getitem__(self, index: int | slice) -> TileSpec | tuple[TileSpec, ...]:
+        if isinstance(index, slice):
+            return tuple(
+                self[position]
+                for position in range(*index.indices(len(self)))
+            )
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError("regional tile index out of range")
+        tiles_per_layer = self.columns * self.rows
+        layer_index, layer_offset = divmod(index, tiles_per_layer)
+        row, column = divmod(layer_offset, self.columns)
+        return TileSpec(
+            self.dimension,
+            self.layers[layer_index],
+            self.lod,
+            self.tile_x_min + column,
+            self.tile_z_min + row,
+        )
+
+
 def required_region_specs(
     block_range: BlockRange,
     *,
     lod: int,
     dimension: str,
     layers: Sequence[str],
-) -> tuple[TileSpec, ...]:
-    """Return every direct tile needed by a region, layer then Z then X."""
+) -> RegionSpecInventory:
+    """Return a lazy direct-tile inventory ordered by layer, Z, then X."""
 
     if dimension != "overworld":
         raise ValueError("only the Overworld is supported")
@@ -236,15 +397,14 @@ def required_region_specs(
         raise ValueError("at least one layer is required")
 
     tile_blocks = 512 * (1 << lod)
-    tile_x_min = block_range.x_min // tile_blocks
-    tile_z_min = block_range.z_min // tile_blocks
-    tile_x_max = (block_range.x_max - 1) // tile_blocks
-    tile_z_max = (block_range.z_max - 1) // tile_blocks
-    return tuple(
-        TileSpec(dimension, layer, lod, tile_x, tile_z)
-        for layer in layers
-        for tile_z in range(tile_z_min, tile_z_max + 1)
-        for tile_x in range(tile_x_min, tile_x_max + 1)
+    return RegionSpecInventory(
+        dimension=dimension,
+        lod=lod,
+        layers=tuple(layers),
+        tile_x_min=block_range.x_min // tile_blocks,
+        tile_z_min=block_range.z_min // tile_blocks,
+        tile_x_max=(block_range.x_max - 1) // tile_blocks,
+        tile_z_max=(block_range.z_max - 1) // tile_blocks,
     )
 
 
@@ -272,27 +432,105 @@ def region_tile_count(
     )
 
 
+def estimate_region_storage(
+    inventory: RegionSpecInventory,
+    *,
+    database: TileDatabase,
+    output_root: Path,
+    max_tile_bytes: int,
+    fallback_tile_bytes: int = DEFAULT_ESTIMATED_TILE_BYTES,
+    margin: float = DEFAULT_STORAGE_MARGIN,
+) -> RegionStorageEstimate:
+    """Estimate only work not already complete or durably absent."""
+
+    if max_tile_bytes <= 0 or fallback_tile_bytes <= 0:
+        raise ValueError("tile byte estimates must be positive")
+    if not math.isfinite(margin) or margin < 1:
+        raise ValueError("storage margin must be finite and at least 1")
+
+    existing_complete = 0
+    observed_bytes = 0
+    for spec in inventory:
+        validation = validate_webp(
+            spec.path(output_root),
+            calculate_hash=False,
+        )
+        if validation.valid:
+            existing_complete += 1
+            observed_bytes += validation.size_bytes
+    reusable_absent = database.count_reusable_absent_tiles(
+        output_root=output_root,
+        dimension=inventory.dimension,
+        lod=inventory.lod,
+        layers=inventory.layers,
+        tile_x_min=inventory.tile_x_min,
+        tile_x_max=inventory.tile_x_max,
+        tile_z_min=inventory.tile_z_min,
+        tile_z_max=inventory.tile_z_max,
+    )
+    missing = max(
+        0,
+        len(inventory) - existing_complete - reusable_absent,
+    )
+    observed_average = (
+        math.ceil(observed_bytes / existing_complete)
+        if existing_complete
+        else database.average_complete_tile_bytes(maximum=max_tile_bytes)
+    )
+    estimated_tile_bytes = min(
+        max_tile_bytes,
+        observed_average
+        if observed_average is not None
+        else fallback_tile_bytes,
+    )
+    return RegionStorageEstimate(
+        requested=len(inventory),
+        existing_complete=existing_complete,
+        reusable_absent=reusable_absent,
+        missing=missing,
+        estimated_tile_bytes=estimated_tile_bytes,
+        required_bytes=math.ceil(
+            missing * estimated_tile_bytes * margin,
+        ),
+    )
+
+
 def seed_region_tasks(
     database: TileDatabase,
     output_root: Path,
     specs: Iterable[TileSpec],
 ) -> tuple[DownloadTask, ...]:
-    """Persist the requested inventory and return tasks for the exact region."""
+    """Compatibility helper that materializes explicitly requested tasks."""
 
-    tasks = tuple(
-        DownloadTask(
-            row_id=database.add_tile(spec, output_root, selected=True),
-            spec=spec,
-            selected=True,
-        )
-        for spec in specs
-    )
+    tasks = tuple(iter_region_tasks(database, output_root, specs))
     database.connection.commit()
     return tasks
 
 
+def iter_region_tasks(
+    database: TileDatabase,
+    output_root: Path,
+    specs: Iterable[TileSpec],
+    *,
+    commit_interval: int = 256,
+) -> Iterator[DownloadTask]:
+    """Prepare tasks on demand, retaining only the executor window in memory."""
+
+    if commit_interval <= 0:
+        raise ValueError("commit_interval must be positive")
+    for index, spec in enumerate(specs, start=1):
+        yield database.prepare_download_task(
+            spec,
+            output_root,
+            selected=True,
+        )
+        if index % commit_interval == 0:
+            database.connection.commit()
+    database.connection.commit()
+
+
 def download_region_tasks(
-    tasks: Sequence[DownloadTask],
+    tasks: Iterable[DownloadTask],
     *,
     fetcher: TileFetcher,
     database: TileDatabase,
@@ -301,56 +539,234 @@ def download_region_tasks(
     workers: int,
     stop_event: threading.Event,
     logger: logging.Logger,
+    total_tasks: int | None = None,
+    max_pending_tasks: int | None = None,
+    progress: Callable[[RegionDownloadProgress], None] | None = None,
+    disk_check_path: Path | None = None,
+    minimum_free_bytes: int = 0,
+    disk_check_interval: int = DEFAULT_DISK_CHECK_INTERVAL,
 ) -> RegionDownloadSummary:
-    """Fetch exact tasks concurrently while serializing SQLite writes."""
+    """Fetch a lazy task stream with a fixed-size executor window."""
 
-    results: list[DownloadResult] = []
-    interrupted = False
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="region",
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    if total_tasks is None:
+        try:
+            total_tasks = len(tasks)  # type: ignore[arg-type]
+        except TypeError:
+            pass
+    if total_tasks is not None and total_tasks < 0:
+        raise ValueError("total_tasks must not be negative")
+    pending_limit = (
+        max_pending_tasks
+        if max_pending_tasks is not None
+        else workers * DEFAULT_PENDING_TASKS_PER_WORKER
     )
-    futures = {executor.submit(fetcher.fetch, task): task for task in tasks}
-    try:
-        for future in concurrent.futures.as_completed(futures):
-            task = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:  # Defensive boundary around worker failures.
-                result = DownloadResult(
-                    task=task,
-                    status="failed",
-                    exists=False,
-                    http_code=None,
-                    attempts=0,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
+    if pending_limit <= 0:
+        raise ValueError("max_pending_tasks must be positive")
+    pending_limit = max(workers, pending_limit)
+    if minimum_free_bytes < 0:
+        raise ValueError("minimum_free_bytes must not be negative")
+    if disk_check_interval <= 0:
+        raise ValueError("disk_check_interval must be positive")
+
+    complete = 0
+    absent = 0
+    failed = 0
+    reused = 0
+    reused_absent = 0
+    downloaded_bytes = 0
+    processed = 0
+    consumed = 0
+    interrupted = False
+    stop_reason: str | None = None
+    last_disk_check_processed = -disk_check_interval
+
+    def emit(event: str, status: str) -> None:
+        if progress is None:
+            return
+        progress(
+            RegionDownloadProgress(
+                event=event,
+                requested=total_tasks,
+                processed=processed,
+                complete=complete,
+                absent=absent,
+                failed=failed,
+                reused=reused,
+                reused_absent=reused_absent,
+                downloaded_bytes=downloaded_bytes,
+                interrupted=interrupted,
+                status=status,
+                stop_reason=stop_reason,
+            )
+        )
+
+    def check_disk_space(*, force: bool = False) -> bool:
+        nonlocal interrupted
+        nonlocal last_disk_check_processed
+        nonlocal stop_reason
+
+        if disk_check_path is None:
+            return True
+        if (
+            not force
+            and processed - last_disk_check_processed < disk_check_interval
+        ):
+            return True
+        last_disk_check_processed = processed
+        free_bytes = shutil.disk_usage(disk_check_path).free
+        if free_bytes >= minimum_free_bytes:
+            return True
+        interrupted = True
+        stop_reason = "insufficient-disk"
+        logger.error(
+            "Espacio libre por debajo de la reserva segura: %d < %d bytes",
+            free_bytes,
+            minimum_free_bytes,
+        )
+        stop_event.set()
+        return False
+
+    def record(result: DownloadResult) -> None:
+        nonlocal absent
+        nonlocal complete
+        nonlocal downloaded_bytes
+        nonlocal failed
+        nonlocal processed
+        nonlocal reused
+        nonlocal reused_absent
+
+        catalog_absent = (
+            result.status == "absent"
+            and result.attempts == 0
+            and result.task.catalog_status == "absent"
+            and result.task.catalog_http_code == 404
+        )
+        if not catalog_absent:
             database.record_result(
                 result,
                 output_root,
                 min_lod=lod,
                 selected_lods={lod},
             )
-            results.append(result)
-            if result.status == "complete":
-                action = "reutilizado" if result.attempts == 0 else "descargado"
+        processed += 1
+        downloaded_bytes += result.downloaded_bytes
+        if result.status == "complete":
+            complete += 1
+            if result.attempts == 0:
+                reused += 1
+            action = "reutilizado" if result.attempts == 0 else "descargado"
+            logger.info(
+                "%s %s (%d bytes)",
+                action,
+                result.task.spec.url,
+                result.size_bytes,
+            )
+        elif result.status == "absent":
+            absent += 1
+            if result.attempts == 0:
+                reused_absent += 1
                 logger.info(
-                    "%s %s (%d bytes)",
-                    action,
+                    "404 reutilizado del catálogo: %s",
                     result.task.spec.url,
-                    result.size_bytes,
                 )
-            elif result.status == "absent":
-                logger.info("no publicado (404): %s", result.task.spec.url)
             else:
-                logger.error(
-                    "%s: %s — %s",
-                    result.status,
-                    result.task.spec.url,
-                    result.error or "sin detalle",
-                )
+                logger.info("no publicado (404): %s", result.task.spec.url)
+        else:
+            failed += 1
+            logger.error(
+                "%s: %s — %s",
+                result.status,
+                result.task.spec.url,
+                result.error or "sin detalle",
+            )
+        emit("progress", "running")
+
+    def cached_absent_result(task: DownloadTask) -> DownloadResult | None:
+        if (
+            task.catalog_status != "absent"
+            or task.catalog_http_code != 404
+            or task.spec.path(output_root).exists()
+        ):
+            return None
+        return DownloadResult(
+            task=task,
+            status="absent",
+            exists=False,
+            http_code=404,
+            attempts=0,
+            error="tile no publicado (reutilizado del catálogo local)",
+        )
+
+    emit("start", "running")
+    check_disk_space(force=True)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="region",
+    )
+    task_iterator = iter(tasks)
+    pending: dict[
+        concurrent.futures.Future[DownloadResult],
+        DownloadTask,
+    ] = {}
+    exhausted = False
+
+    def fill_pending() -> None:
+        nonlocal consumed
+        nonlocal exhausted
+        while (
+            not exhausted
+            and not stop_event.is_set()
+            and len(pending) < pending_limit
+        ):
+            try:
+                task = next(task_iterator)
+            except StopIteration:
+                exhausted = True
+                break
+            consumed += 1
+            resumed_absent = cached_absent_result(task)
+            if resumed_absent is not None:
+                record(resumed_absent)
+                continue
+            pending[executor.submit(fetcher.fetch, task)] = task
+
+    try:
+        fill_pending()
+        while pending or not exhausted:
             if stop_event.is_set():
                 interrupted = True
+                for future in pending:
+                    future.cancel()
+            if not pending:
+                if stop_event.is_set() or exhausted:
+                    break
+                fill_pending()
+                continue
+            done, _ = concurrent.futures.wait(
+                tuple(pending),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                task = pending.pop(future)
+                if future.cancelled():
+                    continue
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = DownloadResult(
+                        task=task,
+                        status="failed",
+                        exists=False,
+                        http_code=None,
+                        attempts=0,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                record(result)
+            check_disk_space()
+            if not stop_event.is_set():
+                fill_pending()
     except KeyboardInterrupt:
         interrupted = True
         stop_event.set()
@@ -358,24 +774,34 @@ def download_region_tasks(
     finally:
         if stop_event.is_set():
             interrupted = True
-            for future in futures:
+            for future in pending:
                 future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
 
-    complete = sum(result.status == "complete" for result in results)
-    absent = sum(result.status == "absent" for result in results)
-    failed = len(results) - complete - absent
-    reused = sum(
-        result.status == "complete" and result.attempts == 0 for result in results
+    requested = total_tasks if total_tasks is not None else consumed
+    if interrupted and stop_reason is None:
+        stop_reason = "stop-requested"
+    if not interrupted and processed < requested:
+        failed += requested - processed
+    terminal_status = (
+        "interrupted"
+        if interrupted
+        else "error"
+        if failed
+        else "complete"
     )
+    emit("summary", terminal_status)
     return RegionDownloadSummary(
-        requested=len(tasks),
+        requested=requested,
         complete=complete,
         absent=absent,
         failed=failed,
         reused=reused,
-        downloaded_bytes=sum(result.downloaded_bytes for result in results),
+        downloaded_bytes=downloaded_bytes,
         interrupted=interrupted,
+        processed=processed,
+        reused_absent=reused_absent,
+        stop_reason=stop_reason,
     )
 
 
@@ -442,6 +868,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Refuse a larger regional inventory before scheduling it "
             f"(default: {DEFAULT_MAX_TILES:,})."
+        ),
+    )
+    parser.add_argument(
+        "--progress-jsonl",
+        action="store_true",
+        help=(
+            "Emit machine-readable progress on stdout; human logs remain "
+            "on stderr."
         ),
     )
     parser.add_argument("--verbose", action="store_true")
@@ -547,23 +981,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         stop_event.set()
 
     try:
-        # This intentionally uses the configured response ceiling, not an average:
-        # it is a strict upper-bound preflight for small targeted captures.
-        missing_tiles = sum(
-            not validate_webp(
-                spec.path(output_root), calculate_hash=False
-            ).valid
-            for spec in specs
+        database = TileDatabase(output_root / "tiles.sqlite3")
+        storage = estimate_region_storage(
+            specs,
+            database=database,
+            output_root=output_root,
+            max_tile_bytes=args.max_tile_bytes,
         )
-        required_upper_bound = math.ceil(
-            missing_tiles * args.max_tile_bytes * 1.20
+        runtime_reserve = max(
+            DEFAULT_RUNTIME_DISK_RESERVE_BYTES,
+            args.max_tile_bytes * args.workers * 2,
         )
         free_bytes = shutil.disk_usage(output_root).free
-        if free_bytes < required_upper_bound:
+        required_with_reserve = storage.required_bytes + runtime_reserve
+        if free_bytes < required_with_reserve:
             parser.error(
-                "insufficient disk for the regional upper bound plus 20%: "
-                f"need {required_upper_bound:,} bytes, have {free_bytes:,}"
+                "insufficient disk for the estimated missing tiles, 20% "
+                f"margin, and runtime reserve: need {required_with_reserve:,} "
+                f"bytes, have {free_bytes:,}"
             )
+        logger.info(
+            "Preflight: %d existentes, %d ausentes reutilizables, "
+            "%d faltantes; estimación %d bytes + reserva %d.",
+            storage.existing_complete,
+            storage.reusable_absent,
+            storage.missing,
+            storage.required_bytes,
+            runtime_reserve,
+        )
 
         stop_event = threading.Event()
         limiter = AdaptiveRateLimiter(args.requests_per_second, stop_event)
@@ -576,14 +1021,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_tile_bytes=args.max_tile_bytes,
             logger=logger,
         )
-        database = TileDatabase(output_root / "tiles.sqlite3")
-
         if threading.current_thread() is threading.main_thread():
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous_handlers[signum] = signal.getsignal(signum)
                 signal.signal(signum, stop_handler)
 
-        tasks = seed_region_tasks(database, output_root, specs)
         database.set_metadata(
             "last_region_request",
             {
@@ -591,7 +1033,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "layers": list(args.layers),
                 "lod": args.lod,
                 "bounds": dataclasses.asdict(block_range),
-                "tiles": len(tasks),
+                "tiles": inventory_count,
             },
         )
         logger.info(
@@ -601,11 +1043,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             block_range.z_min,
             block_range.z_max,
             args.lod,
-            len(tasks),
+            inventory_count,
             ",".join(args.layers),
         )
+        progress_reporter = (
+            JsonlProgressReporter(sys.stdout)
+            if args.progress_jsonl
+            else None
+        )
         summary = download_region_tasks(
-            tasks,
+            iter_region_tasks(database, output_root, specs),
             fetcher=fetcher,
             database=database,
             output_root=output_root,
@@ -613,14 +1060,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             workers=args.workers,
             stop_event=stop_event,
             logger=logger,
+            total_tasks=inventory_count,
+            progress=progress_reporter,
+            disk_check_path=output_root,
+            minimum_free_bytes=runtime_reserve,
         )
 
+        human_output = sys.stderr if args.progress_jsonl else sys.stdout
         print(
             "Descarga regional: "
             f"{summary.complete} completos "
             f"({summary.reused} reutilizados), "
-            f"{summary.absent} ausentes, "
-            f"{summary.failed} fallidos."
+            f"{summary.absent} ausentes "
+            f"({summary.reused_absent} reutilizados), "
+            f"{summary.failed} fallidos.",
+            file=human_output,
         )
         if summary.interrupted:
             print(
@@ -653,7 +1107,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"Imagen: {result.output_path.resolve()} "
                 f"({result.width}x{result.height} px, "
-                f"{len(result.missing_paths)} tiles transparentes/ausentes)."
+                f"{len(result.missing_paths)} tiles transparentes/ausentes).",
+                file=human_output,
             )
         return 0
     finally:

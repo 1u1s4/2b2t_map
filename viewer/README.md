@@ -72,8 +72,11 @@ servidor a `localhost`.
    filtra sectores **Listos**, **En curso** o **Por explorar**.
 3. Haz clic en un sector o arrastra uno o más sectores de la rejilla 33×33.
 4. Revisa los límites X/Z y el número de filas y columnas LOD 0.
-5. Pulsa **Explorar en máximo detalle**. La sesión se crea y abre directamente
-   en su primera celda.
+5. El visor comprueba `base`, `overlay` y `newchunks` para toda la selección.
+   Si falta algo, elige el ritmo y pulsa **Descargar región completa**.
+6. Espera a que el estado exacto llegue a 100%, o detén y reanuda el trabajo
+   más tarde. Solo entonces se habilita **Explorar región**.
+7. La sesión abre su primera celda y la marca como revisada automáticamente.
 
 Desde **Explorar** también puedes usar **Elegir región en el Atlas**. Dibujar
 una región, usar la vista o introducir coordenadas permanece disponible como
@@ -125,57 +128,60 @@ La cruceta visible y las flechas del teclado mueven exactamente una celda:
 - los controles se desactivan en los bordes.
 
 La tarjeta muestra porcentaje, revisadas, total revisable, celdas sin datos,
-fila, columna y límites X/Z de la celda actual. La cruceta sigue disponible aunque el usuario
-acerque o desplace visualmente el mapa; al cambiar de celda, la cámara vuelve a
-encajarla sin modificar su LOD de datos.
+fila, columna y límites X/Z de la celda actual. La cruceta sigue disponible
+aunque el usuario acerque o desplace visualmente el mapa; al cambiar de celda,
+la cámara vuelve a encajarla sin modificar su LOD de datos.
 
-**Marcar como revisada** se habilita cuando el WebP LOD 0 exacto de la celda
-está guardado y es reversible. Descargarlo no cambia por sí solo el progreso
-humano. Si la descarga termina correctamente pero `base` devuelve `404`,
-**Omitir celda sin datos** la guarda en un bitset separado y la excluye del
-denominador; nunca se cuenta como revisada.
+Entrar a una celda mediante inicio, cruceta, teclado, clic o búsqueda la marca
+automáticamente como revisada. Volver a visitarla no incrementa el contador.
+Si `base` fue confirmado como `404` durante la descarga completa, queda en un
+bitset **Sin datos**, se excluye del denominador y nunca se cuenta como
+revisada.
 
 **Exportar** genera `obsidian-atlas-exploracion.json`. El archivo incluye dos
 bitsets base64url —revisadas y sin datos—, no listas extensas de coordenadas.
 **Importar** valida versión, dimensión, límites alineados, escala, LOD, índice y
 contadores.
-Al pulsar **Explorar esta región**, la sesión activa se guarda automáticamente
-y la selección nueva se abre de inmediato. **Pausar sesión** sigue disponible
-para cerrar el recorrido sin iniciar otro. También se puede elegir directamente
-cualquier celda visible con un clic.
+Al iniciar otra región, la sesión activa se guarda automáticamente y la nueva
+selección pasa primero por el gate de descarga. **Pausar sesión** sigue
+disponible para cerrar el recorrido sin iniciar otro. También se puede elegir
+directamente cualquier celda visible con un clic.
 
 Las sesiones creadas por versiones anteriores conservan su LOD, escala, celda
-actual y progreso al restaurarlas o importarlas. Un LOD heredado queda en solo
-lectura; **Crear versión en LOD 0** archiva la original intacta y crea una
-sesión nueva sobre los mismos límites.
+actual y progreso al restaurarlas o importarlas, pero una sesión LOD 0 no puede
+saltarse la verificación regional. Un LOD heredado queda en solo lectura;
+**Crear versión en LOD 0** archiva la original intacta y lleva la copia al gate
+de descarga.
 
-El máximo por sesión es 4,000,000 de celdas. Durante una sesión, la escala
+El máximo por sesión es 1,048,576 celdas. Durante una sesión, la escala
 mínima limita el viewport a 8×6 tiles antes del margen de render y la cámara se
 mantiene dentro de la región más una celda de contexto. El Atlas calcula el
 tamaño LOD 0 antes de iniciar y pide reducir una selección que supere el máximo.
 
-## Datos bajo demanda
+## Descarga regional obligatoria
 
-La tarjeta de la celda ofrece:
+La tarjeta previa a la exploración ofrece:
 
 ```text
 0.25 req/s · 0.5 req/s · 1 req/s · 2 req/s
 ```
 
-**Descargar celda actual** envía al runtime:
+**Descargar región completa** envía al runtime:
 
-- límites exactos de esa celda;
+- límites exactos de toda la región;
 - Overworld;
 - LOD 0 para toda sesión nueva;
-- `base` siempre y las capas complementarias visibles;
+- las tres capas `base`, `overlay` y `newchunks`;
 - ritmo elegido.
 
 El runtime ejecuta `../download_region_2b2t.py`, permite un trabajo a la vez,
-limita cada operación a 64 combinaciones tile/capa y realiza un preflight
-conservador de espacio. Los WebP válidos existentes se reutilizan.
+limita la región a 1,048,576 celdas espaciales y realiza un preflight de lo que
+realmente falta con 20% de margen. Los WebP válidos y los `404` persistidos se
+reutilizan; el ejecutor mantiene una cola acotada aunque la región sea grande.
 
-**Detener celda** solicita una interrupción segura. La navegación nunca inicia
-un trabajo automáticamente.
+**Detener descarga** solicita una interrupción segura. **Reanudar descarga**
+continúa el mismo inventario. La navegación permanece bloqueada hasta que
+`complete + absent = total` y no existan pendientes, faltantes ni fallos.
 
 Desde terminal puede reproducirse el mismo flujo:
 
@@ -213,6 +219,11 @@ solo lectura. La consulta se limita a las bandas publicadas: tiles ajenos a la
 huella no pueden completar un sector irregular. Los estados pendientes se
 separan de fallos, corrupción o protección.
 
+`GET /api/local-atlas/region-status?...` comprueba los límites LOD 0 y las
+capas solicitadas contra SQLite y los WebP. Devuelve conteos completos,
+ausentes, pendientes, fallidos y faltantes, porcentaje, readiness y las celdas
+`base` confirmadas como `404`. Este estado durable sobrevive reinicios.
+
 `GET /api/local-atlas/workspace` y `PUT /api/local-atlas/workspace` leen y
 guardan el workspace fijo de LuisA. `PUT` exige token local, `If-Match` y un
 write-id idempotente. El store valida el documento completo, limita tamaño y
@@ -245,9 +256,8 @@ La estructura esperada es:
 
 El endpoint `/api/tile` sirve únicamente un WebP local válido. No tiene modo
 remoto: incluso el parámetro heredado `online=1` se ignora y una ausencia local
-responde `404` sin contactar la red. El usuario puede obtener el tile mediante
-**Descargar celda actual**; la descarga respeta el ritmo regional y escribe el
-resultado en la biblioteca antes de mostrarlo.
+responde `404` sin contactar la red. Solo la descarga regional explícita
+contacta la fuente y escribe el resultado antes de habilitar la sesión.
 
 Chrome puede abrir `2b2t_tiles` mediante File System Access con permiso de solo
 lectura. El navegador calcula la ruta visible; no escanea ni sube la carpeta.
@@ -305,7 +315,8 @@ Rutas:
 | --- | --- | --- |
 | `GET` | `/api/local-atlas/status` | capacidad y trabajo actual |
 | `GET` | `/api/local-atlas/coverage?layer=base&lod=0..3` | cobertura exacta del terreno local |
-| `POST` | `/api/local-atlas/download` | iniciar una celda validada |
+| `GET` | `/api/local-atlas/region-status?...` | verificar una región y su readiness durable |
+| `POST` | `/api/local-atlas/download` | iniciar o reanudar una región validada |
 | `POST` | `/api/local-atlas/stop` | detener el trabajo activo |
 | `GET`/`HEAD` | `/api/tile` | servir exclusivamente un tile local |
 
