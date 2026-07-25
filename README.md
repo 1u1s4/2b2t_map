@@ -73,6 +73,24 @@ npm run build
 npm test
 ```
 
+Para mantener la barra disponible durante toda la descarga, inicia una vez el
+visor supervisado:
+
+```bash
+./start_progress_viewer_luisa.sh
+```
+
+Quedará en `http://localhost:3001`, limitado a la máquina local. El supervisor
+reinicia el servidor si termina inesperadamente y el comando es idempotente:
+volver a ejecutarlo no crea una segunda instancia.
+La sesión permanece activa mientras continúe la sesión de macOS; después de
+reiniciar o cerrar sesión, ejecuta el comando una vez más.
+
+```bash
+./start_progress_viewer_luisa.sh --status
+./start_progress_viewer_luisa.sh --stop
+```
+
 ### Conectar los tiles locales en Chrome
 
 1. Abre el panel **Archivo** de Obsidian Atlas.

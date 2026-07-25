@@ -58,7 +58,7 @@ export default defineConfig(async ({ mode }) => {
     // Vinext enables Vite's console-forwarding client without its matching
     // transport in this multi-environment setup. One rejected promise then
     // recursively fills the error overlay; local Chrome already has DevTools.
-    ...(progressFile ? { forwardConsole: false } : {}),
+    ...(progressFile ? { forwardConsole: false, strictPort: true } : {}),
   };
 
   return {

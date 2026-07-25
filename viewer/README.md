@@ -41,6 +41,21 @@ Este bridge se habilita únicamente durante desarrollo, sirve un solo
 variable, y en el sitio publicado, la ruta responde sin contenido y se mantiene
 el flujo normal de permiso explícito de Chrome.
 
+Desde la raíz del repositorio, el lanzador supervisado mantiene esa misma vista
+local disponible en una URL fija y la reinicia si el proceso termina:
+
+```bash
+./start_progress_viewer_luisa.sh
+# abre http://localhost:3001
+```
+
+Usa `./start_progress_viewer_luisa.sh --status` para comprobarla y
+`./start_progress_viewer_luisa.sh --stop` para detenerla. El servidor escucha
+solo en `localhost`; `progress.json` se proyecta a los campos de la tarjeta y
+no incluye rutas locales ni el comando de reanudación.
+La sesión `screen` no sobrevive un reinicio o cierre de sesión de macOS; vuelve
+a ejecutar el lanzador en ese caso.
+
 Comandos de comprobación:
 
 ```bash
