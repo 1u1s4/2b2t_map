@@ -3,8 +3,18 @@ set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 viewer_dir="${project_dir}/viewer"
-tile_root="/Volumes/2b2t Tiles/2b2t_tiles"
+external_tile_root="/Volumes/2b2t Tiles/2b2t_tiles"
+repository_tile_root="${project_dir}/2b2t_tiles"
+tile_root="${OBSIDIAN_ATLAS_TILE_ROOT:-${external_tile_root}}"
 backing_root="/Volumes/LuisA"
+if [[ -n "${OBSIDIAN_ATLAS_BACKING_ROOT:-}" ]]; then
+  backing_root="${OBSIDIAN_ATLAS_BACKING_ROOT}"
+fi
+if [[ -z "${OBSIDIAN_ATLAS_TILE_ROOT:-}" &&
+  ! -d "${tile_root}" &&
+  -d "${repository_tile_root}" ]]; then
+  tile_root="${repository_tile_root}"
+fi
 runtime_dir="/Users/luisalvarado/Library/Application Support/ObsidianAtlas"
 log_file="${runtime_dir}/local_atlas.log"
 lock_file="${runtime_dir}/.local_atlas.lock"
@@ -26,8 +36,9 @@ Uso:
   ./start_local_atlas_luisa.sh --stop
 
 Inicia el atlas local en una sesión screen supervisada y limitada a localhost.
-Lee tiles únicamente desde la biblioteca configurada en LuisA. El modo interno
---serve-loop y sus auxiliares no deben ejecutarse directamente.
+Usa la biblioteca externa si está montada; si no, emplea la copia verificada
+2b2t_tiles del repositorio. El workspace siempre se guarda en LuisA. El modo
+interno --serve-loop y sus auxiliares no deben ejecutarse directamente.
 EOF
 }
 

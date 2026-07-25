@@ -13,10 +13,18 @@ import type {
 import { basename, resolve } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Plugin } from "vite";
+import {
+  AtlasWorkspaceError,
+  LocalAtlasWorkspaceStore,
+  MAX_ATLAS_WORKSPACE_BYTES,
+  atlasWorkspaceEtag,
+  parseAtlasWorkspaceEtag,
+} from "./local-atlas-workspace.ts";
 
 const STATUS_ENDPOINT = "/api/local-atlas/status";
 const DOWNLOAD_ENDPOINT = "/api/local-atlas/download";
 const STOP_ENDPOINT = "/api/local-atlas/stop";
+const WORKSPACE_ENDPOINT = "/api/local-atlas/workspace";
 const TILE_ENDPOINT = "/api/tile";
 const TILE_SIZE_PIXELS = 512;
 const TILES_PER_SHARD = 32;
@@ -76,6 +84,7 @@ function writeJson(
   response: ServerResponse,
   statusCode: number,
   payload: unknown,
+  headers: Readonly<Record<string, string>> = {},
 ) {
   const body = Buffer.from(JSON.stringify(payload));
   response.statusCode = statusCode;
@@ -84,6 +93,9 @@ function writeJson(
   response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("Content-Length", String(body.byteLength));
+  for (const [name, value] of Object.entries(headers)) {
+    response.setHeader(name, value);
+  }
   response.end(body);
 }
 
@@ -93,6 +105,59 @@ function writeEmpty(response: ServerResponse, statusCode: number) {
   response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.end();
+}
+
+function writeWorkspaceError(
+  response: ServerResponse,
+  error: unknown,
+): void {
+  if (error instanceof RangeError) {
+    writeJson(response, 413, { error: error.message });
+    return;
+  }
+  if (error instanceof TypeError) {
+    writeJson(response, 400, { error: error.message });
+    return;
+  }
+  if (!(error instanceof AtlasWorkspaceError)) {
+    writeJson(response, 500, {
+      error: "No se pudo acceder al workspace local",
+    });
+    return;
+  }
+
+  const statusCode =
+    error.code === "WORKSPACE_CONFLICT"
+      ? 412
+      : error.code === "WORKSPACE_TOO_LARGE"
+        ? 413
+        : error.code === "WORKSPACE_LOCKED"
+          ? 423
+          : error.code === "INVALID_WORKSPACE"
+            ? 400
+            : 503;
+  writeJson(
+    response,
+    statusCode,
+    {
+      error: error.message,
+      code: error.code,
+      ...(error.current
+        ? {
+            currentRevision: error.current.revision,
+            current: error.current,
+          }
+        : {}),
+    },
+    error.current
+      ? {
+          ETag: atlasWorkspaceEtag(
+            error.current.workspaceId,
+            error.current.revision,
+          ),
+        }
+      : undefined,
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -271,7 +336,10 @@ export function parseRegionDownloadRequest(
   };
 }
 
-async function readRequestBody(request: IncomingMessage): Promise<unknown> {
+async function readRequestBody(
+  request: IncomingMessage,
+  maximumBytes = MAX_REQUEST_BODY_BYTES,
+): Promise<unknown> {
   const contentType = request.headers["content-type"] ?? "";
   if (!/^application\/json(?:;|$)/i.test(contentType)) {
     throw new TypeError("Content-Type debe ser application/json");
@@ -281,7 +349,7 @@ async function readRequestBody(request: IncomingMessage): Promise<unknown> {
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.byteLength;
-    if (size > MAX_REQUEST_BODY_BYTES) {
+    if (size > maximumBytes) {
       throw new RangeError("La solicitud supera el tamaño permitido");
     }
     chunks.push(buffer);
@@ -603,7 +671,7 @@ async function tryServeLocalTile(
   }
 }
 
-function createMiddleware(options: LocalAtlasOptions) {
+export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   const tileRoot = options.tileRoot?.trim()
     ? resolve(options.tileRoot)
     : undefined;
@@ -623,6 +691,9 @@ function createMiddleware(options: LocalAtlasOptions) {
     (existsSync(defaultVenvPython) ? defaultVenvPython : "python3");
   const state: RuntimeState = { job: null, child: null, stopTimer: null };
   const mutationToken = randomUUID();
+  const workspaceStore = backingRoot
+    ? new LocalAtlasWorkspaceStore(backingRoot)
+    : null;
 
   const middleware = async (
     request: IncomingMessage,
@@ -634,6 +705,7 @@ function createMiddleware(options: LocalAtlasOptions) {
       path !== STATUS_ENDPOINT &&
       path !== DOWNLOAD_ENDPOINT &&
       path !== STOP_ENDPOINT &&
+      path !== WORKSPACE_ENDPOINT &&
       path !== TILE_ENDPOINT
     ) {
       next();
@@ -664,16 +736,101 @@ function createMiddleware(options: LocalAtlasOptions) {
     }
 
     if (path === STATUS_ENDPOINT && request.method === "GET") {
+      const [capacity, persistence] = await Promise.all([
+        readCapacity(tileRoot, backingRoot, requirementBytes),
+        workspaceStore
+          ? workspaceStore.availability()
+          : Promise.resolve({
+              configured: false as const,
+              writable: false,
+              volume: "LuisA" as const,
+              revision: null,
+              updatedAt: null,
+            }),
+      ]);
       writeJson(response, 200, {
         localOnly: true,
         mutationToken,
-        capacity: await readCapacity(
-          tileRoot,
-          backingRoot,
-          requirementBytes,
-        ),
+        capacity,
+        persistence,
         job: publicJob(state.job),
       });
+      return;
+    }
+
+    if (path === WORKSPACE_ENDPOINT && request.method === "GET") {
+      if (!workspaceStore) {
+        writeJson(response, 503, {
+          error: "La persistencia en LuisA no está configurada",
+        });
+        return;
+      }
+      try {
+        const result = await workspaceStore.read();
+        writeJson(response, 200, result.workspace, {
+          ETag: atlasWorkspaceEtag(
+            result.workspace.workspaceId,
+            result.workspace.revision,
+          ),
+          ...(result.recoveredFromBackup
+            ? { "X-Atlas-Recovered-From-Backup": "1" }
+            : {}),
+        });
+      } catch (error) {
+        writeWorkspaceError(response, error);
+      }
+      return;
+    }
+
+    if (path === WORKSPACE_ENDPOINT && request.method === "PUT") {
+      if (request.headers["x-atlas-token"] !== mutationToken) {
+        writeJson(response, 403, {
+          error: "Token local inválido; recarga el visor",
+        });
+        return;
+      }
+      if (!workspaceStore) {
+        writeJson(response, 503, {
+          error: "La persistencia en LuisA no está configurada",
+        });
+        return;
+      }
+      const ifMatch = request.headers["if-match"];
+      if (ifMatch === undefined) {
+        writeJson(response, 428, {
+          error: "If-Match es obligatorio para guardar el workspace",
+        });
+        return;
+      }
+      const expectedWorkspace = parseAtlasWorkspaceEtag(ifMatch);
+      if (expectedWorkspace === null) {
+        writeJson(response, 400, {
+          error: "If-Match no contiene una revisión válida",
+        });
+        return;
+      }
+      const writeId = request.headers["x-atlas-write-id"];
+      if (typeof writeId !== "string") {
+        writeJson(response, 400, {
+          error: "X-Atlas-Write-Id es obligatorio",
+        });
+        return;
+      }
+      try {
+        const result = await workspaceStore.write(
+          await readRequestBody(request, MAX_ATLAS_WORKSPACE_BYTES),
+          expectedWorkspace,
+          writeId,
+        );
+        writeJson(response, 200, result.workspace, {
+          ETag: atlasWorkspaceEtag(
+            result.workspace.workspaceId,
+            result.workspace.revision,
+          ),
+        });
+      } catch (error) {
+        writeWorkspaceError(response, error);
+      }
       return;
     }
 
@@ -798,8 +955,9 @@ function createMiddleware(options: LocalAtlasOptions) {
 }
 
 /**
- * Local-only Vite bridge for disk capacity, bounded regional downloads, and
- * local-first tile reads. It never accepts paths or commands from the browser.
+ * Local-only Vite bridge for durable workspace state, disk capacity, bounded
+ * regional downloads, and local-first tile reads. It never accepts paths or
+ * commands from the browser.
  */
 export function localAtlas(options: LocalAtlasOptions = {}): Plugin {
   let close: (() => void) | null = null;
@@ -807,7 +965,7 @@ export function localAtlas(options: LocalAtlasOptions = {}): Plugin {
     name: "obsidian-atlas-local-runtime",
     apply: "serve",
     configureServer(server) {
-      const runtime = createMiddleware(options);
+      const runtime = createLocalAtlasMiddleware(options);
       close = runtime.close;
       server.middlewares.use(runtime.middleware);
       server.httpServer?.once("close", runtime.close);

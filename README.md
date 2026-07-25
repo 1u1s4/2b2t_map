@@ -11,7 +11,8 @@ un zoom y un LOD fijos, permite avanzar con flechas o en recorrido serpentina y
 registra qué celdas ya fueron revisadas.
 
 La aplicación se sirve únicamente en `localhost`. Los datos persistentes se
-guardan en la biblioteca de LuisA y en el perfil local del navegador. La
+guardan de forma atómica en LuisA y mantienen una copia de recuperación en el
+navegador. La
 biblioteca existente se conserva: los WebP válidos se reutilizan y solo se
 solicitan los tiles que falten en la celda elegida.
 
@@ -20,10 +21,12 @@ La versión actual admite únicamente **Overworld**.
 ## Qué incluye
 
 - visor canvas con coordenadas X/Z, zoom, LOD y bloques por píxel;
+- rejilla maestra 33×33 basada en la huella irregular real de 66,464 tiles LOD 3;
+- selección por arrastre de uno o varios sectores de 32,768×32,768 bloques;
 - regiones dibujadas, tomadas de la vista o introducidas por coordenadas;
 - una celda por tile del LOD fijado;
 - navegación cardinal y recorrido anterior/siguiente en serpentina;
-- progreso revisado persistente y exportable;
+- varias sesiones pausables con progreso persistente y exportable;
 - descarga explícita de la celda actual entre `0.25` y `2 req/s`;
 - capas `base`, `overlay` y `newchunks`;
 - puntos y áreas con nombre, color y notas privadas;
@@ -35,7 +38,8 @@ La versión actual admite únicamente **Overworld**.
 
 Requisitos:
 
-- macOS con `/Volumes/LuisA` y `/Volumes/2b2t Tiles` montados;
+- macOS con `/Volumes/LuisA` montado;
+- `/Volumes/2b2t Tiles` es opcional: si falta se usa `./2b2t_tiles`;
 - Python 3.10 o posterior;
 - Node.js `>=22.13.0`;
 - Google Chrome actualizado;
@@ -85,15 +89,18 @@ PYTHON_BIN='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
 
 ## Flujo de exploración
 
-1. Ajusta el mapa al zoom que deseas usar durante la revisión.
-2. Abre **Explorar**.
-3. Pulsa **Dibujar región**, **Usar vista** o escribe los límites.
-4. Crea la sesión. El zoom y el LOD quedan fijados.
-5. Recorre la rejilla con las flechas visibles o las teclas de dirección.
+1. Abre **Explorar** y pulsa **Ver mapa completo y seleccionar**.
+2. Arrastra sobre la rejilla maestra para elegir una región. Los sectores
+   completos y parciales se muestran por separado.
+3. Usa **Encajar región**, **Preparar LOD 0**, **Dibujar región**, **Usar
+   vista** o escribe límites X/Z exactos.
+4. Ajusta el zoom deseado y crea la sesión; su zoom y LOD quedan fijados.
+5. Recorre la rejilla fina con clic, las flechas o la ruta serpentina.
 6. Usa **Marcar como revisada** o **Revisada y siguiente**.
 7. Si falta información local, elige el ritmo y pulsa
    **Descargar celda actual**.
-8. Exporta la sesión antes de cerrarla o cambiar de navegador.
+8. **Pausar sesión** la conserva en LuisA; después puedes abrirla desde
+   **Workspace durable**. **Guardar ahora** fuerza una escritura inmediata.
 
 El progreso de revisión y la presencia del tile son conceptos distintos.
 Descargar una celda no la marca como revisada, y navegar no inicia solicitudes
@@ -137,7 +144,8 @@ un bitset compacto para el progreso.
 El lanzador usa estas ubicaciones:
 
 ```text
-Biblioteca: /Volumes/2b2t Tiles/2b2t_tiles
+Biblioteca preferida: /Volumes/2b2t Tiles/2b2t_tiles
+Fallback automático: ./2b2t_tiles
 Respaldo físico: /Volumes/LuisA
 ```
 
@@ -276,10 +284,27 @@ El servidor local consulta primero esta biblioteca. Chrome también puede abrir
 la carpeta `2b2t_tiles` con permiso de solo lectura desde **Explorar → Fuentes
 de datos locales**.
 
-## Sesiones y highlights
+## Workspace, sesiones y highlights
 
-La sesión activa se guarda en `localStorage` bajo
-`obsidian-atlas-exploration-v1`. La exportación crea:
+El runtime guarda el workspace autoritativo en una ruta fija derivada de
+`OBSIDIAN_ATLAS_BACKING_ROOT`:
+
+```text
+/Volumes/LuisA/ObsidianAtlas/state/atlas-workspace.v1.json
+```
+
+Las escrituras usan revisión CAS, identificador idempotente, temporal en el
+mismo directorio, `fsync`, renombrado atómico y backup. El documento conserva
+hasta 128 sesiones, 10,000 highlights, la sesión activa y la selección global.
+Las sesiones pausadas se pueden eliminar desde su tarjeta para liberar cupo.
+Una copia completa permanece en `localStorage`, aislada por pestaña, para
+recuperación cuando el volumen no está conectado. **Pausar y guardar** no
+desactiva una sesión hasta asegurar disco o navegador; si aparece un conflicto,
+la rama local se conserva y la UI exige confirmar antes de descartarla. El badge
+distingue comprobando, guardando, guardado, solo lectura, sin disco, conflicto
+y error.
+
+La exportación manual de una sesión crea:
 
 ```text
 obsidian-atlas-exploracion.json
@@ -287,11 +312,10 @@ obsidian-atlas-exploracion.json
 
 El archivo contiene región, zoom, LOD, celda actual y bitset de celdas
 revisadas. La importación valida versión, dimensión, límites, contador y
-codificación antes de reemplazar la sesión local.
+codificación antes de añadirla al workspace.
 
-Los highlights se guardan por separado bajo
-`obsidian-atlas-highlights-v1`. Pueden ser puntos o áreas con nombre, nota,
-color y visibilidad. Su exportación crea
+Los highlights pueden ser puntos o áreas con nombre, nota, color y visibilidad.
+Su exportación crea
 `obsidian-atlas-highlights.json`.
 
 ## Variables locales

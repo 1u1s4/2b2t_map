@@ -2,8 +2,9 @@
 
 Este directorio contiene la UI local de Obsidian Atlas. El producto divide una
 región del Overworld en tiles revisables, fija el zoom de la sesión y conserva
-el progreso en el navegador. El backend de desarrollo expone capacidad,
-lectura de tiles y descarga regional únicamente en `localhost`.
+el progreso en un workspace durable de LuisA. El backend de desarrollo expone
+capacidad, persistencia, lectura de tiles y descarga regional únicamente en
+`localhost`.
 
 ## Ejecutar
 
@@ -20,9 +21,9 @@ Después abre [http://localhost:3001](http://localhost:3001).
 ./start_local_atlas_luisa.sh --stop
 ```
 
-El lanzador requiere `/Volumes/LuisA`,
-`/Volumes/2b2t Tiles/2b2t_tiles`, `screen`, Python y las dependencias de este
-directorio. La primera instalación es:
+El lanzador requiere `/Volumes/LuisA`, `screen`, Python y las dependencias de
+este directorio. Prefiere `/Volumes/2b2t Tiles/2b2t_tiles`, pero si ese volumen
+no está montado usa automáticamente `../2b2t_tiles`. La primera instalación es:
 
 ```bash
 cd viewer
@@ -65,11 +66,12 @@ servidor a `localhost`.
 
 ## Crear una sesión
 
-1. Navega hasta el área de interés.
-2. Ajusta el zoom deseado.
-3. Abre **Explorar** con el dock o la tecla `E`.
-4. Dibuja una región, toma la vista actual o introduce cuatro coordenadas.
-5. Pulsa **Crear sesión de exploración**.
+1. Abre **Explorar** con el dock o la tecla `E`.
+2. Pulsa **Ver mapa completo y seleccionar**.
+3. Arrastra uno o más sectores de la rejilla maestra 33×33.
+4. Encaja la región o prepara el detalle máximo LOD 0.
+5. También puedes dibujar una región, usar la vista o introducir coordenadas.
+6. Pulsa **Crear sesión de exploración**.
 
 La región usa límites semiabiertos:
 
@@ -101,17 +103,11 @@ y límites X/Z de la celda actual.
 **Marcar como revisada** es reversible. La presencia de un WebP no cambia el
 progreso humano.
 
-El estado se guarda con la clave:
-
-```text
-obsidian-atlas-exploration-v1
-```
-
 **Exportar** genera `obsidian-atlas-exploracion.json`. El archivo incluye un
 bitset base64url, no una lista extensa de coordenadas. **Importar** valida
-versión, dimensión, límites alineados, escala, LOD, índice y contador. Cerrar
-una sesión elimina su estado del navegador, por lo que debe exportarse si se
-quiere archivar.
+versión, dimensión, límites alineados, escala, LOD, índice y contador.
+**Pausar sesión** la conserva y permite abrir otra región sin perder progreso.
+También se puede elegir directamente cualquier celda visible con un clic.
 
 El máximo por sesión es 4,000,000 de celdas. El canvas solo recorre las celdas
 visibles para evitar que una región grande bloquee la interfaz.
@@ -170,6 +166,15 @@ composición de imágenes y cuadrículas de coordenadas.
 - margen y resultado de la comparación;
 - trabajo regional actual.
 
+`GET /api/local-atlas/workspace` y `PUT /api/local-atlas/workspace` leen y
+guardan el workspace fijo de LuisA. `PUT` exige token local, `If-Match` y un
+write-id idempotente. El store valida el documento completo, limita tamaño y
+cantidad, escribe de forma atómica y mantiene un backup recuperable:
+
+```text
+/Volumes/LuisA/ObsidianAtlas/state/atlas-workspace.v1.json
+```
+
 El espacio efectivo es el menor entre la biblioteca montada y su volumen de
 respaldo. La comparación no acredita los datos existentes contra la referencia,
 por lo que mantiene un margen conservador. Esta lectura es informativa y no
@@ -219,9 +224,13 @@ Los highlights disponibles son:
 - área: `R` y arrastre.
 
 Nombre, nota, color y visibilidad permanecen en
-`obsidian-atlas-highlights-v1`. Su JSON de respaldo es
-`obsidian-atlas-highlights.json`. Las sesiones de rejilla y los highlights se
-persisten por separado.
+el workspace de LuisA. Su JSON de respaldo manual es
+`obsidian-atlas-highlights.json`. `localStorage` conserva una copia de
+recuperación completa por pestaña y migra automáticamente cuando su revisión
+base coincide. Un conflicto nunca sobrescribe LuisA: conserva la rama local
+hasta que el usuario elige explícitamente qué versión usar. El workspace admite
+128 sesiones y 10,000 highlights; las sesiones pausadas se pueden eliminar
+desde su tarjeta.
 
 ## Atajos
 

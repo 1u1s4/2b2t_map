@@ -70,10 +70,32 @@ import {
   type WorldBounds,
 } from "./lib/exploration-grid";
 import {
+  OVERWORLD_OBSERVED_DATA_BOUNDS,
+  OVERWORLD_OVERVIEW_CELL_BLOCKS,
+  OVERWORLD_OVERVIEW_CELL_COUNT,
+  OVERWORLD_OVERVIEW_GRID_BOUNDS,
+  coverageSelectionBetweenCells,
+  fitCoverageScale,
+  overviewCellAtWorld,
+  overviewCellForIndex,
+  parseCoverageSelection,
+  type OverworldCoverageSelection,
+  type OverworldOverviewCell,
+} from "./lib/overworld-coverage";
+import {
   downloadExplorationCell,
+  LocalAtlasWorkspaceConflictError,
+  localAtlasWorkspaceContent,
+  parseLocalAtlasWorkspaceContent,
+  parseLocalAtlasWorkspaceExplorations,
   readLocalAtlasRuntime,
+  readLocalAtlasWorkspace,
   stopLocalRegionJob,
+  writeLocalAtlasWorkspace,
   type LocalAtlasRuntime,
+  type LocalAtlasWorkspaceContent,
+  type LocalAtlasWorkspaceExploration,
+  type LocalAtlasWorkspacePrecondition,
 } from "./lib/local-atlas-runtime";
 import {
   type ChangeEvent,
@@ -91,12 +113,23 @@ const INITIAL_CAMERA = { x: -85_181, z: 168_232 };
 const INITIAL_SCALE = 2.9423;
 const MIN_SCALE = 1 / 1_500;
 const MAX_SCALE = 8;
+const MAX_WORKSPACE_EXPLORATIONS = 128;
+const MAX_WORKSPACE_HIGHLIGHTS = 10_000;
 const HIGHLIGHT_STORAGE_KEY = "obsidian-atlas-highlights-v1";
 const EXPLORATION_STORAGE_KEY = "obsidian-atlas-exploration-v1";
+const SAVED_EXPLORATIONS_STORAGE_KEY =
+  "obsidian-atlas-saved-explorations-v1";
+const LEGACY_WORKSPACE_RECOVERY_STORAGE_KEY =
+  "obsidian-atlas-workspace-recovery-v1";
+const WORKSPACE_RECOVERY_STORAGE_PREFIX =
+  "obsidian-atlas-workspace-recovery-v1:";
+const WORKSPACE_TAB_ID_SESSION_KEY = "obsidian-atlas-workspace-tab-id-v1";
+const COVERAGE_SELECTION_STORAGE_KEY =
+  "obsidian-atlas-overworld-selection-v1";
 const COLORS = ["#ff5f57", "#ffbd4a", "#26d9c7", "#62a8ff", "#c58cff"];
 
 type Drawer = "layers" | "exploration" | "highlights" | "help" | null;
-type MarkMode = "pin" | "area" | "region" | null;
+type MarkMode = "pin" | "area" | "region" | "coverage" | null;
 
 type Camera = {
   x: number;
@@ -142,6 +175,15 @@ type TileStats = {
   missing: number;
 };
 
+type PersistenceState =
+  | "checking"
+  | "saving"
+  | "saved"
+  | "readonly"
+  | "offline"
+  | "conflict"
+  | "error";
+
 type ActivePointer = {
   clientX: number;
   clientY: number;
@@ -149,8 +191,238 @@ type ActivePointer = {
   screenY: number;
 };
 
+type BrowserWorkspaceRecovery = {
+  readonly version: 1;
+  readonly dirty: true;
+  readonly updatedAt: string;
+  readonly base: LocalAtlasWorkspacePrecondition | null;
+  readonly content: LocalAtlasWorkspaceContent;
+  readonly storageKey: string;
+};
+
+let browserWorkspaceTabId: string | null = null;
+const activeBrowserWorkspaceBranches = new Set<string>();
+
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));
+}
+
+function parseBrowserWorkspaceRecovery(
+  value: unknown,
+  storageKey: string,
+): BrowserWorkspaceRecovery | null {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value)
+  ) {
+    return null;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.version !== 1 || candidate.dirty !== true) return null;
+  const updatedAt =
+    typeof candidate.updatedAt === "string" &&
+    Number.isFinite(new Date(candidate.updatedAt).getTime())
+      ? candidate.updatedAt
+      : "1970-01-01T00:00:00.000Z";
+  const content = parseLocalAtlasWorkspaceContent(candidate.content);
+  if (!content) return null;
+  let base: LocalAtlasWorkspacePrecondition | null = null;
+  if (candidate.base !== null) {
+    if (
+      typeof candidate.base !== "object" ||
+      Array.isArray(candidate.base)
+    ) {
+      return null;
+    }
+    const rawBase = candidate.base as Record<string, unknown>;
+    if (
+      typeof rawBase.workspaceId !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        rawBase.workspaceId,
+      ) ||
+      typeof rawBase.revision !== "number" ||
+      !Number.isSafeInteger(rawBase.revision) ||
+      rawBase.revision < 0
+    ) {
+      return null;
+    }
+    base = {
+      workspaceId: rawBase.workspaceId,
+      revision: rawBase.revision,
+    };
+  }
+  return {
+    version: 1,
+    dirty: true,
+    updatedAt,
+    base,
+    content,
+    storageKey,
+  };
+}
+
+function currentBrowserWorkspaceTabIdentifier() {
+  if (!browserWorkspaceTabId) {
+    try {
+      browserWorkspaceTabId =
+        window.sessionStorage.getItem(WORKSPACE_TAB_ID_SESSION_KEY);
+      if (!browserWorkspaceTabId) {
+        browserWorkspaceTabId = crypto.randomUUID();
+        window.sessionStorage.setItem(
+          WORKSPACE_TAB_ID_SESSION_KEY,
+          browserWorkspaceTabId,
+        );
+      }
+    } catch {
+      browserWorkspaceTabId = crypto.randomUUID();
+    }
+  }
+  return browserWorkspaceTabId;
+}
+
+function currentBrowserWorkspaceRecoveryKey() {
+  return `${WORKSPACE_RECOVERY_STORAGE_PREFIX}${currentBrowserWorkspaceTabIdentifier()}`;
+}
+
+function rotateBrowserWorkspaceRecoveryBranch() {
+  const previous = readRecoveryAtKey(currentBrowserWorkspaceRecoveryKey());
+  browserWorkspaceTabId = crypto.randomUUID();
+  try {
+    window.sessionStorage.setItem(
+      WORKSPACE_TAB_ID_SESSION_KEY,
+      browserWorkspaceTabId,
+    );
+  } catch {
+    // The in-memory branch id still separates this page instance.
+  }
+  if (previous) {
+    writeBrowserWorkspaceRecovery(previous.content, previous.base);
+  }
+  return browserWorkspaceTabId;
+}
+
+function readRecoveryAtKey(
+  storageKey: string,
+): BrowserWorkspaceRecovery | null {
+  try {
+    const stored = window.localStorage.getItem(storageKey);
+    return stored
+      ? parseBrowserWorkspaceRecovery(
+          JSON.parse(stored) as unknown,
+          storageKey,
+        )
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readBrowserWorkspaceRecovery(options?: {
+  includeOtherBranches?: boolean;
+}): BrowserWorkspaceRecovery | null {
+  const own = readRecoveryAtKey(currentBrowserWorkspaceRecoveryKey());
+  if (own || !options?.includeOtherBranches) return own;
+  const candidates: BrowserWorkspaceRecovery[] = [];
+  const legacy = readRecoveryAtKey(LEGACY_WORKSPACE_RECOVERY_STORAGE_KEY);
+  if (legacy) candidates.push(legacy);
+  try {
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const storageKey = window.localStorage.key(index);
+      if (
+        !storageKey ||
+        !storageKey.startsWith(WORKSPACE_RECOVERY_STORAGE_PREFIX)
+      ) {
+        continue;
+      }
+      const branchId = storageKey.slice(
+        WORKSPACE_RECOVERY_STORAGE_PREFIX.length,
+      );
+      if (
+        branchId !== currentBrowserWorkspaceTabIdentifier() &&
+        activeBrowserWorkspaceBranches.has(branchId)
+      ) {
+        continue;
+      }
+      const recovery = readRecoveryAtKey(storageKey);
+      if (recovery) candidates.push(recovery);
+    }
+  } catch {
+    // A current-tab branch is still sufficient when storage enumeration fails.
+  }
+  return (
+    candidates.sort((left, right) =>
+      right.updatedAt.localeCompare(left.updatedAt),
+    )[0] ?? null
+  );
+}
+
+function writeBrowserWorkspaceRecovery(
+  content: LocalAtlasWorkspaceContent,
+  base: LocalAtlasWorkspacePrecondition | null,
+): boolean {
+  try {
+    const recovery = {
+      version: 1,
+      dirty: true,
+      updatedAt: new Date().toISOString(),
+      base,
+      content,
+    } as const;
+    window.localStorage.setItem(
+      currentBrowserWorkspaceRecoveryKey(),
+      JSON.stringify(recovery),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearBrowserWorkspaceRecovery(
+  expectedContent?: LocalAtlasWorkspaceContent,
+) {
+  try {
+    const ownKey = currentBrowserWorkspaceRecoveryKey();
+    if (!expectedContent) {
+      window.localStorage.removeItem(ownKey);
+      return;
+    }
+    const expectedSignature = JSON.stringify(expectedContent);
+    const candidateKeys = new Set<string>([
+      ownKey,
+      LEGACY_WORKSPACE_RECOVERY_STORAGE_KEY,
+    ]);
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const storageKey = window.localStorage.key(index);
+      if (storageKey?.startsWith(WORKSPACE_RECOVERY_STORAGE_PREFIX)) {
+        candidateKeys.add(storageKey);
+      }
+    }
+    for (const storageKey of candidateKeys) {
+      const branchId = storageKey.startsWith(
+        WORKSPACE_RECOVERY_STORAGE_PREFIX,
+      )
+        ? storageKey.slice(WORKSPACE_RECOVERY_STORAGE_PREFIX.length)
+        : null;
+      if (
+        storageKey !== ownKey &&
+        branchId &&
+        activeBrowserWorkspaceBranches.has(branchId)
+      ) {
+        continue;
+      }
+      const recovery = readRecoveryAtKey(storageKey);
+      if (
+        recovery &&
+        JSON.stringify(recovery.content) === expectedSignature
+      ) {
+        window.localStorage.removeItem(storageKey);
+      }
+    }
+  } catch {
+    // The canonical disk workspace remains safe if browser cleanup is blocked.
+  }
 }
 
 function formatCoordinate(value: number) {
@@ -219,7 +491,7 @@ function isSafeMapCoordinate(value: unknown): value is number {
   return (
     typeof value === "number" &&
     Number.isSafeInteger(value) &&
-    Math.abs(value) <= 60_000_000
+    Math.abs(value) <= 30_000_000
   );
 }
 
@@ -265,9 +537,16 @@ function readHighlightList(
   options: { discardInvalid: boolean },
 ): Highlight[] | null {
   if (!Array.isArray(value)) return null;
+  if (
+    value.length > MAX_WORKSPACE_HIGHLIGHTS &&
+    !options.discardInvalid
+  ) {
+    return null;
+  }
+  const candidates = value.slice(0, MAX_WORKSPACE_HIGHLIGHTS);
   const seen = new Set<string>();
   const result: Highlight[] = [];
-  for (const item of value) {
+  for (const item of candidates) {
     if (!isValidHighlight(item) || seen.has(item.id)) {
       if (options.discardInvalid) continue;
       return null;
@@ -280,6 +559,50 @@ function readHighlightList(
 
 function locationHash(camera: Camera, scale: number) {
   return `#@${Math.round(camera.x)},${Math.round(camera.z)},${scale.toFixed(4)},0`;
+}
+
+function workspaceExplorationFromState(
+  state: ExplorationState,
+  previous?: LocalAtlasWorkspaceExploration,
+): LocalAtlasWorkspaceExploration {
+  const serialized = JSON.parse(
+    serializeExplorationState(state),
+  ) as LocalAtlasWorkspaceExploration["state"];
+  if (
+    previous &&
+    JSON.stringify(previous.state) === JSON.stringify(serialized)
+  ) {
+    return previous;
+  }
+  const now = new Date().toISOString();
+  return {
+    id: state.region.id,
+    createdAt: previous?.createdAt ?? now,
+    updatedAt: now,
+    state: serialized,
+  };
+}
+
+function explorationStateFromWorkspace(
+  exploration: LocalAtlasWorkspaceExploration,
+): ExplorationState {
+  return deserializeExplorationState(JSON.stringify(exploration.state));
+}
+
+function upsertWorkspaceExploration(
+  items: LocalAtlasWorkspaceExploration[],
+  state: ExplorationState,
+): LocalAtlasWorkspaceExploration[] {
+  const existingIndex = items.findIndex(
+    (item) => item.id === state.region.id,
+  );
+  const existing = existingIndex === -1 ? undefined : items[existingIndex];
+  const next = workspaceExplorationFromState(state, existing);
+  if (next === existing) return items;
+  if (existingIndex === -1) return [...items, next];
+  return items.map((item, index) =>
+    index === existingIndex ? next : item,
+  );
 }
 
 async function copyText(text: string) {
@@ -339,7 +662,24 @@ export function MapViewer() {
   } | null>(null);
   const areaStartRef = useRef<{ x: number; z: number } | null>(null);
   const areaPreviewRef = useRef<Highlight["bounds"]>(undefined);
+  const coverageStartRef = useRef<OverworldOverviewCell | null>(null);
   const localSourceRef = useRef<LocalTileSource | null>(null);
+  const workspaceHydrationTokenRef = useRef<string | null>(null);
+  const workspacePreconditionRef =
+    useRef<LocalAtlasWorkspacePrecondition | null>(null);
+  const workspaceContentRef = useRef<LocalAtlasWorkspaceContent | null>(null);
+  const workspaceRuntimeRef = useRef<LocalAtlasRuntime | null>(null);
+  const explorationStateRef = useRef<ExplorationState | null>(null);
+  const workspaceSavePromiseRef = useRef<Promise<boolean> | null>(null);
+  const workspaceConflictRef = useRef(false);
+  const workspaceSaveTimerRef = useRef<number | null>(null);
+  const lastSavedWorkspaceRef = useRef<string | null>(null);
+  const pendingWorkspaceWriteRef = useRef<{
+    readonly content: LocalAtlasWorkspaceContent;
+    readonly expected: LocalAtlasWorkspacePrecondition;
+    readonly signature: string;
+    readonly writeId: string;
+  } | null>(null);
 
   const [camera, setCamera] = useState<Camera>(INITIAL_CAMERA);
   const [scale, setScale] = useState(INITIAL_SCALE);
@@ -377,6 +717,12 @@ export function MapViewer() {
     },
   ]);
   const [showGrid, setShowGrid] = useState(true);
+  const [showCoverageGrid, setShowCoverageGrid] = useState(true);
+  const [coverageSelection, setCoverageSelection] =
+    useState<OverworldCoverageSelection | null>(null);
+  const [coveragePreview, setCoveragePreview] =
+    useState<OverworldCoverageSelection | null>(null);
+  const [coverageSelectionReady, setCoverageSelectionReady] = useState(false);
   const [onlineFallback, setOnlineFallback] = useState(false);
   const [localSource, setLocalSource] = useState<LocalTileSource | null>(null);
   const [archiveName, setArchiveName] = useState<string | null>(null);
@@ -396,7 +742,11 @@ export function MapViewer() {
     useState<ExplorationState | null>(null);
   const [confirmCloseExploration, setConfirmCloseExploration] =
     useState(false);
+  const [pauseBusy, setPauseBusy] = useState(false);
   const [explorationReady, setExplorationReady] = useState(false);
+  const [savedExplorations, setSavedExplorations] = useState<
+    LocalAtlasWorkspaceExploration[]
+  >([]);
   const [regionForm, setRegionForm] = useState({
     name: "Región de análisis",
     minX: "-86000",
@@ -409,6 +759,13 @@ export function MapViewer() {
     useState<LocalAtlasRuntime | null>(null);
   const [runtimeChecked, setRuntimeChecked] = useState(false);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const [workspaceBranchReady, setWorkspaceBranchReady] = useState(false);
+  const [workspaceReady, setWorkspaceReady] = useState(false);
+  const [persistenceState, setPersistenceState] =
+    useState<PersistenceState>("checking");
+  const [persistenceMessage, setPersistenceMessage] = useState(
+    "Comprobando LuisA…",
+  );
   const [toast, setToast] = useState<string | null>(null);
 
   const lod = lodForScale(scale);
@@ -426,10 +783,141 @@ export function MapViewer() {
   const explorationPercent = explorationState
     ? (explorationState.reviewedCount / explorationState.region.cellCount) * 100
     : 0;
-
+  const visibleCoverageSelection = coveragePreview ?? coverageSelection;
+  const coverageSummary = useMemo(() => {
+    let full = 0;
+    let partial = 0;
+    let availableTiles = 0;
+    for (let index = 0; index < OVERWORLD_OVERVIEW_CELL_COUNT; index += 1) {
+      const cell = overviewCellForIndex(index);
+      availableTiles += cell.availableTileCount;
+      if (cell.coverageStatus === "full") full += 1;
+      if (cell.coverageStatus === "partial") partial += 1;
+    }
+    return {
+      full,
+      partial,
+      available: full + partial,
+      empty: OVERWORLD_OVERVIEW_CELL_COUNT - full - partial,
+      availableTiles,
+    };
+  }, []);
+  const workspaceContent = useMemo<LocalAtlasWorkspaceContent>(
+    () => ({
+      schemaVersion: 1,
+      activeExplorationId: explorationState?.region.id ?? null,
+      explorations: savedExplorations,
+      highlights,
+      coverageSelection,
+    }),
+    [
+      coverageSelection,
+      explorationState?.region.id,
+      highlights,
+      savedExplorations,
+    ],
+  );
+  const orderedSavedExplorations = useMemo(
+    () =>
+      [...savedExplorations].sort((left, right) =>
+        right.updatedAt.localeCompare(left.updatedAt),
+      ),
+    [savedExplorations],
+  );
+  const runtimeMutationToken = localRuntime?.mutationToken ?? null;
+  const runtimePersistenceConfigured =
+    localRuntime?.persistence.configured ?? false;
+  const runtimePersistenceWritable =
+    localRuntime?.persistence.writable ?? false;
+  const workspaceMutationsBlocked =
+    !runtimeChecked ||
+    !workspaceBranchReady ||
+    pauseBusy ||
+    (runtimePersistenceConfigured && !workspaceReady);
   const notify = useCallback((message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(null), 1_700);
+  }, []);
+
+  useEffect(() => {
+    const pageInstanceId = crypto.randomUUID();
+    let branchId = currentBrowserWorkspaceTabIdentifier();
+    let channel: BroadcastChannel | null = null;
+    const readyTimer = window.setTimeout(
+      () => setWorkspaceBranchReady(true),
+      150,
+    );
+    if ("BroadcastChannel" in window) {
+      channel = new BroadcastChannel("obsidian-atlas-workspace-branches-v1");
+      channel.onmessage = (event: MessageEvent<unknown>) => {
+        if (
+          typeof event.data !== "object" ||
+          event.data === null ||
+          Array.isArray(event.data)
+        ) {
+          return;
+        }
+        const message = event.data as Record<string, unknown>;
+        if (
+          typeof message.pageInstanceId !== "string" ||
+          message.pageInstanceId === pageInstanceId
+        ) {
+          return;
+        }
+        if (message.type === "branch-query") {
+          channel?.postMessage({
+            type: "branch-presence",
+            branchId,
+            pageInstanceId,
+          });
+          return;
+        }
+        if (typeof message.branchId !== "string") return;
+        if (message.type === "branch-release") {
+          activeBrowserWorkspaceBranches.delete(message.branchId);
+          return;
+        }
+        if (message.type === "branch-presence") {
+          activeBrowserWorkspaceBranches.add(message.branchId);
+          return;
+        }
+        if (message.type !== "branch-claim") return;
+        activeBrowserWorkspaceBranches.add(message.branchId);
+        if (message.branchId !== branchId) return;
+        if (pageInstanceId > message.pageInstanceId) {
+          branchId = rotateBrowserWorkspaceRecoveryBranch();
+          channel?.postMessage({
+            type: "branch-claim",
+            branchId,
+            pageInstanceId,
+          });
+        } else {
+          channel?.postMessage({
+            type: "branch-claim",
+            branchId,
+            pageInstanceId,
+          });
+        }
+      };
+      channel.postMessage({
+        type: "branch-claim",
+        branchId,
+        pageInstanceId,
+      });
+      channel.postMessage({
+        type: "branch-query",
+        pageInstanceId,
+      });
+    }
+    return () => {
+      window.clearTimeout(readyTimer);
+      channel?.postMessage({
+        type: "branch-release",
+        branchId,
+        pageInstanceId,
+      });
+      channel?.close();
+    };
   }, []);
 
   const clearTileCache = useCallback(() => {
@@ -451,6 +939,43 @@ export function MapViewer() {
     setScale(state.region.scale);
   }, []);
 
+  const focusMapPoint = useCallback(
+    (x: number, z: number) => {
+      if (!explorationState) {
+        setCamera({ x, z });
+        return true;
+      }
+      const index = cellIndexAtWorld(explorationState.region, x, z);
+      if (index === null) {
+        notify("Ese punto queda fuera de la sesión activa");
+        return false;
+      }
+      const next = withCurrentIndex(explorationState, index);
+      setExplorationState(next);
+      focusExploration(next);
+      return true;
+    },
+    [explorationState, focusExploration, notify],
+  );
+
+  const archiveExploration = useCallback((state: ExplorationState) => {
+    setSavedExplorations((items) =>
+      upsertWorkspaceExploration(items, state),
+    );
+  }, []);
+
+  useEffect(() => {
+    workspaceContentRef.current = workspaceContent;
+  }, [workspaceContent]);
+
+  useEffect(() => {
+    workspaceRuntimeRef.current = localRuntime;
+  }, [localRuntime]);
+
+  useEffect(() => {
+    explorationStateRef.current = explorationState;
+  }, [explorationState]);
+
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       setLocalSupported(getFileSystemAccessSupport().supported);
@@ -468,6 +993,33 @@ export function MapViewer() {
         // A malformed local preference should never block the map.
       }
       setHighlightsReady(true);
+
+      try {
+        const stored = window.localStorage.getItem(
+          COVERAGE_SELECTION_STORAGE_KEY,
+        );
+        if (stored) {
+          const parsed = parseCoverageSelection(JSON.parse(stored) as unknown);
+          if (parsed) setCoverageSelection(parsed);
+        }
+      } catch {
+        // The disk-backed workspace can repair a malformed browser cache.
+      }
+      setCoverageSelectionReady(true);
+
+      try {
+        const stored = window.localStorage.getItem(
+          SAVED_EXPLORATIONS_STORAGE_KEY,
+        );
+        if (stored) {
+          const parsed = parseLocalAtlasWorkspaceExplorations(
+            JSON.parse(stored) as unknown,
+          );
+          if (parsed) setSavedExplorations(parsed);
+        }
+      } catch {
+        // A malformed recovery cache must never block disk hydration.
+      }
 
       let restoredExploration: ExplorationState | null = null;
       try {
@@ -539,6 +1091,55 @@ export function MapViewer() {
   }, [explorationReady, explorationState, notify]);
 
   useEffect(() => {
+    if (!explorationReady) return;
+    try {
+      window.localStorage.setItem(
+        SAVED_EXPLORATIONS_STORAGE_KEY,
+        JSON.stringify(savedExplorations),
+      );
+    } catch {
+      const timeout = window.setTimeout(
+        () =>
+          notify(
+            "No se pudo guardar la lista de sesiones en este navegador",
+          ),
+        0,
+      );
+      return () => window.clearTimeout(timeout);
+    }
+  }, [explorationReady, notify, savedExplorations]);
+
+  useEffect(() => {
+    if (!explorationReady || !explorationState) return;
+    const frame = window.requestAnimationFrame(() => {
+      setSavedExplorations((items) =>
+        upsertWorkspaceExploration(items, explorationState),
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [explorationReady, explorationState]);
+
+  useEffect(() => {
+    if (!coverageSelectionReady) return;
+    try {
+      if (coverageSelection) {
+        window.localStorage.setItem(
+          COVERAGE_SELECTION_STORAGE_KEY,
+          JSON.stringify(coverageSelection),
+        );
+      } else {
+        window.localStorage.removeItem(COVERAGE_SELECTION_STORAGE_KEY);
+      }
+    } catch {
+      const timeout = window.setTimeout(
+        () => notify("No se pudo guardar la selección global en el navegador"),
+        0,
+      );
+      return () => window.clearTimeout(timeout);
+    }
+  }, [coverageSelection, coverageSelectionReady, notify]);
+
+  useEffect(() => {
     const timeout = window.setTimeout(() => {
       window.history.replaceState(null, "", locationHash(camera, scale));
     }, 180);
@@ -549,12 +1150,24 @@ export function MapViewer() {
     const onHashChange = () => {
       const location = parseLocation(window.location.hash, []);
       if (!location) return;
+      if (explorationState) {
+        const index = cellIndexAtWorld(
+          explorationState.region,
+          location.x,
+          location.z,
+        );
+        if (index === null) return;
+        const next = withCurrentIndex(explorationState, index);
+        setExplorationState(next);
+        focusExploration(next);
+        return;
+      }
       setCamera({ x: location.x, z: location.z });
       if (location.scale) setScale(location.scale);
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
+  }, [explorationState, focusExploration]);
 
   useEffect(() => {
     const element = mapRef.current;
@@ -577,6 +1190,7 @@ export function MapViewer() {
       for (const record of cache.values()) {
         record.bitmap?.close();
       }
+      cache.clear();
     };
   }, []);
 
@@ -625,6 +1239,566 @@ export function MapViewer() {
       window.clearInterval(interval);
     };
   }, [clearTileCache, notify]);
+
+  const flushWorkspace = useCallback(async (): Promise<boolean> => {
+    const inFlight = workspaceSavePromiseRef.current;
+    if (inFlight) return inFlight;
+
+    const task = (async (): Promise<boolean> => {
+      while (true) {
+        const runtime = workspaceRuntimeRef.current;
+        const latestContent = workspaceContentRef.current;
+        if (!runtime?.persistence.configured || !latestContent) {
+          setPersistenceState("offline");
+          setPersistenceMessage("Sin guardar en LuisA · copia local activa");
+          return false;
+        }
+        if (!runtime.persistence.writable) {
+          setPersistenceState("readonly");
+          setPersistenceMessage("LuisA está en solo lectura · copia local activa");
+          return false;
+        }
+        if (workspaceConflictRef.current) {
+          setPersistenceState("conflict");
+          setPersistenceMessage(
+            "Conflicto pendiente · recarga LuisA antes de volver a guardar",
+          );
+          return false;
+        }
+        const latestSignature = JSON.stringify(latestContent);
+        if (
+          pendingWorkspaceWriteRef.current === null &&
+          latestSignature === lastSavedWorkspaceRef.current
+        ) {
+          setPersistenceState("saved");
+          setPersistenceMessage("Todo guardado en LuisA");
+          return true;
+        }
+        const expected = workspacePreconditionRef.current;
+        if (!expected && pendingWorkspaceWriteRef.current === null) {
+          setPersistenceState("error");
+          setPersistenceMessage("Falta la revisión segura del workspace");
+          return false;
+        }
+        const pending =
+          pendingWorkspaceWriteRef.current ??
+          {
+            content: latestContent,
+            expected: expected!,
+            signature: latestSignature,
+            writeId: crypto.randomUUID(),
+          };
+        pendingWorkspaceWriteRef.current = pending;
+
+        setPersistenceState("saving");
+        setPersistenceMessage("Guardando cambios en LuisA…");
+        try {
+          const saved = await writeLocalAtlasWorkspace(
+            runtime,
+            pending.content,
+            pending.expected,
+            { writeId: pending.writeId },
+          );
+          pendingWorkspaceWriteRef.current = null;
+          workspacePreconditionRef.current = {
+            workspaceId: saved.workspaceId,
+            revision: saved.revision,
+          };
+          lastSavedWorkspaceRef.current = JSON.stringify(
+            localAtlasWorkspaceContent(saved),
+          );
+          const latestAfterSave = workspaceContentRef.current;
+          if (
+            latestAfterSave &&
+            JSON.stringify(latestAfterSave) !==
+              lastSavedWorkspaceRef.current
+          ) {
+            writeBrowserWorkspaceRecovery(
+              latestAfterSave,
+              workspacePreconditionRef.current,
+            );
+          } else {
+            clearBrowserWorkspaceRecovery(
+              localAtlasWorkspaceContent(saved),
+            );
+          }
+          workspaceConflictRef.current = false;
+          setPersistenceState("saved");
+          setPersistenceMessage(
+            `Guardado en LuisA · ${new Date(saved.updatedAt ?? Date.now()).toLocaleTimeString("es-GT", {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}`,
+          );
+        } catch (error) {
+          if (error instanceof LocalAtlasWorkspaceConflictError) {
+            writeBrowserWorkspaceRecovery(
+              workspaceContentRef.current ?? pending.content,
+              pending.expected,
+            );
+            pendingWorkspaceWriteRef.current = null;
+            workspacePreconditionRef.current = null;
+            lastSavedWorkspaceRef.current = null;
+            workspaceConflictRef.current = true;
+            setPersistenceState("conflict");
+            setPersistenceMessage(
+              "Conflicto con otra pestaña · no se sobrescribió ningún dato",
+            );
+          } else {
+            setPersistenceState("error");
+            setPersistenceMessage(
+              error instanceof Error
+                ? error.message
+                : "No se pudo guardar en LuisA",
+            );
+          }
+          return false;
+        }
+
+        const latest = workspaceContentRef.current;
+        if (
+          !latest ||
+          JSON.stringify(latest) === lastSavedWorkspaceRef.current
+        ) {
+          return true;
+        }
+      }
+    })();
+
+    workspaceSavePromiseRef.current = task;
+    try {
+      return await task;
+    } finally {
+      if (workspaceSavePromiseRef.current === task) {
+        workspaceSavePromiseRef.current = null;
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (
+      !highlightsReady ||
+      !explorationReady ||
+      !coverageSelectionReady ||
+      !workspaceBranchReady
+    ) {
+      return;
+    }
+    if (!runtimePersistenceConfigured || !runtimeMutationToken) {
+      if (
+        runtimeChecked &&
+        lastSavedWorkspaceRef.current === null &&
+        workspaceContentRef.current
+      ) {
+        lastSavedWorkspaceRef.current = JSON.stringify(
+          workspaceContentRef.current,
+        );
+      }
+      const timeout = window.setTimeout(() => {
+        setPersistenceState("offline");
+        setPersistenceMessage("Sin LuisA · guardando copia en el navegador");
+        if (runtimeChecked) setWorkspaceReady(true);
+      }, 0);
+      return () => window.clearTimeout(timeout);
+    }
+    if (
+      workspaceHydrationTokenRef.current === runtimeMutationToken
+    ) {
+      const timeout = window.setTimeout(() => {
+        if (!runtimePersistenceWritable) {
+          setPersistenceState("readonly");
+          setPersistenceMessage(
+            "LuisA está en solo lectura · copia local activa",
+          );
+        } else if (workspaceConflictRef.current) {
+          setPersistenceState("conflict");
+          setPersistenceMessage(
+            "Conflicto pendiente · recarga LuisA antes de volver a guardar",
+          );
+        } else {
+          const latest = workspaceContentRef.current;
+          if (
+            latest &&
+            JSON.stringify(latest) !== lastSavedWorkspaceRef.current
+          ) {
+            void flushWorkspace();
+          } else {
+            setPersistenceState("saved");
+            setPersistenceMessage("LuisA conectado · todo guardado");
+          }
+        }
+      }, 0);
+      return () => window.clearTimeout(timeout);
+    }
+    workspaceHydrationTokenRef.current = runtimeMutationToken;
+    let cancelled = false;
+    let hydrationCompleted = false;
+
+    void (async () => {
+      await Promise.resolve();
+      if (cancelled) return;
+      const hydrationStartSignature = JSON.stringify(
+        workspaceContentRef.current,
+      );
+      setWorkspaceReady(false);
+      setPersistenceState("checking");
+      setPersistenceMessage("Leyendo workspace de LuisA…");
+      try {
+        const runtime = workspaceRuntimeRef.current;
+        if (!runtime?.persistence.configured) {
+          throw new Error("La persistencia de LuisA dejó de estar disponible");
+        }
+        let diskWorkspace = await readLocalAtlasWorkspace();
+        if (cancelled || !diskWorkspace) {
+          throw new Error("LuisA no devolvió un workspace");
+        }
+        pendingWorkspaceWriteRef.current = null;
+        workspaceConflictRef.current = false;
+
+        const contentAfterRead = workspaceContentRef.current;
+        if (
+          contentAfterRead &&
+          JSON.stringify(contentAfterRead) !== hydrationStartSignature
+        ) {
+          writeBrowserWorkspaceRecovery(contentAfterRead, null);
+        }
+        let browserRecovery = readBrowserWorkspaceRecovery({
+          includeOtherBranches: true,
+        });
+        if (
+          browserRecovery &&
+          browserRecovery.storageKey !== currentBrowserWorkspaceRecoveryKey() &&
+          writeBrowserWorkspaceRecovery(
+            browserRecovery.content,
+            browserRecovery.base,
+          )
+        ) {
+          browserRecovery =
+            readBrowserWorkspaceRecovery() ?? browserRecovery;
+        }
+        if (browserRecovery) {
+          const diskContent = localAtlasWorkspaceContent(diskWorkspace);
+          const recoveryMatchesDisk =
+            JSON.stringify(browserRecovery.content) ===
+            JSON.stringify(diskContent);
+          const baseMatchesDisk =
+            browserRecovery.base?.workspaceId === diskWorkspace.workspaceId &&
+            browserRecovery.base.revision === diskWorkspace.revision;
+          const diskIsEmpty =
+            diskWorkspace.revision === 0 &&
+            diskWorkspace.explorations.length === 0 &&
+            diskWorkspace.highlights.length === 0 &&
+            diskWorkspace.coverageSelection === null;
+
+          if (recoveryMatchesDisk) {
+            clearBrowserWorkspaceRecovery(browserRecovery.content);
+          } else if (
+            runtime.persistence.writable &&
+            (baseMatchesDisk || diskIsEmpty)
+          ) {
+            diskWorkspace = await writeLocalAtlasWorkspace(
+              runtime,
+              browserRecovery.content,
+              {
+                workspaceId: diskWorkspace.workspaceId,
+                revision: diskWorkspace.revision,
+              },
+            );
+            clearBrowserWorkspaceRecovery(browserRecovery.content);
+          } else {
+            const recoveredHighlights = readHighlightList(
+              browserRecovery.content.highlights,
+              { discardInvalid: false },
+            );
+            if (!recoveredHighlights) {
+              throw new Error("La copia de recuperación no es válida");
+            }
+            const recoveredActive = browserRecovery.content.activeExplorationId
+              ? browserRecovery.content.explorations.find(
+                  (item) =>
+                    item.id ===
+                    browserRecovery.content.activeExplorationId,
+                )
+              : undefined;
+            const recoveredExploration = recoveredActive
+              ? explorationStateFromWorkspace(recoveredActive)
+              : null;
+            workspacePreconditionRef.current = baseMatchesDisk
+              ? {
+                  workspaceId: diskWorkspace.workspaceId,
+                  revision: diskWorkspace.revision,
+                }
+              : null;
+            lastSavedWorkspaceRef.current = JSON.stringify(diskContent);
+            workspaceContentRef.current = browserRecovery.content;
+            setSavedExplorations([
+              ...browserRecovery.content.explorations,
+            ]);
+            setHighlights(recoveredHighlights);
+            setCoverageSelection(browserRecovery.content.coverageSelection);
+            setExplorationState(recoveredExploration);
+            if (recoveredExploration) focusExploration(recoveredExploration);
+            setWorkspaceReady(true);
+            if (!runtime.persistence.writable && baseMatchesDisk) {
+              setPersistenceState("readonly");
+              setPersistenceMessage(
+                "Cambios locales conservados · LuisA está en solo lectura",
+              );
+            } else {
+              workspaceConflictRef.current = true;
+              setPersistenceState("conflict");
+              setPersistenceMessage(
+                "Cambios locales en conflicto · elige qué versión conservar",
+              );
+            }
+            hydrationCompleted = true;
+            return;
+          }
+        }
+
+        if (
+          diskWorkspace.revision === 0 &&
+          diskWorkspace.explorations.length === 0 &&
+          diskWorkspace.highlights.length === 0 &&
+          diskWorkspace.coverageSelection === null
+        ) {
+          const cached = workspaceContentRef.current;
+          if (!cached) {
+            throw new Error("El workspace local todavía no está listo");
+          }
+          const explorations = [...cached.explorations];
+          const cachedExploration = explorationStateRef.current;
+          if (
+            cachedExploration &&
+            !explorations.some(
+              (item) => item.id === cachedExploration.region.id,
+            )
+          ) {
+            explorations.push(
+              workspaceExplorationFromState(cachedExploration),
+            );
+          }
+          const legacyContent: LocalAtlasWorkspaceContent = {
+            ...cached,
+            activeExplorationId: cachedExploration?.region.id ?? null,
+            explorations,
+          };
+          const hasLegacyData =
+            legacyContent.explorations.length > 0 ||
+            legacyContent.highlights.length > 0 ||
+            legacyContent.coverageSelection !== null;
+          const migrated = hasLegacyData && runtime.persistence.writable
+            ? await writeLocalAtlasWorkspace(
+                runtime,
+                legacyContent,
+                {
+                  workspaceId: diskWorkspace.workspaceId,
+                  revision: diskWorkspace.revision,
+                },
+              )
+            : diskWorkspace;
+          if (cancelled) return;
+          workspacePreconditionRef.current = {
+            workspaceId: migrated.workspaceId,
+            revision: migrated.revision,
+          };
+          lastSavedWorkspaceRef.current = JSON.stringify(
+            localAtlasWorkspaceContent(migrated),
+          );
+          if (hasLegacyData && runtime.persistence.writable) {
+            clearBrowserWorkspaceRecovery(legacyContent);
+          }
+          setSavedExplorations([...legacyContent.explorations]);
+          setWorkspaceReady(true);
+          if (runtime.persistence.writable) {
+            setPersistenceState("saved");
+            setPersistenceMessage(
+              hasLegacyData
+                ? "Datos del navegador migrados a LuisA"
+                : "Workspace de LuisA listo",
+            );
+          } else {
+            setPersistenceState("readonly");
+            setPersistenceMessage(
+              hasLegacyData
+                ? "LuisA en solo lectura · copia local conservada"
+                : "LuisA está en solo lectura",
+            );
+          }
+          hydrationCompleted = true;
+          return;
+        }
+
+        const restoredHighlights = readHighlightList(
+          diskWorkspace.highlights,
+          { discardInvalid: false },
+        );
+        if (!restoredHighlights) {
+          throw new Error("Los highlights de LuisA no son válidos");
+        }
+        const activeExploration = diskWorkspace.activeExplorationId
+          ? diskWorkspace.explorations.find(
+              (item) => item.id === diskWorkspace.activeExplorationId,
+            )
+          : undefined;
+        const restoredExploration = activeExploration
+          ? explorationStateFromWorkspace(activeExploration)
+          : null;
+
+        workspacePreconditionRef.current = {
+          workspaceId: diskWorkspace.workspaceId,
+          revision: diskWorkspace.revision,
+        };
+        lastSavedWorkspaceRef.current = JSON.stringify(
+          localAtlasWorkspaceContent(diskWorkspace),
+        );
+        setSavedExplorations([...diskWorkspace.explorations]);
+        setHighlights(restoredHighlights);
+        setCoverageSelection(diskWorkspace.coverageSelection);
+        setExplorationState(restoredExploration);
+        if (restoredExploration) focusExploration(restoredExploration);
+        setWorkspaceReady(true);
+        if (runtime.persistence.writable) {
+          setPersistenceState("saved");
+          setPersistenceMessage(
+            diskWorkspace.updatedAt
+              ? `Restaurado desde LuisA · rev. ${diskWorkspace.revision}`
+              : "Workspace de LuisA listo",
+          );
+        } else {
+          setPersistenceState("readonly");
+          setPersistenceMessage("Restaurado desde LuisA · solo lectura");
+        }
+        hydrationCompleted = true;
+      } catch (error) {
+        if (cancelled) return;
+        if (error instanceof LocalAtlasWorkspaceConflictError) {
+          const recovery = readBrowserWorkspaceRecovery({
+            includeOtherBranches: true,
+          });
+          if (recovery) {
+            const recoveredHighlights = readHighlightList(
+              recovery.content.highlights,
+              { discardInvalid: false },
+            );
+            if (recoveredHighlights) {
+              const recoveredActive = recovery.content.activeExplorationId
+                ? recovery.content.explorations.find(
+                    (item) =>
+                      item.id === recovery.content.activeExplorationId,
+                  )
+                : undefined;
+              const recoveredExploration = recoveredActive
+                ? explorationStateFromWorkspace(recoveredActive)
+                : null;
+              pendingWorkspaceWriteRef.current = null;
+              workspacePreconditionRef.current = null;
+              lastSavedWorkspaceRef.current = error.current
+                ? JSON.stringify(localAtlasWorkspaceContent(error.current))
+                : null;
+              workspaceContentRef.current = recovery.content;
+              workspaceConflictRef.current = true;
+              setSavedExplorations([...recovery.content.explorations]);
+              setHighlights(recoveredHighlights);
+              setCoverageSelection(recovery.content.coverageSelection);
+              setExplorationState(recoveredExploration);
+              if (recoveredExploration) {
+                focusExploration(recoveredExploration);
+              }
+              setWorkspaceReady(true);
+              setPersistenceState("conflict");
+              setPersistenceMessage(
+                "LuisA cambió durante la recuperación · tu copia local sigue intacta",
+              );
+              hydrationCompleted = true;
+              return;
+            }
+          }
+        }
+        workspaceHydrationTokenRef.current = null;
+        setWorkspaceReady(false);
+        setPersistenceState("error");
+        setPersistenceMessage(
+          error instanceof Error
+            ? error.message
+            : "No se pudo leer LuisA",
+        );
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (
+        !hydrationCompleted &&
+        workspaceHydrationTokenRef.current === runtimeMutationToken
+      ) {
+        workspaceHydrationTokenRef.current = null;
+      }
+    };
+  }, [
+    coverageSelectionReady,
+    explorationReady,
+    focusExploration,
+    flushWorkspace,
+    highlightsReady,
+    runtimeMutationToken,
+    runtimePersistenceConfigured,
+    runtimePersistenceWritable,
+    runtimeChecked,
+    workspaceBranchReady,
+  ]);
+
+  useEffect(() => {
+    if (
+      !workspaceReady ||
+      JSON.stringify(workspaceContent) === lastSavedWorkspaceRef.current
+    ) {
+      return;
+    }
+    const existingRecovery = readBrowserWorkspaceRecovery();
+    const stored = writeBrowserWorkspaceRecovery(
+      workspaceContent,
+      workspacePreconditionRef.current ?? existingRecovery?.base ?? null,
+    );
+    if (!stored) {
+      const timeout = window.setTimeout(
+        () => notify("El navegador no pudo actualizar la copia de recuperación"),
+        0,
+      );
+      return () => window.clearTimeout(timeout);
+    }
+  }, [notify, workspaceContent, workspaceReady]);
+
+  useEffect(() => {
+    if (
+      !workspaceReady ||
+      !runtimePersistenceConfigured ||
+      !runtimePersistenceWritable ||
+      workspaceConflictRef.current ||
+      JSON.stringify(workspaceContent) === lastSavedWorkspaceRef.current
+    ) {
+      return;
+    }
+    if (workspaceSaveTimerRef.current !== null) {
+      window.clearTimeout(workspaceSaveTimerRef.current);
+    }
+    workspaceSaveTimerRef.current = window.setTimeout(() => {
+      workspaceSaveTimerRef.current = null;
+      void flushWorkspace();
+    }, 650);
+    return () => {
+      if (workspaceSaveTimerRef.current !== null) {
+        window.clearTimeout(workspaceSaveTimerRef.current);
+        workspaceSaveTimerRef.current = null;
+      }
+    };
+  }, [
+    flushWorkspace,
+    runtimePersistenceConfigured,
+    runtimePersistenceWritable,
+    workspaceContent,
+    workspaceReady,
+  ]);
 
   const ensureTile = useCallback(
     (key: TileKey) => {
@@ -772,14 +1946,20 @@ export function MapViewer() {
           const destinationSize = tileSpan * scale;
 
           if (record?.status === "loaded" && record.bitmap) {
-            context.drawImage(
-              record.bitmap,
-              destination.x,
-              destination.y,
-              destinationSize + 0.5,
-              destinationSize + 0.5,
-            );
-            continue;
+            try {
+              context.drawImage(
+                record.bitmap,
+                destination.x,
+                destination.y,
+                destinationSize + 0.5,
+                destinationSize + 0.5,
+              );
+              continue;
+            } catch {
+              record.bitmap.close();
+              tileCacheRef.current.delete(tileCacheKey(key));
+              ensureTile(key);
+            }
           }
 
           let mayRequestAncestor =
@@ -816,17 +1996,24 @@ export function MapViewer() {
             const childX = tileX - parentTileX * subdivision;
             const childZ = tileZ - parentTileZ * subdivision;
             const sourceSize = 512 / subdivision;
-            context.drawImage(
-              parent.bitmap,
-              childX * sourceSize,
-              childZ * sourceSize,
-              sourceSize,
-              sourceSize,
-              destination.x,
-              destination.y,
-              destinationSize + 0.5,
-              destinationSize + 0.5,
-            );
+            try {
+              context.drawImage(
+                parent.bitmap,
+                childX * sourceSize,
+                childZ * sourceSize,
+                sourceSize,
+                sourceSize,
+                destination.x,
+                destination.y,
+                destinationSize + 0.5,
+                destinationSize + 0.5,
+              );
+            } catch {
+              parent.bitmap.close();
+              tileCacheRef.current.delete(tileCacheKey(parentKey));
+              ensureTile(parentKey);
+              continue;
+            }
             deepestFallbackLod =
               deepestFallbackLod === null
                 ? fallbackLod
@@ -865,6 +2052,92 @@ export function MapViewer() {
           context.fillText(`Z ${Math.round(z)}`, 12, point.y - 7);
         }
       }
+    }
+
+    if (showCoverageGrid && !explorationState) {
+      const overviewCellSize = OVERWORLD_OVERVIEW_CELL_BLOCKS * scale;
+      for (let index = 0; index < OVERWORLD_OVERVIEW_CELL_COUNT; index += 1) {
+        const cell = overviewCellForIndex(index);
+        if (
+          cell.bounds.maxXExclusive < minX ||
+          cell.bounds.minX > maxX ||
+          cell.bounds.maxZExclusive < minZ ||
+          cell.bounds.minZ > maxZ
+        ) {
+          continue;
+        }
+        const point = screenAtWorld(cell.bounds.minX, cell.bounds.minZ);
+        const selected =
+          visibleCoverageSelection !== null &&
+          cell.row >= visibleCoverageSelection.minRow &&
+          cell.row < visibleCoverageSelection.maxRowExclusive &&
+          cell.column >= visibleCoverageSelection.minColumn &&
+          cell.column < visibleCoverageSelection.maxColumnExclusive;
+
+        context.globalAlpha = 1;
+        context.fillStyle = selected
+          ? "rgba(98, 168, 255, 0.22)"
+          : cell.coverageStatus === "full"
+            ? "rgba(38, 217, 199, 0.045)"
+            : cell.coverageStatus === "partial"
+              ? "rgba(255, 189, 74, 0.09)"
+              : "rgba(2, 8, 15, 0.38)";
+        context.fillRect(
+          point.x,
+          point.y,
+          overviewCellSize,
+          overviewCellSize,
+        );
+        context.lineWidth = selected ? 2.5 : 1;
+        context.strokeStyle = selected
+          ? "rgba(133, 196, 255, 0.98)"
+          : cell.coverageStatus === "full"
+            ? "rgba(94, 242, 219, 0.36)"
+            : cell.coverageStatus === "partial"
+              ? "rgba(255, 196, 87, 0.58)"
+              : "rgba(164, 178, 195, 0.16)";
+        context.setLineDash(
+          selected || cell.coverageStatus === "full" ? [] : [4, 4],
+        );
+        context.strokeRect(
+          point.x + 0.5,
+          point.y + 0.5,
+          overviewCellSize - 1,
+          overviewCellSize - 1,
+        );
+        context.setLineDash([]);
+
+        if (overviewCellSize >= 72 && cell.coverageStatus !== "empty") {
+          context.font = "600 10px var(--font-geist-mono), monospace";
+          context.fillStyle = selected
+            ? "rgba(225, 242, 255, 0.98)"
+            : "rgba(225, 236, 246, 0.78)";
+          context.fillText(
+            `${cell.id} · ${cell.availableTileCount}/64`,
+            point.x + 8,
+            point.y + 17,
+          );
+        }
+      }
+
+      const observedStart = screenAtWorld(
+        OVERWORLD_OBSERVED_DATA_BOUNDS.minX,
+        OVERWORLD_OBSERVED_DATA_BOUNDS.minZ,
+      );
+      const observedEnd = screenAtWorld(
+        OVERWORLD_OBSERVED_DATA_BOUNDS.maxXExclusive,
+        OVERWORLD_OBSERVED_DATA_BOUNDS.maxZExclusive,
+      );
+      context.lineWidth = 2;
+      context.strokeStyle = "rgba(255, 209, 120, 0.78)";
+      context.setLineDash([9, 7]);
+      context.strokeRect(
+        observedStart.x,
+        observedStart.y,
+        observedEnd.x - observedStart.x,
+        observedEnd.y - observedStart.y,
+      );
+      context.setLineDash([]);
     }
 
     if (explorationState) {
@@ -1045,7 +2318,9 @@ export function MapViewer() {
     scale,
     screenAtWorld,
     selectedHighlightId,
+    showCoverageGrid,
     showGrid,
+    visibleCoverageSelection,
     viewSize,
   ]);
 
@@ -1094,6 +2369,11 @@ export function MapViewer() {
 
   const addPin = useCallback(
     (point: Camera) => {
+      if (highlights.length >= MAX_WORKSPACE_HIGHLIGHTS) {
+        setMarkMode(null);
+        notify("El workspace alcanzó el límite de 10,000 highlights");
+        return;
+      }
       const id = crypto.randomUUID();
       const highlight: Highlight = {
         id,
@@ -1117,6 +2397,13 @@ export function MapViewer() {
 
   const addArea = useCallback(
     (bounds: NonNullable<Highlight["bounds"]>) => {
+      if (highlights.length >= MAX_WORKSPACE_HIGHLIGHTS) {
+        areaPreviewRef.current = undefined;
+        setAreaPreview(undefined);
+        setMarkMode(null);
+        notify("El workspace alcanzó el límite de 10,000 highlights");
+        return;
+      }
       const x1 = Math.round(bounds.x1);
       const z1 = Math.round(bounds.z1);
       const x2 = Math.round(bounds.x2);
@@ -1169,11 +2456,88 @@ export function MapViewer() {
     [notify],
   );
 
+  const applyCoverageSelectionToRegion = useCallback(
+    (selection: OverworldCoverageSelection) => {
+      setRegionForm((current) => ({
+        ...current,
+        name:
+          selection.cellCount === 1
+            ? `Sector global F${selection.minRow + 1} · C${selection.minColumn + 1}`
+            : `Selección global ${selection.rows}×${selection.columns}`,
+        minX: String(selection.bounds.minX),
+        minZ: String(selection.bounds.minZ),
+        maxXExclusive: String(selection.bounds.maxXExclusive),
+        maxZExclusive: String(selection.bounds.maxZExclusive),
+      }));
+    },
+    [],
+  );
+
+  const commitCoverageSelection = useCallback(
+    (selection: OverworldCoverageSelection) => {
+      setCoverageSelection(selection);
+      setCoveragePreview(null);
+      applyCoverageSelectionToRegion(selection);
+      setDrawer("exploration");
+      notify(
+        `${selection.availableCellCount.toLocaleString("es-GT")} sectores con datos seleccionados`,
+      );
+    },
+    [applyCoverageSelectionToRegion, notify],
+  );
+
+  const viewFullCoverage = useCallback(() => {
+    const bounds = OVERWORLD_OVERVIEW_GRID_BOUNDS;
+    setCamera({
+      x: (bounds.minX + bounds.maxXExclusive) / 2,
+      z: (bounds.minZ + bounds.maxZExclusive) / 2,
+    });
+    setScale(fitCoverageScale(viewSize.width, viewSize.height, 68));
+    setShowCoverageGrid(true);
+    setDrawer("exploration");
+    setMarkMode("coverage");
+    notify("Arrastra sobre la rejilla para elegir una región");
+  }, [notify, viewSize]);
+
+  const openCoverageSelection = useCallback(
+    (maximumDetail = false) => {
+      if (!coverageSelection) return;
+      const bounds = coverageSelection.bounds;
+      const nextScale = maximumDetail
+        ? INITIAL_SCALE
+        : clamp(
+            Math.min(
+              (viewSize.width - 144) /
+                (bounds.maxXExclusive - bounds.minX),
+              (viewSize.height - 144) /
+                (bounds.maxZExclusive - bounds.minZ),
+            ),
+            MIN_SCALE,
+            MAX_SCALE,
+          );
+      setCamera({
+        x: (bounds.minX + bounds.maxXExclusive) / 2,
+        z: (bounds.minZ + bounds.maxZExclusive) / 2,
+      });
+      setScale(nextScale);
+      setMarkMode(null);
+      applyCoverageSelectionToRegion(coverageSelection);
+      notify(
+        maximumDetail
+          ? "Detalle máximo listo · LOD 0"
+          : "Región abierta; ajusta el zoom o inicia la exploración",
+      );
+    },
+    [applyCoverageSelectionToRegion, coverageSelection, notify, viewSize],
+  );
+
   const beginMarkMode = useCallback((mode: Exclude<MarkMode, null>) => {
     setMarkMode(mode);
     areaPreviewRef.current = undefined;
     setAreaPreview(undefined);
     areaStartRef.current = null;
+    coverageStartRef.current = null;
+    setCoveragePreview(null);
     pinStartRef.current = null;
     if (window.matchMedia("(max-width: 720px)").matches) {
       setDrawer(null);
@@ -1199,6 +2563,21 @@ export function MapViewer() {
       event.currentTarget.setPointerCapture(event.pointerId);
       return;
     }
+    if (markMode === "coverage") {
+      const cell = overviewCellAtWorld(world.x, world.z);
+      if (!cell) {
+        notify("Elige un sector dentro de la huella observada del Overworld");
+        return;
+      }
+      coverageStartRef.current = cell;
+      try {
+        setCoveragePreview(coverageSelectionBetweenCells(cell, cell));
+      } catch {
+        setCoveragePreview(null);
+      }
+      event.currentTarget.setPointerCapture(event.pointerId);
+      return;
+    }
     if (markMode === "area" || markMode === "region") {
       areaStartRef.current = world;
       const preview = {
@@ -1209,6 +2588,20 @@ export function MapViewer() {
       };
       areaPreviewRef.current = preview;
       setAreaPreview(preview);
+      event.currentTarget.setPointerCapture(event.pointerId);
+      return;
+    }
+
+    if (explorationState) {
+      const hit = hitHighlight(screenX, screenY);
+      pointerRef.current = {
+        id: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        camera,
+        moved: false,
+        hitId: hit?.id ?? null,
+      };
       event.currentTarget.setPointerCapture(event.pointerId);
       return;
     }
@@ -1286,6 +2679,19 @@ export function MapViewer() {
       return;
     }
 
+    if (markMode === "coverage" && coverageStartRef.current) {
+      const cell = overviewCellAtWorld(world.x, world.z);
+      if (!cell) return;
+      try {
+        setCoveragePreview(
+          coverageSelectionBetweenCells(coverageStartRef.current, cell),
+        );
+      } catch {
+        setCoveragePreview(null);
+      }
+      return;
+    }
+
     if (activePointersRef.current.has(event.pointerId)) {
       activePointersRef.current.set(event.pointerId, {
         clientX: event.clientX,
@@ -1296,6 +2702,7 @@ export function MapViewer() {
     }
 
     if (pinchRef.current && activePointersRef.current.size >= 2) {
+      if (explorationState) return;
       const [first, second] = [...activePointersRef.current.values()];
       const centerX = (first.screenX + second.screenX) / 2;
       const centerY = (first.screenY + second.screenY) / 2;
@@ -1329,6 +2736,7 @@ export function MapViewer() {
     const dx = event.clientX - pointer.startX;
     const dy = event.clientY - pointer.startY;
     if (Math.abs(dx) + Math.abs(dy) > 3) pointer.moved = true;
+    if (explorationState) return;
     setCamera({
       x: pointer.camera.x - dx / scale,
       z: pointer.camera.z - dy / scale,
@@ -1340,6 +2748,16 @@ export function MapViewer() {
     if (pinStart?.id === event.pointerId) {
       pinStartRef.current = null;
       if (!pinStart.moved) addPin(pinStart.point);
+    } else if (markMode === "coverage" && coverageStartRef.current) {
+      const selection = coveragePreview;
+      coverageStartRef.current = null;
+      setCoveragePreview(null);
+      setMarkMode(null);
+      if (selection) {
+        commitCoverageSelection(selection);
+      } else {
+        notify("La selección no contiene sectores con datos");
+      }
     } else if (
       (markMode === "area" || markMode === "region") &&
       areaPreviewRef.current
@@ -1367,8 +2785,28 @@ export function MapViewer() {
         pointer?.id === event.pointerId &&
         !pointer.moved
       ) {
-        setSelectedHighlightId(pointer.hitId);
-        if (pointer.hitId) setDrawer("highlights");
+        if (pointer.hitId) {
+          setSelectedHighlightId(pointer.hitId);
+          setDrawer("highlights");
+        } else if (explorationState) {
+          const rect = event.currentTarget.getBoundingClientRect();
+          const point = worldAtScreen(
+            event.clientX - rect.left,
+            event.clientY - rect.top,
+          );
+          const index = cellIndexAtWorld(
+            explorationState.region,
+            point.x,
+            point.z,
+          );
+          if (index !== null) {
+            const next = withCurrentIndex(explorationState, index);
+            setExplorationState(next);
+            focusExploration(next);
+          }
+        } else {
+          setSelectedHighlightId(null);
+        }
       }
       if (pointer?.id === event.pointerId) pointerRef.current = null;
     }
@@ -1386,8 +2824,10 @@ export function MapViewer() {
     if (pointerRef.current?.id === event.pointerId) pointerRef.current = null;
     if (pinStartRef.current?.id === event.pointerId) pinStartRef.current = null;
     areaStartRef.current = null;
+    coverageStartRef.current = null;
     areaPreviewRef.current = undefined;
     setAreaPreview(undefined);
+    setCoveragePreview(null);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
@@ -1412,6 +2852,22 @@ export function MapViewer() {
       return;
     }
     setSearchError(false);
+    if (explorationState) {
+      const index = cellIndexAtWorld(
+        explorationState.region,
+        result.x,
+        result.z,
+      );
+      if (index === null) {
+        notify("Esa ubicación queda fuera de la sesión activa");
+        return;
+      }
+      const next = withCurrentIndex(explorationState, index);
+      setExplorationState(next);
+      focusExploration(next);
+      notify(`Celda centrada en ${Math.round(result.x)}, ${Math.round(result.z)}`);
+      return;
+    }
     setCamera({ x: result.x, z: result.z });
     if (result.scale) setScale(result.scale);
     notify(`Centrado en ${Math.round(result.x)}, ${Math.round(result.z)}`);
@@ -1429,6 +2885,7 @@ export function MapViewer() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (workspaceMutationsBlocked) return;
       if (
         event.target instanceof HTMLInputElement ||
         event.target instanceof HTMLTextAreaElement
@@ -1454,9 +2911,11 @@ export function MapViewer() {
       } else if (event.key === "Escape") {
         pinStartRef.current = null;
         areaStartRef.current = null;
+        coverageStartRef.current = null;
         areaPreviewRef.current = undefined;
         setMarkMode(null);
         setAreaPreview(undefined);
+        setCoveragePreview(null);
         setDrawer(null);
       } else if (event.key.startsWith("Arrow")) {
         if (explorationState) {
@@ -1498,6 +2957,7 @@ export function MapViewer() {
     explorationState,
     moveExplorationCardinal,
     scale,
+    workspaceMutationsBlocked,
     zoomAt,
   ]);
 
@@ -1578,6 +3038,17 @@ export function MapViewer() {
 
   const startExploration = () => {
     try {
+      const knownExplorationIds = new Set(
+        savedExplorations.map((exploration) => exploration.id),
+      );
+      if (explorationState) {
+        knownExplorationIds.add(explorationState.region.id);
+      }
+      if (knownExplorationIds.size >= MAX_WORKSPACE_EXPLORATIONS) {
+        throw new Error(
+          "El workspace alcanzó el límite de 128 sesiones; exporta una antes de crear otra",
+        );
+      }
       const bounds: WorldBounds = {
         minX: Number(regionForm.minX),
         minZ: Number(regionForm.minZ),
@@ -1589,14 +3060,7 @@ export function MapViewer() {
       ) {
         throw new Error("Las cuatro coordenadas deben ser enteros");
       }
-      if (
-        explorationState &&
-        !window.confirm(
-          "Esto reemplazará la sesión de exploración activa. ¿Continuar?",
-        )
-      ) {
-        return;
-      }
+      if (explorationState) archiveExploration(explorationState);
       let next = createExplorationState({
         id: `region-${Date.now().toString(36)}`,
         name: regionForm.name.trim() || "Región de análisis",
@@ -1631,10 +3095,67 @@ export function MapViewer() {
     setConfirmCloseExploration(true);
   };
 
-  const confirmFinishExploration = () => {
-    setConfirmCloseExploration(false);
-    setExplorationState(null);
-    notify("Sesión de exploración cerrada");
+  const confirmFinishExploration = async () => {
+    if (!explorationState || pauseBusy) return;
+    setPauseBusy(true);
+    try {
+      const nextExplorations = upsertWorkspaceExploration(
+        [...savedExplorations],
+        explorationState,
+      );
+      if (nextExplorations.length > MAX_WORKSPACE_EXPLORATIONS) {
+        notify(
+          "No se puede pausar: el workspace alcanzó el límite de 128 sesiones",
+        );
+        return;
+      }
+      const nextContent: LocalAtlasWorkspaceContent = {
+        ...workspaceContent,
+        activeExplorationId: null,
+        explorations: nextExplorations,
+      };
+      const previousContent = workspaceContentRef.current;
+      const browserRecoverySaved = writeBrowserWorkspaceRecovery(
+        nextContent,
+        workspacePreconditionRef.current ??
+          readBrowserWorkspaceRecovery()?.base ??
+          null,
+      );
+      let savedToDisk = false;
+      if (!browserRecoverySaved) {
+        workspaceContentRef.current = nextContent;
+        savedToDisk = await flushWorkspace();
+        if (!savedToDisk) {
+          workspaceContentRef.current = previousContent;
+          notify(
+            "No se pudo asegurar una copia; la sesión sigue activa para que puedas exportarla",
+          );
+          return;
+        }
+      }
+      try {
+        window.localStorage.setItem(
+          SAVED_EXPLORATIONS_STORAGE_KEY,
+          JSON.stringify(nextExplorations),
+        );
+        window.localStorage.removeItem(EXPLORATION_STORAGE_KEY);
+      } catch {
+        // The full recovery record or the completed disk write is already safe.
+      }
+      setSavedExplorations(nextExplorations);
+      workspaceContentRef.current = nextContent;
+      explorationStateRef.current = null;
+      setConfirmCloseExploration(false);
+      setExplorationState(null);
+      if (!savedToDisk) savedToDisk = await flushWorkspace();
+      notify(
+        savedToDisk
+          ? "Sesión pausada y guardada en LuisA"
+          : "Sesión pausada · copia de recuperación conservada",
+      );
+    } finally {
+      setPauseBusy(false);
+    }
   };
 
   const exportExploration = () => {
@@ -1658,14 +3179,21 @@ export function MapViewer() {
     if (!file) return;
     try {
       const next = deserializeExplorationState(await file.text());
-      if (
-        explorationState &&
-        !window.confirm(
-          "Esto reemplazará la sesión de exploración activa. ¿Continuar?",
-        )
-      ) {
-        return;
+      const knownExplorationIds = new Set(
+        savedExplorations.map((exploration) => exploration.id),
+      );
+      if (explorationState) {
+        knownExplorationIds.add(explorationState.region.id);
       }
+      if (
+        !knownExplorationIds.has(next.region.id) &&
+        knownExplorationIds.size >= MAX_WORKSPACE_EXPLORATIONS
+      ) {
+        throw new Error(
+          "El workspace alcanzó el límite de 128 sesiones; exporta una antes de importar otra",
+        );
+      }
+      if (explorationState) archiveExploration(explorationState);
       setExplorationState(next);
       focusExploration(next);
       onlineFallbackRef.current = false;
@@ -1678,6 +3206,41 @@ export function MapViewer() {
         error instanceof Error ? error.message : "Sesión de exploración inválida",
       );
     }
+  };
+
+  const resumeSavedExploration = (
+    exploration: LocalAtlasWorkspaceExploration,
+  ) => {
+    try {
+      if (explorationState) archiveExploration(explorationState);
+      const next = explorationStateFromWorkspace(exploration);
+      setExplorationState(next);
+      focusExploration(next);
+      onlineFallbackRef.current = false;
+      setOnlineFallback(false);
+      clearTileCache();
+      setDrawer("exploration");
+      notify(`Sesión “${next.region.name}” restaurada`);
+    } catch {
+      notify("La sesión guardada ya no es compatible");
+    }
+  };
+
+  const deleteSavedExploration = (
+    exploration: LocalAtlasWorkspaceExploration,
+  ) => {
+    if (explorationState?.region.id === exploration.id) return;
+    if (
+      !window.confirm(
+        `¿Eliminar “${exploration.state.region.name}” del workspace? Exporta la sesión primero si quieres conservar otra copia.`,
+      )
+    ) {
+      return;
+    }
+    setSavedExplorations((items) =>
+      items.filter((item) => item.id !== exploration.id),
+    );
+    notify(`Sesión “${exploration.state.region.name}” eliminada`);
   };
 
   const reviewCurrentAndMove = (step: -1 | 1) => {
@@ -1793,6 +3356,12 @@ export function MapViewer() {
     if (!file) return;
     try {
       const parsed = JSON.parse(await file.text()) as unknown;
+      if (
+        Array.isArray(parsed) &&
+        parsed.length > MAX_WORKSPACE_HIGHLIGHTS
+      ) {
+        throw new Error("El archivo supera el límite de 10,000 highlights");
+      }
       const valid = readHighlightList(parsed, { discardInvalid: false });
       if (!valid) {
         throw new Error(
@@ -1833,7 +3402,23 @@ export function MapViewer() {
   return (
     <main
       className={`atlas-shell ${drawer ? "has-drawer" : ""} ${markMode ? "is-marking" : ""}`}
+      aria-busy={workspaceMutationsBlocked}
     >
+      {workspaceMutationsBlocked ? (
+        <div className="workspace-hydration-shield" role="status">
+          <HardDrive size={19} />
+          <div>
+            <strong>
+              {pauseBusy ? "Guardando sesión" : "Sincronizando workspace"}
+            </strong>
+            <span>
+              {pauseBusy
+                ? "Asegurando una copia antes de pausar…"
+                : "Protegiendo el progreso antes de habilitar cambios…"}
+            </span>
+          </div>
+        </div>
+      ) : null}
       <div ref={mapRef} className="map-stage">
         <canvas
           ref={canvasRef}
@@ -2044,6 +3629,285 @@ export function MapViewer() {
 
           {drawer === "exploration" && (
             <div className="drawer-content exploration-panel">
+              <section className="coverage-overview-card">
+                <div className="coverage-overview-heading">
+                  <Grid3X3 size={19} />
+                  <div>
+                    <span>REJILLA MAESTRA · OVERWORLD</span>
+                    <strong>Huella real publicada, sector por sector</strong>
+                  </div>
+                  <span className="coverage-overview-status">33 × 33</span>
+                </div>
+                <p className="coverage-overview-copy">
+                  Cada sector representa{" "}
+                  {OVERWORLD_OVERVIEW_CELL_BLOCKS.toLocaleString("es-GT")} ×{" "}
+                  {OVERWORLD_OVERVIEW_CELL_BLOCKS.toLocaleString("es-GT")}{" "}
+                  bloques. La máscara distingue tiles existentes de huecos.
+                </p>
+                <div className="coverage-overview-metrics">
+                  <span>
+                    Con datos
+                    <strong>
+                      {coverageSummary.available.toLocaleString("es-GT")} sectores
+                    </strong>
+                  </span>
+                  <span>
+                    Tiles verificados
+                    <strong>
+                      {coverageSummary.availableTiles.toLocaleString("es-GT")}
+                    </strong>
+                  </span>
+                  <span>
+                    Paso
+                    <strong>32,768 bloques</strong>
+                  </span>
+                </div>
+                <span className="coverage-bounds">
+                  X {formatCoordinate(OVERWORLD_OBSERVED_DATA_BOUNDS.minX)} →{" "}
+                  {formatCoordinate(
+                    OVERWORLD_OBSERVED_DATA_BOUNDS.maxXExclusive,
+                  )}
+                  <br />
+                  Z {formatCoordinate(OVERWORLD_OBSERVED_DATA_BOUNDS.minZ)} →{" "}
+                  {formatCoordinate(
+                    OVERWORLD_OBSERVED_DATA_BOUNDS.maxZExclusive,
+                  )}
+                </span>
+                <div className="coverage-overview-actions">
+                  <button
+                    type="button"
+                    data-primary="true"
+                    disabled={Boolean(explorationState)}
+                    onClick={viewFullCoverage}
+                  >
+                    <ScanSearch size={15} />
+                    Ver mapa completo y seleccionar
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={showCoverageGrid}
+                    disabled={Boolean(explorationState)}
+                    onClick={() => setShowCoverageGrid((visible) => !visible)}
+                  >
+                    {showCoverageGrid ? <Eye size={15} /> : <EyeOff size={15} />}
+                    {showCoverageGrid ? "Ocultar rejilla" : "Mostrar rejilla"}
+                  </button>
+                </div>
+                <div className="coverage-legend" aria-label="Leyenda de cobertura">
+                  <span
+                    className="coverage-legend-item"
+                    data-coverage="full"
+                  >
+                    <i className="coverage-legend-dot" />
+                    Completo
+                  </span>
+                  <span
+                    className="coverage-legend-item"
+                    data-coverage="partial"
+                  >
+                    <i className="coverage-legend-dot" />
+                    Parcial
+                  </span>
+                  <span
+                    className="coverage-legend-item"
+                    data-coverage="empty"
+                  >
+                    <i className="coverage-legend-dot" />
+                    Sin tile
+                  </span>
+                </div>
+              </section>
+
+              <section
+                className={`coverage-selection-card ${
+                  coverageSelection ? "" : "is-empty"
+                }`}
+                data-active={coverageSelection ? "true" : "false"}
+              >
+                <div className="coverage-selection-heading">
+                  <SquareMousePointer size={18} />
+                  <div>
+                    <span>REGIÓN SELECCIONADA</span>
+                    <strong>
+                      {coverageSelection
+                        ? `${coverageSelection.rows} filas × ${coverageSelection.columns} columnas`
+                        : "Todavía no has elegido una región"}
+                    </strong>
+                  </div>
+                  {coverageSelection ? (
+                    <span className="coverage-selection-status">
+                      {coverageSelection.availableCellCount} con datos
+                    </span>
+                  ) : null}
+                </div>
+                {coverageSelection ? (
+                  <>
+                    <div className="coverage-selection-summary">
+                      <span>
+                        Sectores
+                        <strong>{coverageSelection.cellCount}</strong>
+                      </span>
+                      <span>
+                        Completos
+                        <strong>{coverageSelection.fullCellCount}</strong>
+                      </span>
+                      <span>
+                        Parciales
+                        <strong>{coverageSelection.partialCellCount}</strong>
+                      </span>
+                    </div>
+                    <span className="coverage-selection-bounds">
+                      X {formatCoordinate(coverageSelection.bounds.minX)} →{" "}
+                      {formatCoordinate(
+                        coverageSelection.bounds.maxXExclusive,
+                      )}
+                      <br />
+                      Z {formatCoordinate(coverageSelection.bounds.minZ)} →{" "}
+                      {formatCoordinate(
+                        coverageSelection.bounds.maxZExclusive,
+                      )}
+                    </span>
+                    <div className="coverage-full-map-actions">
+                      <button
+                        type="button"
+                        onClick={() => openCoverageSelection(false)}
+                      >
+                        <Crosshair size={15} />
+                        Encajar región
+                      </button>
+                      <button
+                        type="button"
+                        data-primary="true"
+                        onClick={() => openCoverageSelection(true)}
+                      >
+                        <ScanSearch size={15} />
+                        Preparar LOD 0
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="coverage-selection-hint">
+                    Pulsa “Ver mapa completo” y arrastra desde el primer sector
+                    hasta el último. También puedes seguir escribiendo
+                    coordenadas exactas.
+                  </p>
+                )}
+              </section>
+
+              <section className="saved-session-picker">
+                <div className="saved-session-picker-heading">
+                  <HardDrive size={18} />
+                  <div>
+                    <span>WORKSPACE DURABLE</span>
+                    <strong>Progreso, regiones y highlights</strong>
+                  </div>
+                  <span
+                    className="persistence-badge"
+                    data-state={persistenceState}
+                    title={persistenceMessage}
+                  >
+                    <strong>{persistenceMessage}</strong>
+                  </span>
+                </div>
+                <div className="saved-session-actions">
+                  <button
+                    type="button"
+                    className="compact-button is-primary"
+                    disabled={
+                      persistenceState === "saving" ||
+                      persistenceState === "conflict" ||
+                      !localRuntime?.persistence.configured ||
+                      !localRuntime.persistence.writable
+                    }
+                    onClick={() => void flushWorkspace()}
+                  >
+                    <HardDrive size={14} />
+                    Guardar ahora
+                  </button>
+                  {persistenceState === "conflict" ? (
+                    <button
+                      type="button"
+                      className="compact-button"
+                      onClick={() => {
+                        if (
+                          !window.confirm(
+                            "Esto descartará la copia local en conflicto y cargará la versión guardada en LuisA. ¿Continuar?",
+                          )
+                        ) {
+                          return;
+                        }
+                        clearBrowserWorkspaceRecovery(
+                          workspaceContentRef.current ?? workspaceContent,
+                        );
+                        window.location.reload();
+                      }}
+                    >
+                      <RotateCcw size={14} />
+                      Usar versión de LuisA
+                    </button>
+                  ) : null}
+                </div>
+                {orderedSavedExplorations.length > 0 ? (
+                  <div className="saved-session-list">
+                    {orderedSavedExplorations.map((exploration) => {
+                      const active =
+                        explorationState?.region.id === exploration.id;
+                      return (
+                        <article
+                          className={`saved-session-item ${
+                            active ? "is-active" : ""
+                          }`}
+                          key={exploration.id}
+                        >
+                          <div>
+                            <strong>{exploration.state.region.name}</strong>
+                            <span>
+                              LOD {exploration.state.region.lod} ·{" "}
+                              {exploration.state.reviewedCount.toLocaleString(
+                                "es-GT",
+                              )}{" "}
+                              revisadas
+                            </span>
+                          </div>
+                          <div className="saved-session-item-actions">
+                            <button
+                              type="button"
+                              disabled={active}
+                              onClick={() =>
+                                resumeSavedExploration(exploration)
+                              }
+                            >
+                              {active ? "Activa" : "Abrir"}
+                            </button>
+                            <button
+                              type="button"
+                              className="danger"
+                              disabled={active}
+                              aria-label={`Eliminar ${exploration.state.region.name}`}
+                              title={
+                                active
+                                  ? "Pausa la sesión antes de eliminarla"
+                                  : "Eliminar del workspace"
+                              }
+                              onClick={() =>
+                                deleteSavedExploration(exploration)
+                              }
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="saved-session-empty">
+                    Las regiones que inicies aparecerán aquí y permanecerán en
+                    LuisA aunque cierres el navegador.
+                  </p>
+                )}
+              </section>
+
               <section
                 className={`capacity-card ${
                   localRuntime?.capacity.fits === true
@@ -2379,7 +4243,7 @@ export function MapViewer() {
                       onClick={finishExploration}
                     >
                       <Trash2 size={15} />
-                      Cerrar sesión
+                      Pausar sesión
                     </button>
                   </div>
                   {confirmCloseExploration ? (
@@ -2388,9 +4252,10 @@ export function MapViewer() {
                       aria-label="Confirmar cierre de sesión"
                     >
                       <div>
-                        <strong>¿Eliminar este progreso local?</strong>
+                        <strong>¿Pausar esta sesión?</strong>
                         <small>
-                          Exporta primero si quieres retomarlo más adelante.
+                          El progreso seguirá en el workspace y podrás abrirlo
+                          otra vez.
                         </small>
                       </div>
                       <div>
@@ -2403,9 +4268,12 @@ export function MapViewer() {
                         <button
                           type="button"
                           className="danger"
+                          disabled={persistenceState === "saving"}
                           onClick={confirmFinishExploration}
                         >
-                          Eliminar progreso
+                          {persistenceState === "saving"
+                            ? "Guardando…"
+                            : "Pausar y guardar"}
                         </button>
                       </div>
                     </section>
@@ -2587,10 +4455,7 @@ export function MapViewer() {
                       type="button"
                       aria-label="Centrar highlight"
                       onClick={() =>
-                        setCamera({
-                          x: selectedHighlight.x,
-                          z: selectedHighlight.z,
-                        })
+                        focusMapPoint(selectedHighlight.x, selectedHighlight.z)
                       }
                     >
                       <Crosshair size={16} />
@@ -2664,7 +4529,7 @@ export function MapViewer() {
                       key={highlight.id}
                       onClick={() => {
                         setSelectedHighlightId(highlight.id);
-                        setCamera({ x: highlight.x, z: highlight.z });
+                        focusMapPoint(highlight.x, highlight.z);
                       }}
                     >
                       <span
@@ -2699,8 +4564,8 @@ export function MapViewer() {
                   </div>
                   <h3>Tu mapa, tus referencias</h3>
                   <p>
-                    Marca un punto o arrastra un área. Se guardan únicamente en
-                    este navegador.
+                    Marca un punto o arrastra un área. Se guardan
+                    automáticamente en LuisA y mantienen una copia local.
                   </p>
                   <button type="button" onClick={() => beginMarkMode("pin")}>
                     <Plus size={16} />
@@ -2935,6 +4800,8 @@ export function MapViewer() {
         <div className="marking-banner glass-card">
           {markMode === "pin" ? (
             <MapPin />
+          ) : markMode === "coverage" ? (
+            <Grid3X3 />
           ) : markMode === "region" ? (
             <SquareMousePointer />
           ) : (
@@ -2944,6 +4811,8 @@ export function MapViewer() {
             <strong>
               {markMode === "pin"
                 ? "Haz clic para marcar"
+                : markMode === "coverage"
+                  ? "Arrastra para seleccionar sectores del Overworld"
                 : markMode === "region"
                   ? "Arrastra para delimitar la región"
                   : "Arrastra para delimitar un área"}
@@ -2956,9 +4825,11 @@ export function MapViewer() {
             onClick={() => {
               pinStartRef.current = null;
               areaStartRef.current = null;
+              coverageStartRef.current = null;
               areaPreviewRef.current = undefined;
               setMarkMode(null);
               setAreaPreview(undefined);
+              setCoveragePreview(null);
             }}
           >
             <X />
