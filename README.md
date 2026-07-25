@@ -283,8 +283,9 @@ python download_all_2b2t.py \
 
 En este equipo, `run_full_download_luisa.sh` monta el contenedor APFS alojado
 en la unidad `LuisA`, evita el desperdicio de ExFAT, mantiene el equipo
-despierto y ejecuta exactamente ese alcance. Usa una reserva adicional del
-18 % porque cada grupo ya incorpora un 25 % conservador de incertidumbre:
+despierto y ejecuta exactamente ese alcance. El lanzador normal exige y usa
+una reserva adicional del 20 % después de que cada grupo incorpora un 25 %
+conservador de incertidumbre:
 
 ```bash
 ./run_full_download_luisa.sh
@@ -619,7 +620,21 @@ más adelante.
 La reserva adicional no sustituye el margen interno: se aplica después del
 25 % de incertidumbre por muestreo. Por ejemplo, 18 % de reserva equivale a
 exigir aproximadamente 47,5 % sobre la estimación puntual
-(`1,25 × 1,18 = 1,475`).
+(`1,25 × 1,18 = 1,475`). Ese total combinado no sustituye el requisito
+independiente de reservar 20 % después de la estimación conservadora.
+`estimate.json` registra `sampling_uncertainty_percent`,
+`nominal_total_margin_percent`, `effective_total_margin_percent` y
+`meets_required_space_headroom` para distinguir ambos conceptos sin inferirlos
+a partir del comando. El margen efectivo queda `null` cuando ya no existe una
+estimación puntual restante contra la cual calcular el cociente.
+
+El CLI y el lanzador rechazan normalmente cualquier reserva menor de 20 %.
+Existe una excepción estrecha para continuar la ejecución histórica completa
+que ya arrancó al 18 %: exige `--resume`, alcance completo, `--no-fallback` y
+un `estimate.json` existente que pruebe exactamente ese mismo plan. El
+supervisor añade además una marca interna para que el lanzador admita ese único
+18 %, pero esa marca no evita la prueba del plan existente. No permite iniciar
+una salida nueva ni un alcance parcial por debajo del requisito.
 
 Las cifras cambian con las muestras del origen, los tiles ya descargados, la
 unidad de asignación y el espacio libre. Siempre debe prevalecer el
@@ -628,22 +643,28 @@ mapa completo se detenga si no cabe, en vez de declarar terminado un subconjunto
 
 ## Estado actual de la descarga y espacio
 
-Instantánea del **24 de julio de 2026 a las 19:19 UTC−6**:
+Instantánea del **24 de julio de 2026 a las 20:37 UTC−6**:
 
 - `LuisA` está montada y tiene 1,34 TiB libres;
 - un sparsebundle alojado en `LuisA` está montado como `/Volumes/2b2t Tiles`;
 - el contenedor usa APFS con bloques de 4 KiB, frente a los 128 KiB de ExFAT;
-- el inventario arrancó la cola con más de 90 000 tiles completos y 0 corruptos;
+- hay 97 796 tiles completos, 3 247 ausentes y 0 corruptos;
 - la sesión detached `obsidian_atlas_full` está activa;
 - el alcance solicitado es `overworld,nether,end × base,overlay,newchunks ×
   LOD 0..10`;
 - `--no-fallback` impide sustituir silenciosamente el mapa completo por un plan
   parcial;
-- el preflight de 99 grupos terminó y aprobó el alcance completo;
-- la estimación conservadora restante es 1,12 TiB; con 18 % de reserva exige
-  1,33 TiB, por debajo del espacio libre;
+- el preflight de 99 grupos aprobó temporalmente el alcance completo al 18 %;
+  esto no se presenta como cumplimiento del requisito independiente del 20 %;
+- el proceso histórico sigue al 18 % mientras descarga; el cálculo estricto
+  para 20 % todavía tiene un faltante de 10,33 GiB en el volumen limitante;
+- `margin_upgrade.json` publica ese cálculo contra el APFS y contra `LuisA`;
+  cuando ambos pasen la desigualdad estable, el supervisor migrará al 20 %;
 - la cola estimada contiene 17 157 504 solicitudes y publica su barra cada
-  cinco segundos; a 2 solicitudes/s, el tiempo mínimo ronda 99 días.
+  cinco segundos; lleva 101 044 procesadas (0,589 %) y la velocidad observada
+  ronda 1,96 tiles/s;
+- el watchdog automático final está activo y adoptó el mismo PID histórico sin
+  interrumpirlo.
 
 Los datos viven en:
 
@@ -698,6 +719,23 @@ Nunca reanuda `stopped`, `error`, `incomplete`, `preflight_blocked`,
 desmontado, JSON inválido o cualquier finalización. Mientras permanece activo,
 limita los reinicios a tres por cada ventana de 24 horas y el lanzador usa un
 bloqueo atómico para impedir dos descargadores.
+
+Además, comprueba cada cinco minutos cuándo la reserva independiente del 20 %
+cabe tanto en el APFS como en `LuisA`. Exige tres lecturas vivas consecutivas,
+heartbeat fresco, alcance completo e identidad exacta del PID. Entonces guarda
+`margin_transition.json`, envía un único `SIGINT`, espera `stopped` con razón
+exacta `interrumpido`, cero filas `downloading` y `PRAGMA quick_check=ok`, y
+repite el cálculo sin escrituras activas. Solo después relanza al 20 %. Si la
+cuarta lectura ya no cabe, reanuda temporalmente al 18 % y aplica un cooldown.
+Ese relanzamiento también vuelve a demostrar que el 18 % cabe en ambos
+volúmenes; si no cabe, se detiene sin lanzar nada. Después de sincronizar el
+journal, repite por última vez los gates de margen, progreso `running`, PID y
+lock antes de enviar la señal. Un reinicio inesperado exige igualmente
+`PRAGMA quick_check=ok`, el porcentaje exacto contra ambos volúmenes y un
+heartbeat posterior al PID nuevo.
+El journal permite recuperar una caída del supervisor entre la señal y el
+relanzamiento sin usar `SIGKILL`, sin borrar un lock vivo y sin hacer downgrade
+después de validar el 20 %.
 
 ```bash
 screen -dmS obsidian_atlas_watchdog /bin/zsh -lc \

@@ -87,6 +87,9 @@ SCHEMA_SOURCES = {
 RETRYABLE_STATUSES = {408, 425, 429}
 TERMINAL_STATUSES = {"complete", "absent", "probe_complete"}
 DEFAULT_SPACE_HEADROOM_PERCENT = 20.0
+SAMPLING_UNCERTAINTY_PERCENT = 25.0
+REQUIRED_SPACE_HEADROOM_PERCENT = 20.0
+TEMPORARY_MIGRATION_HEADROOM_PERCENT = 18.0
 
 
 def utc_now() -> str:
@@ -158,6 +161,15 @@ def bytes_with_space_headroom(
         max(0, conservative_bytes)
         * (1.0 + space_headroom_percent / 100.0)
     )
+
+
+def compounded_margin_percent(*percentages: float) -> float:
+    """Combine sequential percentage reserves without adding them linearly."""
+
+    multiplier = 1.0
+    for percentage in percentages:
+        multiplier *= 1.0 + max(0.0, percentage) / 100.0
+    return (multiplier - 1.0) * 100.0
 
 
 def is_retryable_http_status(status: int) -> bool:
@@ -919,6 +931,36 @@ class TileDatabase:
         ).fetchone()
         return int(row["count"]), int(row["bytes"])
 
+    def completed_bytes_by_group(
+        self,
+        dimensions: Sequence[str],
+        layers: Sequence[str],
+        lods: set[int],
+    ) -> dict[tuple[str, str, int], int]:
+        dimension_marks = ",".join("?" for _ in dimensions)
+        layer_marks = ",".join("?" for _ in layers)
+        lod_marks = ",".join("?" for _ in lods)
+        return {
+            (
+                str(row["dimension"]),
+                str(row["layer"]),
+                int(row["lod"]),
+            ): int(row["bytes"])
+            for row in self.connection.execute(
+                f"""
+                SELECT dimension, layer, lod,
+                       COALESCE(SUM(size_bytes), 0) AS bytes
+                FROM tiles
+                WHERE dimension IN ({dimension_marks})
+                  AND layer IN ({layer_marks})
+                  AND lod IN ({lod_marks})
+                  AND status='complete'
+                GROUP BY dimension, layer, lod
+                """,
+                [*dimensions, *layers, *sorted(lods)],
+            )
+        }
+
     def has_pending(
         self,
         dimensions: Sequence[str],
@@ -1516,6 +1558,18 @@ def final_status_for_plan(status: str, *, fallback: bool) -> str:
 def download_plan_payload(plan: DownloadPlan) -> dict[str, Any]:
     """Return a deterministic JSON-serializable representation of a plan."""
 
+    minimum_required_with_headroom = bytes_with_space_headroom(
+        plan.conservative_bytes,
+        REQUIRED_SPACE_HEADROOM_PERCENT,
+    )
+    effective_total_margin_percent = (
+        max(
+            0.0,
+            (plan.required_with_headroom / plan.point_bytes - 1.0) * 100.0,
+        )
+        if plan.point_bytes > 0
+        else None
+    )
     return {
         "dimensions": list(plan.dimensions),
         "layers": list(plan.layers),
@@ -1528,6 +1582,19 @@ def download_plan_payload(plan: DownloadPlan) -> dict[str, Any]:
         "free_bytes": plan.free_bytes,
         "required_with_headroom": plan.required_with_headroom,
         "space_headroom_percent": plan.space_headroom_percent,
+        "sampling_uncertainty_percent": SAMPLING_UNCERTAINTY_PERCENT,
+        "required_space_headroom_percent": REQUIRED_SPACE_HEADROOM_PERCENT,
+        "nominal_total_margin_percent": compounded_margin_percent(
+            SAMPLING_UNCERTAINTY_PERCENT,
+            plan.space_headroom_percent,
+        ),
+        "effective_total_margin_percent": effective_total_margin_percent,
+        "minimum_required_with_headroom": minimum_required_with_headroom,
+        "meets_required_space_headroom": (
+            plan.space_headroom_percent >= REQUIRED_SPACE_HEADROOM_PERCENT
+            and plan.required_with_headroom
+            >= minimum_required_with_headroom
+        ),
         "headroom_bytes": max(
             0, plan.required_with_headroom - plan.conservative_bytes
         ),
@@ -1893,7 +1960,10 @@ def discover_estimates(
                 )
                 # Margen de incertidumbre de 25 %, independiente de la reserva
                 # adicional configurable exigida en el preflight.
-                conservative = math.ceil(point_bytes * 1.25)
+                conservative = math.ceil(
+                    point_bytes
+                    * (1.0 + SAMPLING_UNCERTAINTY_PERCENT / 100.0)
+                )
                 estimated_requests = candidates
                 row = EstimateRow(
                     dimension=dimension,
@@ -1960,6 +2030,27 @@ def print_estimate_table(rows: Sequence[EstimateRow], logger: logging.Logger) ->
     logger.info("")
 
 
+def remaining_estimate_bytes(
+    rows: Sequence[EstimateRow],
+    existing_bytes_by_group: dict[tuple[str, str, int], int],
+    *,
+    point_estimate: bool,
+) -> int:
+    total = 0
+    for row in rows:
+        existing = existing_bytes_by_group.get(
+            (row.dimension, row.layer, row.lod),
+            0,
+        )
+        estimated = (
+            row.candidate_tiles * row.mean_bytes_per_candidate
+            if point_estimate
+            else row.conservative_bytes
+        )
+        total += max(0, math.ceil(estimated) - existing)
+    return total
+
+
 def build_plan(
     *,
     dimensions: list[str],
@@ -1970,15 +2061,43 @@ def build_plan(
     existing_bytes: int,
     allow_fallback: bool,
     space_headroom_percent: float = DEFAULT_SPACE_HEADROOM_PERCENT,
+    existing_bytes_by_group: dict[tuple[str, str, int], int] | None = None,
 ) -> DownloadPlan:
-    point_total = math.ceil(
-        sum(
-            row.candidate_tiles * row.mean_bytes_per_candidate
-            for row in rows
+    if existing_bytes_by_group is None:
+        if existing_bytes > 0 and len(rows) > 1:
+            raise ValueError(
+                "se requieren bytes existentes por grupo para evitar "
+                "compensar estimaciones independientes"
+            )
+        existing_bytes_by_group = (
+            {
+                (rows[0].dimension, rows[0].layer, rows[0].lod): existing_bytes
+            }
+            if rows
+            else {}
         )
+    else:
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in existing_bytes_by_group.values()
+        ):
+            raise ValueError("el desglose existente contiene bytes inválidos")
+        if sum(existing_bytes_by_group.values()) != existing_bytes:
+            raise ValueError(
+                "el total existente no coincide con el desglose por grupo"
+            )
+
+    point_total = remaining_estimate_bytes(
+        rows,
+        existing_bytes_by_group,
+        point_estimate=True,
     )
-    conservative_total = max(
-        0, sum(row.conservative_bytes for row in rows) - existing_bytes
+    conservative_total = remaining_estimate_bytes(
+        rows,
+        existing_bytes_by_group,
+        point_estimate=False,
     )
     required = bytes_with_space_headroom(
         conservative_total,
@@ -2044,8 +2163,13 @@ def build_plan(
     selected_rows: list[EstimateRow] = []
     selected_lods: set[int] = set()
     running = 0
+
     for row in base_rows:
-        tentative = running + row.conservative_bytes
+        tentative = running + remaining_estimate_bytes(
+            [row],
+            existing_bytes_by_group,
+            point_estimate=False,
+        )
         if (
             bytes_with_space_headroom(
                 tentative,
@@ -2069,7 +2193,14 @@ def build_plan(
             for row in base_rows
             if row.lod in selected_lods
         ]
-        running = sum(row.conservative_bytes for row in selected_rows)
+        running = sum(
+            remaining_estimate_bytes(
+                [row],
+                existing_bytes_by_group,
+                point_estimate=False,
+            )
+            for row in selected_rows
+        )
 
     return DownloadPlan(
         ["overworld"],
@@ -2079,7 +2210,11 @@ def build_plan(
         True,
         math.ceil(
             sum(
-                row.candidate_tiles * row.mean_bytes_per_candidate
+                remaining_estimate_bytes(
+                    [row],
+                    existing_bytes_by_group,
+                    point_estimate=True,
+                )
                 for row in selected_rows
             )
         ),
@@ -2594,6 +2729,99 @@ def nonnegative_percentage(raw: str) -> float:
     return value
 
 
+def is_exact_full_scope(
+    dimensions: Sequence[str],
+    layers: Sequence[str],
+    lods: set[int],
+) -> bool:
+    return (
+        set(dimensions) == set(DIMENSIONS)
+        and set(layers) == set(LAYERS)
+        and lods == set(range(MAX_LOD + 1))
+    )
+
+
+def legacy_migration_estimate_allows(args: argparse.Namespace) -> bool:
+    """Recognize only the already-running full-map 18% migration plan."""
+
+    if (
+        not args.all
+        or not args.resume
+        or not args.no_fallback
+        or not is_exact_full_scope(args.dimensions, args.layers, args.lods)
+        or not math.isclose(
+            args.space_headroom_percent,
+            TEMPORARY_MIGRATION_HEADROOM_PERCENT,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        return False
+    try:
+        payload = json.loads(
+            (args.out.expanduser().resolve() / "estimate.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        requested = payload["requested"]
+        plan = payload["plan"]
+        configured = plan["space_headroom_percent"]
+        rows = plan["rows"]
+    except (
+        FileNotFoundError,
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+    ):
+        return False
+    if (
+        not isinstance(requested, dict)
+        or not isinstance(plan, dict)
+        or plan.get("fallback") is not False
+        or plan.get("fits") is not True
+        or isinstance(configured, bool)
+        or not isinstance(configured, (int, float))
+        or not math.isfinite(float(configured))
+        or not math.isclose(
+            float(configured),
+            args.space_headroom_percent,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or not isinstance(rows, list)
+    ):
+        return False
+    try:
+        requested_scope_matches = (
+            set(requested["dimensions"]) == set(DIMENSIONS)
+            and set(requested["layers"]) == set(LAYERS)
+            and set(requested["lods"]) == set(range(MAX_LOD + 1))
+        )
+    except (KeyError, TypeError):
+        return False
+    expected_rows = {
+        (dimension, layer, lod)
+        for dimension in DIMENSIONS
+        for layer in LAYERS
+        for lod in range(MAX_LOD + 1)
+    }
+    try:
+        actual_rows = {
+            (row["dimension"], row["layer"], row["lod"])
+            for row in rows
+            if isinstance(row, dict)
+        }
+    except (KeyError, TypeError):
+        return False
+    return (
+        requested_scope_matches
+        and len(rows) == len(expected_rows)
+        and actual_rows == expected_rows
+    )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -2726,6 +2954,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("usa --all, --estimate-only o --smoke-test-only")
     if args.skip_smoke_test and args.smoke_test_only:
         parser.error("--skip-smoke-test y --smoke-test-only son incompatibles")
+    if (
+        args.space_headroom_percent < REQUIRED_SPACE_HEADROOM_PERCENT
+    ):
+        if not legacy_migration_estimate_allows(args):
+            parser.error(
+                "--space-headroom-percent debe ser al menos "
+                f"{REQUIRED_SPACE_HEADROOM_PERCENT:g}; la excepción temporal "
+                "solo pertenece al supervisor de migración del mapa completo"
+            )
     return args
 
 
@@ -2920,14 +3157,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         logger.info("Salida: %s", output_root)
-        if args.space_headroom_percent < DEFAULT_SPACE_HEADROOM_PERCENT:
+        if (
+            args.space_headroom_percent
+            < REQUIRED_SPACE_HEADROOM_PERCENT
+        ):
             logger.warning(
-                "Reserva adicional reducida a %.2f %% (predeterminado: "
-                "%.2f %%); cada grupo conserva además 25 %% de "
-                "incertidumbre por muestreo.",
+                "Reserva posterior a la incertidumbre reducida a %.2f %% "
+                "(requerido: %.2f %%); se aceptó únicamente como "
+                "continuación temporal controlada y debe migrar al "
+                "porcentaje requerido cuando el preflight demuestre que cabe.",
                 args.space_headroom_percent,
-                DEFAULT_SPACE_HEADROOM_PERCENT,
+                REQUIRED_SPACE_HEADROOM_PERCENT,
             )
+        logger.info(
+            "Margen nominal total sobre la estimación puntual: %.2f %% "
+            "(%.2f %% de incertidumbre y %.2f %% de reserva posterior; "
+            "reserva posterior requerida: %.2f %%).",
+            compounded_margin_percent(
+                SAMPLING_UNCERTAINTY_PERCENT,
+                args.space_headroom_percent,
+            ),
+            SAMPLING_UNCERTAINTY_PERCENT,
+            args.space_headroom_percent,
+            REQUIRED_SPACE_HEADROOM_PERCENT,
+        )
         logger.info("Verificando el contrato público de 2b2t.place...")
         schema_session = requests.Session()
         schema_session.headers["User-Agent"] = USER_AGENT
@@ -3025,14 +3278,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             reuse_samples=not args.refresh_discovery,
         )
         print_estimate_table(estimate_rows, logger)
-        completed_count, existing_bytes = database.completed_for(
+        _, existing_bytes = database.completed_for(
             args.dimensions, args.layers, args.lods
         )
+        existing_bytes_by_group = database.completed_bytes_by_group(
+            args.dimensions,
+            args.layers,
+            args.lods,
+        )
         free_bytes = shutil.disk_usage(output_root).free
-        full_conservative_bytes = max(
-            0,
-            sum(row.conservative_bytes for row in estimate_rows)
-            - existing_bytes,
+        full_conservative_bytes = remaining_estimate_bytes(
+            estimate_rows,
+            existing_bytes_by_group,
+            point_estimate=False,
         )
         full_required_with_headroom = bytes_with_space_headroom(
             full_conservative_bytes,
@@ -3047,6 +3305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             existing_bytes=existing_bytes,
             allow_fallback=not args.no_fallback,
             space_headroom_percent=args.space_headroom_percent,
+            existing_bytes_by_group=existing_bytes_by_group,
         )
         plan_payload = download_plan_payload(plan)
         database.set_metadata("last_estimate", plan_payload)

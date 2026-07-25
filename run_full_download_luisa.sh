@@ -8,6 +8,33 @@ map_volume="/Volumes/2b2t Tiles"
 output_dir="${map_volume}/2b2t_tiles"
 python_bin="${PYTHON_BIN:-$(command -v python3)}"
 lock_dir="${output_dir}/.download.lock"
+space_headroom_percent="${SPACE_HEADROOM_PERCENT:-20}"
+temporary_migration="${ALLOW_TEMPORARY_HEADROOM_MIGRATION:-0}"
+
+if ! "${python_bin}" -c \
+  'import math, sys; value=float(sys.argv[1]); raise SystemExit(0 if math.isfinite(value) and 0 <= value <= 100 else 1)' \
+  "${space_headroom_percent}" 2>/dev/null; then
+  echo "SPACE_HEADROOM_PERCENT debe ser un porcentaje entre 0 y 100." >&2
+  exit 2
+fi
+if [[ "${temporary_migration}" != "0" && "${temporary_migration}" != "1" ]]; then
+  echo "ALLOW_TEMPORARY_HEADROOM_MIGRATION debe ser 0 o 1." >&2
+  exit 2
+fi
+if [[ "${temporary_migration}" == "1" ]] &&
+  ! "${python_bin}" -c \
+    'import math, sys; raise SystemExit(0 if math.isclose(float(sys.argv[1]), 18.0, rel_tol=0.0, abs_tol=1e-9) else 1)' \
+    "${space_headroom_percent}"; then
+  echo "La migración temporal solo admite exactamente 18 %." >&2
+  exit 2
+fi
+if [[ "${temporary_migration}" != "1" ]] &&
+  ! "${python_bin}" -c \
+    'import sys; raise SystemExit(0 if float(sys.argv[1]) >= 20 else 1)' \
+    "${space_headroom_percent}"; then
+  echo "La reserva normal debe ser al menos 20 %." >&2
+  exit 2
+fi
 
 if [[ ! -d "${backing_volume}" ]]; then
   echo "La unidad LuisA no está montada en ${backing_volume}." >&2
@@ -78,7 +105,7 @@ exec caffeinate -im "${python_bin}" "${project_dir}/download_all_2b2t.py" \
   --timeout 30 \
   --retries 5 \
   --discovery-samples 25 \
-  --space-headroom-percent 18 \
+  --space-headroom-percent "${space_headroom_percent}" \
   --resume \
   --skip-smoke-test \
   --no-fallback

@@ -104,7 +104,7 @@ class CliTests(unittest.TestCase):
                 "--max-tile-bytes",
                 "123456",
                 "--space-headroom-percent",
-                "15",
+                "20",
                 "--skip-smoke-test",
             ]
         )
@@ -114,7 +114,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(reparsed.dimensions, ["overworld"])
         self.assertEqual(reparsed.discovery_samples, 7)
         self.assertEqual(reparsed.max_tile_bytes, 123456)
-        self.assertEqual(reparsed.space_headroom_percent, 15)
+        self.assertEqual(reparsed.space_headroom_percent, 20)
         self.assertTrue(reparsed.resume)
         self.assertTrue(reparsed.skip_smoke_test)
 
@@ -123,6 +123,85 @@ class CliTests(unittest.TestCase):
             downloader.parse_args(
                 ["--all", "--space-headroom-percent", "100.1"]
             )
+
+    def test_below_required_headroom_needs_exact_migration_scope(self) -> None:
+        with self.assertRaises(SystemExit):
+            downloader.parse_args(
+                ["--all", "--space-headroom-percent", "18"]
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(SystemExit):
+                downloader.parse_args(
+                    [
+                        "--all",
+                        "--dimensions",
+                        "overworld,nether,end",
+                        "--layers",
+                        "base,overlay,newchunks",
+                        "--lods",
+                        "all",
+                        "--out",
+                        directory,
+                        "--space-headroom-percent",
+                        "18",
+                        "--resume",
+                        "--no-fallback",
+                    ]
+                )
+
+    def test_historical_full_resume_is_still_exactly_replayable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            rows = [
+                {
+                    "dimension": dimension,
+                    "layer": layer,
+                    "lod": lod,
+                }
+                for dimension in downloader.DIMENSIONS
+                for layer in downloader.LAYERS
+                for lod in range(downloader.MAX_LOD + 1)
+            ]
+            (output / "estimate.json").write_text(
+                json.dumps(
+                    {
+                        "requested": {
+                            "dimensions": list(downloader.DIMENSIONS),
+                            "layers": list(downloader.LAYERS),
+                            "lods": list(range(downloader.MAX_LOD + 1)),
+                        },
+                        "plan": {
+                            "fallback": False,
+                            "fits": True,
+                            "space_headroom_percent": 18,
+                            "rows": rows,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = downloader.parse_args(
+                [
+                    "--all",
+                    "--dimensions",
+                    "overworld,nether,end",
+                    "--layers",
+                    "base,overlay,newchunks",
+                    "--lods",
+                    "all",
+                    "--out",
+                    str(output),
+                    "--space-headroom-percent",
+                    "18",
+                    "--resume",
+                    "--no-fallback",
+                ]
+            )
+            reparsed = downloader.parse_args(
+                shlex.split(downloader.build_resume_command(args))[2:]
+            )
+            self.assertEqual(reparsed.space_headroom_percent, 18)
+            self.assertTrue(reparsed.resume)
 
 
 class ValidationTests(unittest.TestCase):
@@ -487,6 +566,191 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(plan.required_with_headroom, 1_150)
         self.assertEqual(plan.space_headroom_percent, 15)
 
+    def test_stacked_reserves_do_not_replace_required_headroom(self) -> None:
+        plan = downloader.DownloadPlan(
+            dimensions=["overworld"],
+            layers=["base"],
+            lods={0},
+            rows=[],
+            fallback=False,
+            point_bytes=1_000,
+            conservative_bytes=1_250,
+            requests=1,
+            free_bytes=2_000,
+            required_with_headroom=1_475,
+            space_headroom_percent=18,
+        )
+        payload = downloader.download_plan_payload(plan)
+        self.assertAlmostEqual(
+            downloader.compounded_margin_percent(25, 18),
+            47.5,
+        )
+        self.assertEqual(payload["sampling_uncertainty_percent"], 25)
+        self.assertEqual(payload["required_space_headroom_percent"], 20)
+        self.assertAlmostEqual(
+            payload["nominal_total_margin_percent"],
+            47.5,
+        )
+        self.assertAlmostEqual(
+            payload["effective_total_margin_percent"],
+            47.5,
+        )
+        self.assertEqual(payload["minimum_required_with_headroom"], 1_500)
+        self.assertFalse(payload["meets_required_space_headroom"])
+        required_plan = downloader.dataclasses.replace(
+            plan,
+            required_with_headroom=1_500,
+            space_headroom_percent=20,
+        )
+        self.assertTrue(
+            downloader.download_plan_payload(required_plan)[
+                "meets_required_space_headroom"
+            ]
+        )
+
+    def test_effective_margin_is_undefined_without_point_estimate(self) -> None:
+        plan = downloader.DownloadPlan(
+            dimensions=["overworld"],
+            layers=["base"],
+            lods={0},
+            rows=[],
+            fallback=False,
+            point_bytes=0,
+            conservative_bytes=100,
+            requests=0,
+            free_bytes=1_000,
+            required_with_headroom=120,
+            space_headroom_percent=20,
+        )
+        self.assertIsNone(
+            downloader.download_plan_payload(plan)[
+                "effective_total_margin_percent"
+            ]
+        )
+
+    def test_point_estimate_subtracts_existing_complete_payload(self) -> None:
+        rows = [
+            downloader.EstimateRow(
+                "overworld",
+                "base",
+                0,
+                1,
+                1,
+                1,
+                1,
+                1_000,
+                1_000,
+                1_250,
+                1,
+            )
+        ]
+        plan = downloader.build_plan(
+            dimensions=["overworld"],
+            layers=["base"],
+            lods={0},
+            rows=rows,
+            free_bytes=2_000,
+            existing_bytes=100,
+            allow_fallback=False,
+            space_headroom_percent=18,
+        )
+        self.assertEqual(plan.point_bytes, 900)
+        self.assertEqual(plan.conservative_bytes, 1_150)
+
+    def test_fallback_subtracts_existing_bytes_per_group(self) -> None:
+        rows = [
+            downloader.EstimateRow(
+                "overworld",
+                "base",
+                lod,
+                1,
+                1,
+                1,
+                1,
+                point,
+                point,
+                conservative,
+                1,
+            )
+            for lod, point, conservative in (
+                (10, 1_000, 1_000),
+                (9, 2_000, 2_000),
+            )
+        ]
+        plan = downloader.build_plan(
+            dimensions=["overworld", "nether"],
+            layers=["base", "overlay"],
+            lods={9, 10},
+            rows=rows,
+            free_bytes=600,
+            existing_bytes=600,
+            existing_bytes_by_group={
+                ("overworld", "base", 10): 600,
+            },
+            allow_fallback=True,
+            space_headroom_percent=20,
+        )
+        self.assertTrue(plan.fallback)
+        self.assertEqual(plan.lods, {10})
+        self.assertEqual(plan.conservative_bytes, 400)
+        self.assertEqual(plan.point_bytes, 400)
+        self.assertEqual(plan.required_with_headroom, 480)
+
+    def test_overfull_group_cannot_subsidize_another_group(self) -> None:
+        rows = [
+            downloader.EstimateRow(
+                "overworld",
+                "base",
+                10,
+                1,
+                1,
+                1,
+                1,
+                100,
+                100,
+                100,
+                1,
+            ),
+            downloader.EstimateRow(
+                "overworld",
+                "base",
+                9,
+                1,
+                1,
+                1,
+                1,
+                1_000,
+                1_000,
+                1_000,
+                1,
+            ),
+        ]
+        existing = {
+            ("overworld", "base", 10): 1_000,
+        }
+        self.assertEqual(
+            downloader.remaining_estimate_bytes(
+                rows,
+                existing,
+                point_estimate=False,
+            ),
+            1_000,
+        )
+        plan = downloader.build_plan(
+            dimensions=["overworld"],
+            layers=["base"],
+            lods={9, 10},
+            rows=rows,
+            free_bytes=200,
+            existing_bytes=1_000,
+            existing_bytes_by_group=existing,
+            allow_fallback=False,
+            space_headroom_percent=20,
+        )
+        self.assertEqual(plan.conservative_bytes, 1_000)
+        self.assertEqual(plan.required_with_headroom, 1_200)
+        self.assertFalse(plan.required_with_headroom <= plan.free_bytes)
+
     def test_current_luisa_estimate_fits_at_18_but_not_20_percent(self) -> None:
         conservative = 1_235_379_207_149
         free = 1_471_467_438_080
@@ -499,6 +763,10 @@ class PlanningTests(unittest.TestCase):
         self.assertLessEqual(required_at_18, free)
         self.assertGreater(required_at_20, free)
         self.assertGreater(free - required_at_18, 12 * 1024**3)
+        self.assertLess(
+            18,
+            downloader.REQUIRED_SPACE_HEADROOM_PERCENT,
+        )
 
     def test_no_fallback_preserves_full_scope_when_space_is_short(self) -> None:
         rows = [
