@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -357,7 +359,9 @@ CREATE TABLE tiles (
   tile_z INTEGER NOT NULL,
   status TEXT NOT NULL,
   relative_path TEXT NOT NULL,
-  size_bytes INTEGER
+  size_bytes INTEGER,
+  http_code INTEGER,
+  sha256 TEXT
 );
 `;
 
@@ -379,8 +383,9 @@ connection.executescript(schema)
 connection.executemany(
     """
     INSERT INTO tiles(
-      dimension, layer, lod, tile_x, tile_z, status, relative_path, size_bytes
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      dimension, layer, lod, tile_x, tile_z, status, relative_path, size_bytes,
+      http_code, sha256
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
     rows,
 )
@@ -395,13 +400,17 @@ connection.close()
   );
 }
 
-async function writeWebpHeader(path) {
+async function writeWebpHeader(path, payloadBytes = 4) {
   await mkdir(join(path, ".."), { recursive: true });
-  const header = Buffer.alloc(12);
-  header.write("RIFF", 0, "ascii");
-  header.writeUInt32LE(4, 4);
-  header.write("WEBP", 8, "ascii");
-  await writeFile(path, header);
+  const file = Buffer.alloc(12 + payloadBytes);
+  file.write("RIFF", 0, "ascii");
+  file.writeUInt32LE(file.byteLength - 8, 4);
+  file.write("WEBP", 8, "ascii");
+  await writeFile(path, file);
+  return {
+    size: file.byteLength,
+    sha256: createHash("sha256").update(file).digest("hex"),
+  };
 }
 
 async function invokeLocalMiddleware(runtime, url, init = {}) {
@@ -487,7 +496,7 @@ test("capacity reads archive bytes from running and terminal global progress", a
   assert.equal(terminal.json.capacity.archiveBytes, 67_890);
 });
 
-test("status projects the live global download without exposing local paths", async (context) => {
+test("status ignores legacy global progress in on-demand mode", async (context) => {
   const tileRoot = await mkdtemp(join(tmpdir(), "atlas-global-progress-"));
   context.after(async () => {
     await rm(tileRoot, { recursive: true, force: true });
@@ -506,6 +515,7 @@ test("status projects the live global download without exposing local paths", as
       tiles_pending: 293_987,
       progress_percent: 7.0308,
       data_downloaded_bytes: 10_055_816_466,
+      effective_requests_per_second: 8,
       tiles_per_second: 2.18,
       megabytes_per_second: 0.223,
       eta_seconds: 604_800,
@@ -534,37 +544,14 @@ test("status projects the live global download without exposing local paths", as
   runtime.close();
 
   assert.equal(response.status, 200);
-  assert.deepEqual(response.json.globalDownload, {
-    status: "running",
-    processedRequests: 99_802,
-    plannedRequests: 1_419_496,
-    completeTiles: 98_459,
-    absentTiles: 1_343,
-    corruptTiles: 0,
-    failedTiles: 0,
-    pendingTiles: 293_987,
-    progressPercent: 7.0308,
-    dataBytes: 10_055_816_466,
-    tilesPerSecond: 2.18,
-    megabytesPerSecond: 0.223,
-    etaSeconds: 604_800,
-    updatedAt: "2026-07-26T03:45:44.000Z",
-    fallback: true,
-    scope: {
-      dimensions: ["overworld"],
-      layers: ["base"],
-      lods: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-    },
-  });
-  assert.equal("output" in response.json.globalDownload, false);
-  assert.equal("resumeCommand" in response.json.globalDownload, false);
-  assert.deepEqual(
+  assert.equal(response.json.globalDownload, null);
+  assert.equal(
     parseLocalAtlasRuntime(response.json)?.globalDownload,
-    response.json.globalDownload,
+    null,
   );
 });
 
-test("capacity prefers the strict full-Overworld estimates", async (context) => {
+test("capacity has no whole-world target in on-demand mode", async (context) => {
   const tileRoot = await mkdtemp(join(tmpdir(), "atlas-capacity-estimate-"));
   context.after(async () => {
     await rm(tileRoot, { recursive: true, force: true });
@@ -626,11 +613,11 @@ test("capacity prefers the strict full-Overworld estimates", async (context) => 
   assert.equal(response.status, 200);
   assert.equal(
     response.json.capacity.overworldRequirementBytes,
-    23_456,
+    0,
   );
   assert.equal(
     response.json.capacity.marginBytes,
-    response.json.capacity.availableForAtlasBytes - 23_456,
+    response.json.capacity.availableForAtlasBytes,
   );
   assert.equal(response.json.capacity.fits, true);
 });
@@ -643,12 +630,47 @@ test("regional status is exact, validates files, resolves 404s, and survives run
 
   const baseComplete = "base/0/overworld/0/0/t.0.0.webp";
   const overlayComplete = "overlay/0/overworld/0/0/t.0.1.webp";
-  await writeWebpHeader(join(tileRoot, baseComplete));
-  await writeWebpHeader(join(tileRoot, overlayComplete));
+  const baseFile = await writeWebpHeader(join(tileRoot, baseComplete));
+  const overlayFile = await writeWebpHeader(
+    join(tileRoot, overlayComplete),
+  );
   seedTileDatabase(join(tileRoot, "tiles.sqlite3"), [
-    ["overworld", "base", 0, 0, 0, "complete", baseComplete, 12],
-    ["overworld", "base", 0, 1, 0, "absent", "unused-base-1-0.webp", null],
-    ["overworld", "base", 0, 0, 1, "pending", "unused-base-0-1.webp", null],
+    [
+      "overworld",
+      "base",
+      0,
+      0,
+      0,
+      "complete",
+      baseComplete,
+      baseFile.size,
+      200,
+      baseFile.sha256,
+    ],
+    [
+      "overworld",
+      "base",
+      0,
+      1,
+      0,
+      "absent",
+      "unused-base-1-0.webp",
+      null,
+      404,
+      null,
+    ],
+    [
+      "overworld",
+      "base",
+      0,
+      0,
+      1,
+      "pending",
+      "unused-base-0-1.webp",
+      null,
+      null,
+      null,
+    ],
     [
       "overworld",
       "overlay",
@@ -657,7 +679,9 @@ test("regional status is exact, validates files, resolves 404s, and survives run
       0,
       "complete",
       "overlay/0/overworld/0/0/t.0.0.webp",
-      12,
+      baseFile.size,
+      200,
+      baseFile.sha256,
     ],
     [
       "overworld",
@@ -668,8 +692,21 @@ test("regional status is exact, validates files, resolves 404s, and survives run
       "corrupt",
       "unused-overlay-1-0.webp",
       null,
+      null,
+      null,
     ],
-    ["overworld", "overlay", 0, 0, 1, "complete", overlayComplete, 12],
+    [
+      "overworld",
+      "overlay",
+      0,
+      0,
+      1,
+      "complete",
+      overlayComplete,
+      overlayFile.size,
+      200,
+      overlayFile.sha256,
+    ],
     [
       "overworld",
       "overlay",
@@ -678,6 +715,8 @@ test("regional status is exact, validates files, resolves 404s, and survives run
       1,
       "absent",
       "unused-overlay-1-1.webp",
+      null,
+      404,
       null,
     ],
   ]);
@@ -801,6 +840,271 @@ test("regional status reports an empty catalog as entirely missing", async (cont
     databaseUpdatedAt: null,
     absentCells: [],
   });
+});
+
+test("regional status requires catalog hashes and verified 404 absences", async (context) => {
+  const tileRoot = await mkdtemp(join(tmpdir(), "atlas-strict-status-"));
+  context.after(async () => {
+    await rm(tileRoot, { recursive: true, force: true });
+  });
+
+  const tamperedPath = "base/0/overworld/0/0/t.0.0.webp";
+  const conflictingAbsentPath =
+    "base/0/overworld/0/0/t.2.0.webp";
+  const tamperedFile = await writeWebpHeader(
+    join(tileRoot, tamperedPath),
+  );
+  await writeWebpHeader(join(tileRoot, conflictingAbsentPath));
+  seedTileDatabase(join(tileRoot, "tiles.sqlite3"), [
+    [
+      "overworld",
+      "base",
+      0,
+      0,
+      0,
+      "complete",
+      tamperedPath,
+      tamperedFile.size,
+      200,
+      "0".repeat(64),
+    ],
+    [
+      "overworld",
+      "base",
+      0,
+      1,
+      0,
+      "absent",
+      "base/0/overworld/0/0/t.1.0.webp",
+      null,
+      500,
+      null,
+    ],
+    [
+      "overworld",
+      "base",
+      0,
+      2,
+      0,
+      "absent",
+      conflictingAbsentPath,
+      null,
+      404,
+      null,
+    ],
+  ]);
+
+  const runtime = createLocalAtlasMiddleware({
+    tileRoot,
+    pythonBin: "python3",
+  });
+  const response = await invokeLocalMiddleware(
+    runtime,
+    "/api/local-atlas/region-status?xMin=0&zMin=0&xMaxExclusive=1536&zMaxExclusive=512&lod=0&layers=base",
+  );
+  runtime.close();
+
+  assert.equal(response.status, 200);
+  assert.equal(response.json.ready, false);
+  assert.equal(response.json.completeCount, 0);
+  assert.equal(response.json.absentCount, 0);
+  assert.equal(response.json.failedCount, 3);
+  assert.equal(response.json.resolvedCount, 0);
+});
+
+test("regional status uses the primary catalog only when it is independently ready", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "atlas-status-priority-"));
+  const primaryRoot = join(root, "primary");
+  const regionalRoot = join(root, "regional");
+  await mkdir(primaryRoot, { recursive: true });
+  await mkdir(regionalRoot, { recursive: true });
+  context.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const firstPath = "base/0/overworld/0/0/t.0.0.webp";
+  const secondPath = "base/0/overworld/0/0/t.1.0.webp";
+  const primaryFirst = await writeWebpHeader(
+    join(primaryRoot, firstPath),
+  );
+  const primarySecond = await writeWebpHeader(
+    join(primaryRoot, secondPath),
+  );
+  seedTileDatabase(join(primaryRoot, "tiles.sqlite3"), [
+    [
+      "overworld",
+      "base",
+      0,
+      0,
+      0,
+      "complete",
+      firstPath,
+      primaryFirst.size,
+      200,
+      primaryFirst.sha256,
+    ],
+    [
+      "overworld",
+      "base",
+      0,
+      1,
+      0,
+      "complete",
+      secondPath,
+      primarySecond.size,
+      200,
+      primarySecond.sha256,
+    ],
+  ]);
+  seedTileDatabase(join(regionalRoot, "tiles.sqlite3"), [
+    [
+      "overworld",
+      "base",
+      0,
+      0,
+      0,
+      "absent",
+      firstPath,
+      null,
+      404,
+      null,
+    ],
+  ]);
+
+  const runtime = createLocalAtlasMiddleware({
+    tileRoot: primaryRoot,
+    regionalTileRoot: regionalRoot,
+    pythonBin: "python3",
+  });
+  const url =
+    "/api/local-atlas/region-status?xMin=0&zMin=0&xMaxExclusive=1024&zMaxExclusive=512&lod=0&layers=base";
+  const primaryReady = await invokeLocalMiddleware(runtime, url);
+  assert.equal(primaryReady.status, 200);
+  assert.equal(primaryReady.json.ready, true);
+  assert.equal(primaryReady.json.completeCount, 2);
+  assert.equal(primaryReady.json.absentCount, 0);
+
+  await delay(10);
+  execFileSync(
+    "python3",
+    [
+      "-c",
+      `
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute(
+    "UPDATE tiles SET status = 'pending' WHERE tile_x = 0 AND tile_z = 0"
+)
+connection.commit()
+connection.close()
+`,
+      join(primaryRoot, "tiles.sqlite3"),
+    ],
+    { stdio: "pipe" },
+  );
+
+  const noPartialUnion = await invokeLocalMiddleware(runtime, url);
+  assert.equal(noPartialUnion.status, 200);
+  assert.equal(noPartialUnion.json.ready, false);
+  assert.equal(noPartialUnion.json.completeCount, 0);
+  assert.equal(noPartialUnion.json.absentCount, 1);
+  assert.equal(noPartialUnion.json.missingCount, 1);
+  assert.deepEqual(noPartialUnion.json.absentCells, [
+    { tileX: 0, tileZ: 0 },
+  ]);
+
+  await delay(10);
+  execFileSync(
+    "python3",
+    [
+      "-c",
+      `
+import sqlite3
+import sys
+
+primary = sqlite3.connect(sys.argv[1])
+primary.execute(
+    "UPDATE tiles SET status = 'complete' WHERE tile_x = 0 AND tile_z = 0"
+)
+primary.commit()
+primary.close()
+
+regional = sqlite3.connect(sys.argv[2])
+regional.execute(
+    """
+    INSERT INTO tiles(
+      dimension, layer, lod, tile_x, tile_z, status, relative_path, size_bytes,
+      http_code, sha256
+    ) VALUES ('overworld', 'base', 0, 1, 0, 'absent', ?, NULL, 404, NULL)
+    """,
+    ("base/0/overworld/0/0/t.1.0.webp",),
+)
+regional.commit()
+regional.close()
+`,
+      join(primaryRoot, "tiles.sqlite3"),
+      join(regionalRoot, "tiles.sqlite3"),
+    ],
+    { stdio: "pipe" },
+  );
+  const regionalReady = await invokeLocalMiddleware(runtime, url);
+  runtime.close();
+  assert.equal(regionalReady.status, 200);
+  assert.equal(regionalReady.json.ready, true);
+  assert.equal(regionalReady.json.completeCount, 0);
+  assert.equal(regionalReady.json.absentCount, 2);
+  assert.deepEqual(regionalReady.json.absentCells, [
+    { tileX: 0, tileZ: 0 },
+    { tileX: 1, tileZ: 0 },
+  ]);
+});
+
+test("tile serving prefers the regional overlay and falls back to primary", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "atlas-tile-priority-"));
+  const primaryRoot = join(root, "primary");
+  const regionalRoot = join(root, "regional");
+  const relativePath = "base/0/overworld/0/0/t.0.0.webp";
+  await mkdir(primaryRoot, { recursive: true });
+  await mkdir(regionalRoot, { recursive: true });
+  context.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const primaryFile = await writeWebpHeader(
+    join(primaryRoot, relativePath),
+    12,
+  );
+  const regionalFile = await writeWebpHeader(
+    join(regionalRoot, relativePath),
+    4,
+  );
+  const runtime = createLocalAtlasMiddleware({
+    tileRoot: primaryRoot,
+    regionalTileRoot: regionalRoot,
+  });
+  const url =
+    "/api/tile?layer=base&lod=0&dimension=0&tileX=0&tileZ=0";
+  const regional = await invokeLocalMiddleware(runtime, url, {
+    method: "HEAD",
+  });
+  assert.equal(regional.status, 200);
+  assert.equal(
+    regional.headers.get("content-length"),
+    String(regionalFile.size),
+  );
+
+  await unlink(join(regionalRoot, relativePath));
+  const primary = await invokeLocalMiddleware(runtime, url, {
+    method: "HEAD",
+  });
+  runtime.close();
+  assert.equal(primary.status, 200);
+  assert.equal(
+    primary.headers.get("content-length"),
+    String(primaryFile.size),
+  );
 });
 
 test("regional jobs expose bounded JSONL progress without using it as readiness", async (context) => {
@@ -941,8 +1245,10 @@ emit("summary", "complete", 1)
 test("regional profiles keep cached and network rates distinct while forwarding workers", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "atlas-job-profiles-"));
   const tileRoot = join(root, "tiles");
+  const regionalTileRoot = join(root, "regional-tiles");
   const projectRoot = join(root, "project");
   await mkdir(tileRoot, { recursive: true });
+  await mkdir(regionalTileRoot, { recursive: true });
   await mkdir(projectRoot, { recursive: true });
   context.after(async () => {
     await rm(root, { recursive: true, force: true });
@@ -1000,6 +1306,7 @@ emit("summary", "complete", 2, 0)
 
   const runtime = createLocalAtlasMiddleware({
     tileRoot,
+    regionalTileRoot,
     projectRoot,
     pythonBin: "python3",
   });
@@ -1113,5 +1420,145 @@ emit("summary", "complete", 2, 0)
       argumentsList[argumentsList.indexOf("--workers") + 1],
       workers,
     );
+    assert.equal(
+      argumentsList[argumentsList.indexOf("--out") + 1],
+      regionalTileRoot,
+    );
   }
+});
+
+test("regional downloads keep the full 16 req/s despite legacy global progress", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "atlas-shared-rate-"));
+  const tileRoot = join(root, "primary");
+  const regionalTileRoot = join(root, "regional");
+  const projectRoot = join(root, "project");
+  await mkdir(tileRoot, { recursive: true });
+  await mkdir(regionalTileRoot, { recursive: true });
+  await mkdir(projectRoot, { recursive: true });
+  context.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const globalProgress = {
+    status: "running",
+    phase: "download",
+    processed_requests: 10,
+    planned_requests: 100,
+    tiles_completed: 10,
+    tiles_absent: 0,
+    tiles_corrupt: 0,
+    tiles_failed: 0,
+    tiles_pending: 90,
+    progress_percent: 10,
+    data_downloaded_bytes: 1_024,
+    effective_requests_per_second: 16,
+    tiles_per_second: 1,
+    megabytes_per_second: 0.1,
+    eta_seconds: 90,
+    updated_at: "2026-07-26T03:45:44+00:00",
+    fallback: true,
+    effective_scope: {
+      dimensions: ["overworld"],
+      layers: ["base"],
+      lods: [1],
+    },
+  };
+  await writeFile(
+    join(tileRoot, "progress.json"),
+    JSON.stringify(globalProgress),
+    "utf8",
+  );
+  await writeFile(
+    join(projectRoot, "download_region_2b2t.py"),
+    `
+import json
+import sys
+
+arguments = sys.argv[1:]
+target = float(arguments[arguments.index("--requests-per-second") + 1])
+with open("rate-argv.json", "w", encoding="utf-8") as handle:
+    json.dump(arguments, handle)
+print(json.dumps({
+    "type": "region-download",
+    "version": 1,
+    "event": "summary",
+    "status": "complete",
+    "requested": 1,
+    "processed": 1,
+    "complete": 1,
+    "absent": 0,
+    "failed": 0,
+    "reused": 1,
+    "reusedAbsent": 0,
+    "downloadedBytes": 0,
+    "interrupted": False,
+    "percent": 100,
+    "stopReason": None,
+    "effectiveRps": min(4, target),
+    "targetRps": target,
+}), flush=True)
+`,
+    "utf8",
+  );
+
+  const runtime = createLocalAtlasMiddleware({
+    tileRoot,
+    regionalTileRoot,
+    projectRoot,
+    pythonBin: "python3",
+  });
+  const initialStatus = await invokeLocalMiddleware(
+    runtime,
+    "/api/local-atlas/status",
+  );
+  assert.equal(initialStatus.json.globalDownload, null);
+  const started = await invokeLocalMiddleware(
+    runtime,
+    "/api/local-atlas/download",
+    {
+      method: "POST",
+      headers: {
+        "x-atlas-token": initialStatus.json.mutationToken,
+      },
+      json: {
+        xMin: 0,
+        zMin: 0,
+        xMaxExclusive: 512,
+        zMaxExclusive: 512,
+        lod: 0,
+        layers: ["base"],
+        requestsPerSecond: 16,
+      },
+    },
+  );
+  assert.equal(started.status, 202);
+  assert.equal(started.json.job.request.requestsPerSecond, 16);
+  assert.equal(started.json.job.progress.targetRps, 16);
+
+  let terminal;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await delay(25);
+    terminal = await invokeLocalMiddleware(
+      runtime,
+      "/api/local-atlas/status",
+    );
+    if (terminal.json.job?.status === "complete") break;
+  }
+  assert.equal(terminal?.json.job.status, "complete");
+  const invocation = JSON.parse(
+    await readFile(join(projectRoot, "rate-argv.json"), "utf8"),
+  );
+  assert.equal(
+    invocation[invocation.indexOf("--requests-per-second") + 1],
+    "16",
+  );
+  assert.equal(
+    invocation[invocation.indexOf("--out") + 1],
+    regionalTileRoot,
+  );
+  assert.equal(
+    invocation[invocation.indexOf("--workers") + 1],
+    "8",
+  );
+  runtime.close();
 });

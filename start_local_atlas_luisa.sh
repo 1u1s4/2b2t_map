@@ -5,17 +5,19 @@ project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 viewer_dir="${project_dir}/viewer"
 external_volume="/Volumes/2b2t Tiles"
 external_tile_root="${external_volume}/2b2t_tiles"
+external_regional_tile_root="${external_volume}/ObsidianAtlasRegions/2b2t_tiles"
 sparsebundle_path="/Volumes/LuisA/2b2t_map/2b2t_tiles.sparsebundle"
-repository_tile_root="${project_dir}/2b2t_tiles"
 tile_root="${OBSIDIAN_ATLAS_TILE_ROOT:-${external_tile_root}}"
+if [[ -n "${OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT:-}" ]]; then
+  regional_tile_root="${OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT}"
+elif [[ -n "${OBSIDIAN_ATLAS_TILE_ROOT:-}" ]]; then
+  regional_tile_root="${tile_root}_regions"
+else
+  regional_tile_root="${external_regional_tile_root}"
+fi
 backing_root="/Volumes/LuisA"
 if [[ -n "${OBSIDIAN_ATLAS_BACKING_ROOT:-}" ]]; then
   backing_root="${OBSIDIAN_ATLAS_BACKING_ROOT}"
-fi
-if [[ -z "${OBSIDIAN_ATLAS_TILE_ROOT:-}" &&
-  ! -d "${tile_root}" &&
-  -d "${repository_tile_root}" ]]; then
-  tile_root="${repository_tile_root}"
 fi
 runtime_dir="/Users/luisalvarado/Library/Application Support/ObsidianAtlas"
 log_file="${runtime_dir}/local_atlas.log"
@@ -38,10 +40,12 @@ Uso:
   ./start_local_atlas_luisa.sh --stop
 
 Inicia el atlas local en una sesión screen supervisada y limitada a localhost.
-Monta y usa la biblioteca externa cuando existe su sparsebundle; si no existe,
-emplea la copia verificada 2b2t_tiles del repositorio. El workspace siempre se
-guarda en LuisA. El modo interno --serve-loop y sus auxiliares no deben
-ejecutarse directamente.
+Monta y usa la biblioteca APFS del sparsebundle guardado en LuisA. Las
+predescargas regionales elegidas por el usuario usan una biblioteca aislada,
+reanudable y todo el presupuesto disponible de hasta 16 req/s. Este launcher no
+inicia ni reanuda descargas globales. Tiles regionales y workspace se conservan
+en LuisA. El modo interno --serve-loop y sus auxiliares no deben ejecutarse
+directamente.
 EOF
 }
 
@@ -154,7 +158,8 @@ ensure_external_tile_volume() {
 
   if ! external_volume_is_mounted; then
     if [[ ! -e "${sparsebundle_path}" ]]; then
-      return 0
+      echo "No existe la biblioteca APFS de LuisA: ${sparsebundle_path}" >&2
+      return 1
     fi
     if ! /usr/bin/hdiutil attach \
       -nobrowse \
@@ -177,6 +182,7 @@ ensure_external_tile_volume() {
     return 1
   fi
   tile_root="${external_tile_root}"
+  regional_tile_root="${external_regional_tile_root}"
 }
 
 validate_environment() {
@@ -189,6 +195,16 @@ validate_environment() {
   fi
   if [[ ! -d "${backing_root}" || ! -r "${backing_root}" ]]; then
     echo "La unidad LuisA no está disponible: ${backing_root}" >&2
+    exit 1
+  fi
+  if [[ "${regional_tile_root}" == "${tile_root}" ]]; then
+    echo "La biblioteca regional debe estar separada de la global." >&2
+    exit 1
+  fi
+  /usr/bin/install -d -m 700 "${regional_tile_root}"
+  if [[ ! -d "${regional_tile_root}" || ! -r "${regional_tile_root}" ||
+    ! -w "${regional_tile_root}" ]]; then
+    echo "La biblioteca regional no está disponible: ${regional_tile_root}" >&2
     exit 1
   fi
   if [[ ! -f "${viewer_dir}/package.json" ]]; then
@@ -312,6 +328,7 @@ serve_loop() {
     (
       cd "${viewer_dir}"
       export OBSIDIAN_ATLAS_TILE_ROOT="${tile_root}"
+      export OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT="${regional_tile_root}"
       export OBSIDIAN_ATLAS_BACKING_ROOT="${backing_root}"
       export OBSIDIAN_ATLAS_PYTHON="${python_bin}"
       exec npm run dev -- \

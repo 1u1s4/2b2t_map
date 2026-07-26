@@ -1,11 +1,12 @@
 # Obsidian Atlas — visor local
 
-Este directorio contiene la UI local de Obsidian Atlas. El producto divide una
-región del Overworld en tiles LOD 0 revisables de 512×512 bloques y conserva el
-progreso en un workspace durable de LuisA. El zoom y el desplazamiento son
-visuales: durante una sesión no cambian el LOD de los datos. El backend de
-desarrollo expone capacidad, persistencia, lectura local de tiles y descarga
-regional únicamente en `localhost`.
+Este directorio contiene la UI web de escritorio de Obsidian Atlas. El producto
+divide una región del Overworld en tiles LOD 0 revisables de 512×512 bloques y
+conserva el progreso en un workspace durable de LuisA. El zoom y el
+desplazamiento son visuales: durante una sesión no cambian el LOD de los datos.
+El backend de desarrollo expone capacidad, persistencia, lectura local de tiles
+y descarga regional únicamente en `localhost`. La interfaz requiere al menos
+960 px de ancho y no incluye una variante móvil.
 
 ## Ejecutar
 
@@ -25,9 +26,9 @@ Después abre [http://localhost:3001](http://localhost:3001).
 El lanzador requiere `/Volumes/LuisA`, `screen`, Python y las dependencias de
 este directorio. Si existe
 `/Volumes/LuisA/2b2t_map/2b2t_tiles.sparsebundle`, lo monta de forma segura en
-`/Volumes/2b2t Tiles` y usa su biblioteca. Solo cuando el sparsebundle no
-existe recurre automáticamente a `../2b2t_tiles`. `--status` y `--stop` no
-montan ni desmontan el volumen. La primera instalación es:
+`/Volumes/2b2t Tiles` y usa su biblioteca. El launcher exige ese respaldo:
+no desvía silenciosamente tiles a otro disco. `--status` y `--stop` no montan
+ni desmontan el volumen. La primera instalación es:
 
 ```bash
 cd viewer
@@ -51,13 +52,14 @@ cd viewer
 npm run dev -- --hostname localhost --port 3001
 ```
 
-El modo de desarrollo detecta esa carpeta automáticamente y mantiene el
-workspace dentro de la misma raíz ignorada por Git. Para usar otra biblioteca
-o el volumen LuisA explícitamente:
+El modo de desarrollo detecta esa carpeta automáticamente, usa
+`../2b2t_tiles_regions` para predescargas y mantiene el workspace dentro de una
+raíz ignorada por Git. Para usar las bibliotecas APFS de LuisA explícitamente:
 
 ```bash
 cd viewer
 OBSIDIAN_ATLAS_TILE_ROOT='/Volumes/2b2t Tiles/2b2t_tiles' \
+OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT='/Volumes/2b2t Tiles/ObsidianAtlasRegions/2b2t_tiles' \
 OBSIDIAN_ATLAS_BACKING_ROOT='/Volumes/LuisA' \
 OBSIDIAN_ATLAS_PYTHON='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
   npm run dev -- --hostname localhost --port 3001
@@ -68,6 +70,7 @@ Variables aceptadas:
 | Variable | Valor esperado |
 | --- | --- |
 | `OBSIDIAN_ATLAS_TILE_ROOT` | carpeta canónica `2b2t_tiles` |
+| `OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT` | biblioteca persistente de predescargas |
 | `OBSIDIAN_ATLAS_BACKING_ROOT` | volumen físico que respalda la biblioteca |
 | `OBSIDIAN_ATLAS_PYTHON` | Python con `requests` y `Pillow` |
 | `OBSIDIAN_ATLAS_OVERWORLD_REQUIREMENT_BYTES` | referencia opcional de capacidad |
@@ -126,15 +129,16 @@ El Atlas presenta una sola cobertura: la descarga local de la capa `base` en
 LOD 0. Los estados **Listas**, **En curso** y **Por explorar** funcionan como
 filtros. El inspector muestra tiles guardados, objetivo, porcentaje y límites
 X/Z. **Anterior**, **Siguiente**, flechas y `Enter` permiten operar sin apuntar
-a celdas pequeñas; un toque o clic selecciona el sector. En móvil, una cruceta
-de 44 px permite ajustar el sector enfocado antes de elegirlo.
+a celdas pequeñas; un clic selecciona el sector y la cruceta de escritorio
+permite ajustar el sector enfocado antes de elegirlo.
 
 La huella publicada permanece como detalle interno del cálculo, no como una
 vista seleccionable. Cada `404` confirmado se excluye del denominador para que
 los bordes irregulares puedan alcanzar 100% sin crear pendientes imposibles.
 
 La cobertura local se precarga para que **Explorar** no muestre ceros
-provisionales. Mientras existe un trabajo regional activo, el endpoint se
+provisionales. Se vuelve a leer al cambiar el estado de un trabajo regional y,
+como respaldo, una vez por minuto; el progreso detallado del trabajo sí se
 actualiza cada 2.5 segundos.
 
 ## Navegación y progreso
@@ -163,16 +167,17 @@ revisada.
 bitsets base64url —revisadas y sin datos—, no listas extensas de coordenadas.
 **Importar** valida versión, dimensión, límites alineados, escala, LOD, índice y
 contadores.
-Al iniciar otra región, la sesión activa se guarda automáticamente y la nueva
-selección pasa primero por el gate de descarga. **Pausar sesión** sigue
-disponible para cerrar el recorrido sin iniciar otro. También se puede elegir
-directamente cualquier celda visible con un clic.
+Al iniciar otra región, la sesión única actual permanece en LuisA y la nueva
+selección pasa primero por el gate de descarga. Solo una región completamente
+resuelta puede reemplazarla. **Pausar sesión** sigue disponible para cerrar el
+recorrido sin iniciar otro. También se puede elegir directamente cualquier
+celda visible con un clic.
 
 Las sesiones creadas por versiones anteriores conservan su LOD, escala, celda
-actual y progreso al restaurarlas o importarlas, pero una sesión LOD 0 no puede
+actual y progreso al importarlas, pero una sesión LOD 0 no puede
 saltarse la verificación regional. Un LOD heredado queda en solo lectura;
-**Crear versión en LOD 0** archiva la original intacta y lleva la copia al gate
-de descarga.
+**Crear versión en LOD 0** lleva la copia al gate y la vuelve canónica solo al
+completar la descarga.
 
 El máximo por sesión es 1,048,576 celdas. Durante una sesión, la escala
 mínima limita el viewport a 8×6 tiles antes del margen de render y la cámara se
@@ -181,10 +186,11 @@ tamaño LOD 0 antes de iniciar y pide reducir una selección que supere el máxi
 
 ## Descarga regional obligatoria
 
-La tarjeta previa a la exploración ofrece:
+La tarjeta previa a la exploración ofrece cinco perfiles y selecciona
+**Máximo** por defecto:
 
 ```text
-Cauteloso 0.5 req/s · Normal 2 req/s · Rápido 8 req/s · Turbo 16 req/s
+Mínimo 0.25 req/s · Suave 0.5 req/s · Normal 2 req/s · Rápido 8 req/s · Máximo 16 req/s
 ```
 
 **Descargar región completa** envía al runtime:
@@ -198,14 +204,20 @@ Cauteloso 0.5 req/s · Normal 2 req/s · Rápido 8 req/s · Turbo 16 req/s
 - cooldown global para `Retry-After`, visible junto con RPS logradas, setpoint,
   tiles de red por segundo, MiB/s y ETA de red.
 
-El runtime ejecuta `../download_region_2b2t.py`, permite un trabajo a la vez,
-limita la región a 1,048,576 celdas espaciales y realiza un preflight de lo que
-realmente falta con 20% de margen. Los WebP válidos y los `404` persistidos se
-reutilizan; el ejecutor mantiene una cola acotada aunque la región sea grande.
+El runtime ejecuta `../download_region_2b2t.py` sobre la biblioteca regional
+separada, permite un trabajo a la vez, limita la región a 1,048,576 celdas
+espaciales y realiza un preflight de lo que realmente falta con 20% de margen.
+Los WebP válidos y los `404` persistidos se reutilizan; el ejecutor mantiene una
+cola acotada aunque la región sea grande. No existe un trabajo global: los
+16 req/s completos quedan disponibles para la región elegida.
 
 **Detener descarga** solicita una interrupción segura. **Reanudar descarga**
 continúa el mismo inventario. La navegación permanece bloqueada hasta que
 `complete + absent = total` y no existan pendientes, faltantes ni fallos.
+Mientras el trabajo corre, la UI usa su stream ligero de progreso; la
+verificación completa de tamaño y SHA-256 se ejecuta al entrar al gate y al
+cambiar el trabajo a un estado terminal, evitando releer toda la región cada
+pocos segundos.
 
 Desde terminal puede reproducirse el mismo flujo:
 
@@ -218,7 +230,7 @@ python ../download_region_2b2t.py \
   --dimension overworld \
   --lod 0 \
   --layers base,overlay \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --out '/Volumes/2b2t Tiles/ObsidianAtlasRegions/2b2t_tiles' \
   --workers 1 \
   --requests-per-second 1 \
   --max-tiles 2
@@ -231,17 +243,15 @@ composición de imágenes y cuadrículas de coordenadas.
 
 `GET /api/local-atlas/status` devuelve una instantánea sin caché de:
 
-- espacio del APFS de tiles;
+- espacio del APFS regional;
 - espacio disponible en LuisA;
-- bytes registrados en la biblioteca;
-- referencia del Overworld;
-- margen y resultado de la comparación;
-- progreso global sanitizado desde `progress.json`, cuando existe;
+- bytes regionales registrados;
+- margen disponible para nuevas regiones;
 - trabajo regional actual.
 
-El progreso global incluye alcance, porcentaje, contadores, tiles/s, MB/s,
-bytes y ETA. No proyecta rutas locales, errores internos ni comandos de
-reanudación al navegador.
+Por compatibilidad, `globalDownload` permanece en el contrato con valor `null`.
+Reportes históricos como `progress.json` no crean metas, no aparecen en la UI y
+no reducen el presupuesto regional.
 
 `GET /api/local-atlas/coverage?layer=base&lod=0..3` consulta SQLite en modo
 solo lectura. La consulta se limita a las bandas publicadas: tiles ajenos a la
@@ -271,8 +281,9 @@ crea operaciones.
 
 El orden de lectura es:
 
-1. biblioteca configurada por `OBSIDIAN_ATLAS_TILE_ROOT`;
-2. carpeta elegida manualmente en Chrome;
+1. predescargas de `OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT`;
+2. panorama Overworld LOD 10 de `OBSIDIAN_ATLAS_TILE_ROOT`;
+3. carpeta elegida manualmente en Chrome;
 
 La estructura esperada es:
 
@@ -312,12 +323,11 @@ Los highlights disponibles son:
 
 Nombre, nota, color y visibilidad permanecen en
 el workspace de LuisA. Su JSON de respaldo manual es
-`obsidian-atlas-highlights.json`. `localStorage` conserva una copia de
-recuperación completa por pestaña y migra automáticamente cuando su revisión
-base coincide. Un conflicto nunca sobrescribe LuisA: conserva la rama local
-hasta que el usuario elige explícitamente qué versión usar. El workspace admite
-128 sesiones y 10,000 highlights; las sesiones pausadas se pueden eliminar
-desde su tarjeta.
+`obsidian-atlas-highlights.json`. LuisA mantiene una sola sesión canónica y
+hasta 10,000 highlights. `localStorage` solo contiene una WAL temporal fija,
+sin ramas por pestaña; si queda obsoleta, se descarta y prevalece el documento
+de LuisA. Los workspaces multisesión antiguos se consolidan una vez y se
+archivan completos en `ObsidianAtlas/backups/` antes de podarlos.
 
 ## Atajos
 

@@ -39,9 +39,19 @@ class LocalAtlasLauncherContractTests(unittest.TestCase):
             'external_tile_root="${external_volume}/2b2t_tiles"',
             self.source,
         )
+        self.assertIn(
+            'external_regional_tile_root="${external_volume}/'
+            'ObsidianAtlasRegions/2b2t_tiles"',
+            self.source,
+        )
         self.assertIn('backing_root="/Volumes/LuisA"', self.source)
         self.assertIn(
             'export OBSIDIAN_ATLAS_TILE_ROOT="${tile_root}"',
+            self.source,
+        )
+        self.assertIn(
+            'export OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT='
+            '"${regional_tile_root}"',
             self.source,
         )
         self.assertIn(
@@ -163,6 +173,24 @@ class LocalAtlasLauncherContractTests(unittest.TestCase):
         ):
             with self.subTest(legacy_text=legacy_text):
                 self.assertNotIn(legacy_text, lowered)
+
+    def test_launcher_declares_on_demand_downloads_only(self) -> None:
+        completed = subprocess.run(
+            ["bash", str(LAUNCHER), "--help"],
+            cwd=PROJECT_DIR,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(
+            "todo el presupuesto disponible de hasta 16 req/s",
+            completed.stdout,
+        )
+        self.assertIn(
+            "no\ninicia ni reanuda descargas globales",
+            completed.stdout,
+        )
 
     def test_mounts_and_viewer_are_validated_before_screen_launch(self) -> None:
         validate = self.position("\n  validate_environment\n")

@@ -65,6 +65,7 @@ canvas:focus-visible {
   position: relative;
   width: 100vw;
   height: 100svh;
+  min-width: 960px;
   min-height: 560px;
   overflow: hidden;
   background: var(--ink);
@@ -450,7 +451,7 @@ canvas:focus-visible {
   bottom: 82px;
   left: 98px;
   display: flex;
-  width: 334px;
+  width: clamp(390px, 32vw, 430px);
   flex-direction: column;
   overflow: hidden;
   border-radius: 20px;
@@ -466,7 +467,7 @@ canvas:focus-visible {
 
 .drawer-heading {
   display: flex;
-  min-height: 82px;
+  min-height: 72px;
   align-items: center;
   justify-content: space-between;
   padding: 18px 18px 14px;
@@ -490,12 +491,74 @@ canvas:focus-visible {
   letter-spacing: -0.03em;
 }
 
+.atlas-flow {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(2, 9, 17, 0.42);
+}
+
+.atlas-flow span {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--quiet);
+  font-size: 9px;
+  font-weight: 620;
+  white-space: nowrap;
+}
+
+.atlas-flow span:not(:last-child)::after {
+  width: 14px;
+  height: 1px;
+  margin-left: auto;
+  background: var(--line-strong);
+  content: "";
+}
+
+.atlas-flow i {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+  font-style: normal;
+}
+
+.atlas-flow span[data-state="current"] {
+  color: var(--text);
+}
+
+.atlas-flow span[data-state="current"] i {
+  border-color: rgba(38, 217, 199, 0.48);
+  color: #061512;
+  background: var(--mint);
+  box-shadow: 0 0 12px rgba(38, 217, 199, 0.24);
+}
+
+.atlas-flow span[data-state="complete"] {
+  color: var(--mint);
+}
+
+.atlas-flow span[data-state="complete"] i {
+  border-color: rgba(38, 217, 199, 0.38);
+  background: rgba(38, 217, 199, 0.1);
+}
+
 .drawer-content {
   min-height: 0;
   flex: 1;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 16px;
+  padding: 14px;
   scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
   scrollbar-width: thin;
 }
@@ -744,39 +807,12 @@ canvas:focus-visible {
 }
 
 .exploration-panel {
-  display: flex;
-  flex-direction: column;
+  display: block;
   padding-bottom: 22px;
 }
 
-.exploration-panel > * {
-  flex-shrink: 0;
-}
-
-.exploration-panel > .region-download-gate {
-  order: -51;
+.exploration-panel > :first-child {
   margin-top: 0;
-}
-
-.exploration-panel > .exploration-progress-card {
-  order: -50;
-  margin-top: 0;
-}
-
-.exploration-panel > .current-cell-card {
-  order: -49;
-}
-
-.exploration-panel > .regional-download-card {
-  order: -48;
-}
-
-.exploration-panel > .exploration-transfer {
-  order: -47;
-}
-
-.exploration-panel > .exploration-close-confirm {
-  order: -46;
 }
 
 .capacity-card,
@@ -895,108 +931,6 @@ canvas:focus-visible {
   color: var(--quiet);
   font-size: 8px;
   line-height: 1.5;
-}
-
-.global-download-progress-card {
-  margin-top: 11px;
-  padding: 10px;
-  border: 1px solid rgba(38, 217, 199, 0.24);
-  border-radius: 11px;
-  background:
-    linear-gradient(145deg, rgba(38, 217, 199, 0.07), transparent 62%),
-    rgba(4, 15, 24, 0.72);
-}
-
-.global-download-progress-heading {
-  display: flex;
-  align-items: start;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.global-download-progress-heading span,
-.global-download-progress-heading strong {
-  display: block;
-}
-
-.global-download-progress-heading span {
-  color: var(--mint);
-  font-family: var(--font-geist-mono), monospace;
-  font-size: 7px;
-  letter-spacing: 0.08em;
-}
-
-.global-download-progress-heading div > strong {
-  margin-top: 3px;
-  color: var(--text);
-  font-size: 9px;
-}
-
-.global-download-progress-heading > strong {
-  color: var(--mint);
-  font-family: var(--font-geist-mono), monospace;
-  font-size: 15px;
-  font-weight: 650;
-}
-
-.global-download-progress-track {
-  display: block;
-  height: 6px;
-  margin-top: 9px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.075);
-}
-
-.global-download-progress-track > span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, var(--blue), var(--mint));
-  box-shadow: 0 0 12px rgba(38, 217, 199, 0.3);
-  transition: width 260ms ease;
-}
-
-.global-download-progress-metrics {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1px;
-  margin-top: 9px;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--line);
-}
-
-.global-download-progress-metrics > span {
-  min-width: 0;
-  padding: 7px;
-  color: var(--quiet);
-  background: rgba(7, 17, 31, 0.94);
-  font-size: 7px;
-}
-
-.global-download-progress-metrics strong {
-  display: block;
-  margin-top: 3px;
-  overflow: hidden;
-  color: var(--text);
-  font-family: var(--font-geist-mono), monospace;
-  font-size: 8px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.global-download-progress-card > p {
-  margin: 8px 0 0;
-  color: var(--quiet);
-  font-size: 8px;
-  line-height: 1.45;
-}
-
-.global-download-progress-card[data-status="error"],
-.global-download-progress-card[data-status="incomplete"] {
-  border-color: rgba(255, 109, 122, 0.35);
 }
 
 .region-actions,
@@ -1121,7 +1055,7 @@ canvas:focus-visible {
 
 .region-download-gate {
   overflow: hidden;
-  padding: 15px;
+  padding: 14px;
   border: 1px solid rgba(255, 189, 74, 0.34);
   border-radius: 16px;
   background:
@@ -1248,15 +1182,60 @@ canvas:focus-visible {
 }
 
 .region-download-gate > p {
-  margin: 12px 0 0;
+  margin: 9px 0 0;
   color: var(--muted);
-  font-size: 10px;
+  font-size: 11px;
   line-height: 1.5;
 }
 
+.region-download-budget {
+  margin-top: 11px;
+  overflow: hidden;
+  border: 1px solid rgba(98, 168, 255, 0.24);
+  border-radius: 11px;
+  background: rgba(4, 15, 27, 0.72);
+}
+
+.region-download-budget-title {
+  display: block;
+  padding: 8px 10px 7px;
+  color: var(--blue);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.09em;
+}
+
+.region-download-budget-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  border-top: 1px solid var(--line);
+  background: var(--line);
+}
+
+.region-download-budget-grid > span {
+  min-width: 0;
+  padding: 8px 7px;
+  color: var(--quiet);
+  background: rgba(7, 17, 31, 0.97);
+  font-size: 8px;
+}
+
+.region-download-budget-grid strong {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .region-download-progress {
-  height: 8px;
-  margin-top: 12px;
+  height: 7px;
+  margin-top: 10px;
   overflow: hidden;
   border: 1px solid rgba(255, 189, 74, 0.2);
   border-radius: 999px;
@@ -1281,7 +1260,7 @@ canvas:focus-visible {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1px;
-  margin-top: 11px;
+  margin-top: 9px;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -1290,10 +1269,10 @@ canvas:focus-visible {
 
 .region-download-metrics > span {
   min-width: 0;
-  padding: 8px;
+  padding: 9px;
   color: var(--quiet);
   background: rgba(7, 17, 31, 0.96);
-  font-size: 8px;
+  font-size: 9px;
 }
 
 .region-download-metrics strong {
@@ -1302,9 +1281,75 @@ canvas:focus-visible {
   overflow: hidden;
   color: var(--text);
   font-family: var(--font-geist-mono), monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.region-download-technical {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.region-download-technical > summary {
+  padding: 9px 11px;
+  color: var(--muted);
+  cursor: pointer;
   font-size: 10px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  list-style: none;
+}
+
+.region-download-technical > summary::-webkit-details-marker {
+  display: none;
+}
+
+.region-download-technical > summary::after {
+  float: right;
+  color: var(--quiet);
+  content: "+";
+}
+
+.region-download-technical[open] > summary::after {
+  content: "−";
+}
+
+.region-download-technical .region-download-metrics {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+  border-width: 1px 0 0;
+  border-radius: 0;
+}
+
+.region-persistence-note {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  margin-top: 9px;
+  padding: 9px 10px;
+  border: 1px solid rgba(38, 217, 199, 0.22);
+  border-radius: 10px;
+  color: var(--mint);
+  background: rgba(38, 217, 199, 0.055);
+}
+
+.region-persistence-note strong,
+.region-persistence-note small {
+  display: block;
+}
+
+.region-persistence-note strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.region-persistence-note small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.35;
 }
 
 .region-download-warning {
@@ -1327,17 +1372,16 @@ canvas:focus-visible {
 
 .region-download-rate {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  margin-top: 11px;
+  grid-template-columns: 1fr;
+  gap: 5px;
+  margin-top: 9px;
   color: var(--muted);
   font-size: 9px;
 }
 
 .region-download-rate select {
-  min-width: 112px;
-  min-height: 44px;
+  width: 100%;
+  min-height: 42px;
   padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -1346,6 +1390,12 @@ canvas:focus-visible {
   background: rgba(255, 255, 255, 0.045);
   font-family: var(--font-geist-mono), monospace;
   font-size: 10px;
+}
+
+.region-download-rate-note {
+  color: var(--quiet);
+  font-size: 9px;
+  line-height: 1.45;
 }
 
 .region-download-rate select:focus-visible,
@@ -1357,14 +1407,14 @@ canvas:focus-visible {
 
 .region-download-primary,
 .region-download-gate > .stop-job-button {
-  min-height: 48px;
-  margin-top: 11px;
+  min-height: 46px;
+  margin-top: 9px;
 }
 
 .region-download-cancel {
   display: flex;
   width: 100%;
-  min-height: 44px;
+  min-height: 38px;
   align-items: center;
   justify-content: center;
   margin-top: 6px;
@@ -2520,7 +2570,7 @@ canvas:focus-visible {
   }
 }
 
-/* Global Overworld coverage planner */
+/* Desktop Overworld region planner */
 .coverage-overview-card,
 .coverage-selection-card,
 .saved-session-picker {
@@ -2578,14 +2628,14 @@ canvas:focus-visible {
 .coverage-overview-heading strong,
 .coverage-selection-heading span,
 .coverage-selection-heading strong,
-.saved-session-picker-heading span,
-.saved-session-picker-heading strong {
+.saved-session-picker-heading > div > span,
+.saved-session-picker-heading > div > strong {
   display: block;
 }
 
 .coverage-overview-heading span,
 .coverage-selection-heading span,
-.saved-session-picker-heading span {
+.saved-session-picker-heading > div > span {
   color: var(--blue);
   font-family: var(--font-geist-mono), monospace;
   font-size: 8px;
@@ -2595,7 +2645,7 @@ canvas:focus-visible {
 
 .coverage-overview-heading strong,
 .coverage-selection-heading strong,
-.saved-session-picker-heading strong {
+.saved-session-picker-heading > div > strong {
   margin-top: 3px;
   overflow: hidden;
   color: var(--text);
@@ -2873,7 +2923,7 @@ canvas:focus-visible {
 }
 
 .atlas-drawer {
-  width: 350px;
+  width: clamp(420px, 35vw, 460px);
   border-color: rgba(98, 168, 255, 0.24);
   background:
     linear-gradient(155deg, rgba(25, 54, 82, 0.18), transparent 36%),
@@ -2884,8 +2934,8 @@ canvas:focus-visible {
   display: grid;
   grid-auto-rows: max-content;
   align-content: start;
-  gap: 12px;
-  padding: 14px;
+  gap: 9px;
+  padding: 12px;
 }
 
 .atlas-overview-hero,
@@ -2904,7 +2954,7 @@ canvas:focus-visible {
 .atlas-overview-hero {
   position: relative;
   overflow: hidden;
-  padding: 14px;
+  padding: 11px 12px;
   border-color: rgba(98, 168, 255, 0.3);
   background:
     radial-gradient(circle at 96% -10%, rgba(98, 168, 255, 0.22), transparent 40%),
@@ -2923,8 +2973,8 @@ canvas:focus-visible {
 
 .atlas-overview-icon {
   display: grid;
-  width: 39px;
-  height: 39px;
+  width: 35px;
+  height: 35px;
   place-items: center;
   border: 1px solid rgba(98, 168, 255, 0.28);
   border-radius: 12px;
@@ -2972,11 +3022,11 @@ canvas:focus-visible {
 .atlas-active-session {
   display: grid;
   width: 100%;
-  min-height: 48px;
+  min-height: 42px;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 9px;
-  margin-top: 12px;
+  margin-top: 9px;
   padding: 7px 10px;
   border: 1px solid rgba(98, 168, 255, 0.28);
   border-radius: 11px;
@@ -3084,15 +3134,26 @@ canvas:focus-visible {
   gap: 12px;
 }
 
-.atlas-progress-heading > strong {
-  color: var(--mint);
+.atlas-navigation-badge {
+  padding: 6px 8px;
+  border: 1px solid rgba(98, 168, 255, 0.28);
+  border-radius: 999px;
+  color: #cbe5ff;
+  background: rgba(98, 168, 255, 0.08);
   font-family: var(--font-geist-mono), monospace;
-  font-size: 22px;
-  font-weight: 600;
-  letter-spacing: -0.05em;
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
 }
 
-.atlas-progress-track,
+.atlas-availability-copy {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
 .saved-session-mini-track {
   display: block;
   overflow: hidden;
@@ -3100,12 +3161,6 @@ canvas:focus-visible {
   background: rgba(255, 255, 255, 0.075);
 }
 
-.atlas-progress-track {
-  height: 7px;
-  margin-top: 12px;
-}
-
-.atlas-progress-track > span,
 .saved-session-mini-track > i {
   display: block;
   height: 100%;
@@ -3442,7 +3497,7 @@ canvas:focus-visible {
 
 .atlas-launch-card {
   margin-top: 0;
-  padding: 14px;
+  padding: 12px;
   border-color: rgba(98, 168, 255, 0.3);
   background:
     linear-gradient(145deg, rgba(98, 168, 255, 0.11), transparent 58%),
@@ -3451,32 +3506,6 @@ canvas:focus-visible {
 
 .atlas-launch-heading > svg {
   color: var(--blue);
-}
-
-.atlas-launch-stats {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 5px;
-  margin-top: 11px;
-}
-
-.atlas-launch-stats > span {
-  min-width: 0;
-  padding: 8px 6px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  color: var(--quiet);
-  background: rgba(0, 0, 0, 0.14);
-  font-size: 8px;
-  text-align: center;
-}
-
-.atlas-launch-stats strong {
-  display: block;
-  margin-bottom: 3px;
-  color: var(--text);
-  font-family: var(--font-geist-mono), monospace;
-  font-size: 13px;
 }
 
 .atlas-launch-button {
@@ -3535,6 +3564,19 @@ canvas:focus-visible {
   font-size: 8px;
 }
 
+.exploration-storage-details > summary::after,
+.manual-region-details > summary::after {
+  margin-left: auto;
+  color: var(--quiet);
+  content: "+";
+  font-family: var(--font-geist-mono), monospace;
+}
+
+.exploration-storage-details[open] > summary::after,
+.manual-region-details[open] > summary::after {
+  content: "−";
+}
+
 .exploration-storage-details[open] > summary,
 .manual-region-details[open] > summary {
   border-bottom: 1px solid var(--line);
@@ -3542,16 +3584,6 @@ canvas:focus-visible {
 
 .exploration-storage-details .capacity-card {
   margin: 9px;
-}
-
-.manual-region-details > summary::after {
-  margin-left: auto;
-  content: "+";
-  font-family: var(--font-geist-mono), monospace;
-}
-
-.manual-region-details[open] > summary::after {
-  content: "−";
 }
 
 .manual-region-content {
@@ -3683,12 +3715,6 @@ canvas:focus-visible {
   box-shadow: none;
 }
 
-.persistence-badge[data-state="conflict"] {
-  --persistence-tone: var(--amber);
-  --persistence-border: rgba(255, 189, 74, 0.38);
-  --persistence-background: rgba(255, 189, 74, 0.1);
-}
-
 .persistence-badge[data-state="error"] {
   --persistence-tone: var(--danger);
   --persistence-border: rgba(255, 102, 95, 0.38);
@@ -3709,14 +3735,63 @@ canvas:focus-visible {
 }
 
 .saved-session-picker {
+  padding: 0;
   border-color: rgba(197, 140, 255, 0.22);
   background:
     linear-gradient(145deg, rgba(197, 140, 255, 0.06), transparent 62%),
     rgba(4, 12, 21, 0.58);
 }
 
+.saved-session-picker > summary {
+  padding: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.saved-session-picker > summary::-webkit-details-marker {
+  display: none;
+}
+
+.saved-session-picker[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.saved-session-picker-heading .persistence-badge::after {
+  margin-left: 2px;
+  color: currentColor;
+  content: "+";
+}
+
+.saved-session-picker[open]
+  .saved-session-picker-heading
+  .persistence-badge::after {
+  content: "−";
+}
+
+.saved-session-picker-heading > div > strong {
+  font-size: 11px;
+}
+
+.saved-session-persistence-copy {
+  margin: 10px 12px 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.saved-session-picker > .saved-session-actions,
+.saved-session-picker > .saved-session-list,
+.saved-session-picker > .saved-session-empty {
+  margin-right: 12px;
+  margin-left: 12px;
+}
+
+.saved-session-picker > :last-child {
+  margin-bottom: 12px;
+}
+
 .saved-session-picker-heading > svg,
-.saved-session-picker-heading span {
+.saved-session-picker-heading > div > span {
   color: #c58cff;
 }
 
@@ -3749,13 +3824,8 @@ canvas:focus-visible {
 
 .saved-session-list {
   display: grid;
-  max-height: 230px;
   gap: 6px;
   margin-top: 10px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-color: rgba(148, 168, 189, 0.36) transparent;
-  scrollbar-width: thin;
 }
 
 .saved-session-item {
@@ -3920,11 +3990,11 @@ button.saved-session-item {
   }
 
   .side-drawer {
-    width: 310px;
+    width: 390px;
   }
 
   .atlas-drawer {
-    width: 340px;
+    width: 410px;
   }
 
   .bottom-left-status span:last-child {
@@ -3932,367 +4002,7 @@ button.saved-session-item {
   }
 }
 
-@media (max-width: 720px) {
-  .atlas-shell {
-    min-height: 0;
-  }
-
-  .topbar {
-    top: max(10px, env(safe-area-inset-top));
-    right: max(10px, env(safe-area-inset-right));
-    left: max(10px, env(safe-area-inset-left));
-    grid-template-columns: 48px minmax(0, 1fr) auto;
-    gap: 7px;
-  }
-
-  .brand-card,
-  .search-card,
-  .coordinate-card {
-    min-height: 48px;
-    border-radius: 14px;
-  }
-
-  .brand-card {
-    width: 48px;
-    padding: 6px;
-  }
-
-  .brand-mark {
-    width: 34px;
-    height: 34px;
-  }
-
-  .search-card {
-    padding: 5px 5px 5px 11px;
-  }
-
-  .search-card input {
-    font-size: 12px;
-  }
-
-  .search-card kbd,
-  .search-card > svg {
-    display: none;
-  }
-
-  .search-card button {
-    width: 40px;
-    height: 40px;
-  }
-
-  .coordinate-card {
-    display: grid;
-    width: 126px;
-    align-items: center;
-    padding: 5px 8px;
-  }
-
-  .coordinate-main {
-    display: flex;
-    justify-content: space-between;
-    gap: 5px;
-    font-size: 8px;
-  }
-
-  .coordinate-main strong {
-    margin-left: 2px;
-    font-size: 10px;
-  }
-
-  .coordinate-meta {
-    display: flex;
-    gap: 4px;
-    margin-top: 2px;
-    font-size: 8px;
-  }
-
-  .coordinate-meta span:first-child,
-  .coordinate-meta i:first-of-type {
-    display: none;
-  }
-
-  .coordinate-meta span:last-child,
-  .coordinate-meta i:last-of-type {
-    display: inline-block;
-  }
-
-  .coordinate-actions {
-    display: none;
-  }
-
-  .left-dock {
-    top: auto;
-    right: max(10px, env(safe-area-inset-right));
-    bottom: max(68px, calc(env(safe-area-inset-bottom) + 58px));
-    left: max(10px, env(safe-area-inset-left));
-    display: grid;
-    width: auto;
-    grid-template-columns: repeat(5, 1fr);
-    padding: 5px;
-    border-radius: 15px;
-  }
-
-  .left-dock button {
-    min-height: 46px;
-    padding: 2px 8px;
-  }
-
-  .left-dock button span {
-    font-size: 9px;
-  }
-
-  .side-drawer {
-    top: auto;
-    right: max(8px, env(safe-area-inset-right));
-    bottom: max(126px, calc(env(safe-area-inset-bottom) + 116px));
-    left: max(8px, env(safe-area-inset-left));
-    width: auto;
-    max-height: min(64svh, 570px);
-    border-radius: 20px;
-    animation-name: sheet-in;
-  }
-
-  .atlas-drawer {
-    width: auto;
-    max-height: min(58svh, 520px);
-  }
-
-  .atlas-overview-panel {
-    gap: 10px;
-    padding: 12px;
-  }
-
-  .atlas-overview-hero > p {
-    display: none;
-  }
-
-  .atlas-clear-filter,
-  .atlas-next-pending,
-  .atlas-sector-actions button,
-  .atlas-selection-summary > button {
-    min-height: 44px;
-  }
-
-  .atlas-sector-actions button,
-  .atlas-selection-summary > button {
-    font-size: 11px;
-  }
-
-  .atlas-focus-pad {
-    display: grid;
-  }
-
-  .atlas-status-grid span,
-  .atlas-sector-metrics > span,
-  .atlas-sector-state,
-  .atlas-sector-warning,
-  .atlas-sector-note {
-    font-size: 10px;
-  }
-
-  .atlas-sector-metrics strong,
-  .atlas-sector-inspector code {
-    font-size: 11px;
-  }
-
-  .atlas-keyboard-hint {
-    display: none;
-  }
-
-  .atlas-selection-summary {
-    border-color: rgba(98, 168, 255, 0.46);
-    background: rgba(8, 24, 39, 0.96);
-  }
-
-  @keyframes sheet-in {
-    from {
-      transform: translateY(14px);
-      opacity: 0;
-    }
-  }
-
-  .drawer-heading {
-    min-height: 67px;
-    padding: 13px 15px;
-  }
-
-  .drawer-heading h2 {
-    font-size: 16px;
-  }
-
-  .drawer-content {
-    padding: 13px;
-  }
-
-  .coverage-overview-card,
-  .coverage-selection-card,
-  .saved-session-picker {
-    padding: 12px;
-    border-radius: 14px;
-  }
-
-  .coverage-overview-card::before {
-    top: -64px;
-    right: -54px;
-    opacity: 0.55;
-  }
-
-  .coverage-overview-actions button,
-  .coverage-full-map-actions button,
-  .full-map-actions button,
-  .compact-button,
-  .coverage-compact-button,
-  .saved-session-actions button {
-    min-height: 40px;
-  }
-
-  .coverage-legend {
-    gap: 8px 12px;
-  }
-
-  .persistence-badge {
-    min-height: 34px;
-    padding-inline: 10px;
-  }
-
-  .saved-session-list {
-    max-height: min(190px, 24svh);
-  }
-
-  .bottom-left-status {
-    bottom: max(10px, env(safe-area-inset-bottom));
-    left: 10px;
-    min-height: 36px;
-  }
-
-  .bottom-left-status span:last-child {
-    display: none;
-  }
-
-  .dimension-pill {
-    bottom: max(10px, env(safe-area-inset-bottom));
-    left: auto;
-    right: 58px;
-    min-height: 36px;
-    transform: none;
-  }
-
-  .dimension-pill button {
-    min-height: 36px;
-    padding: 0 8px;
-    font-size: 9px;
-  }
-
-  .coming-soon {
-    display: none;
-  }
-
-  .zoom-stack {
-    right: 10px;
-    bottom: max(126px, calc(env(safe-area-inset-bottom) + 116px));
-  }
-
-  .exploration-navigation {
-    right: 70px;
-    bottom: max(126px, calc(env(safe-area-inset-bottom) + 116px));
-    width: 214px;
-  }
-
-  .fallback-badge {
-    right: 70px;
-    top: 76px;
-    bottom: auto;
-    max-width: calc(100vw - 140px);
-  }
-
-  .marking-banner {
-    top: 70px;
-    min-width: 250px;
-  }
-
-  .toast {
-    right: 10px;
-    bottom: max(132px, calc(env(safe-area-inset-bottom) + 122px));
-  }
-}
-
-@media (max-width: 420px) {
-  .coverage-overview-heading,
-  .coverage-selection-heading,
-  .saved-session-picker-heading {
-    align-items: start;
-  }
-
-  .coverage-overview-status,
-  .coverage-selection-status,
-  .coverage-overview-heading > .persistence-badge,
-  .saved-session-picker-heading > .persistence-badge {
-    grid-column: 2 / -1;
-    justify-self: start;
-    margin-top: 2px;
-  }
-
-  .coverage-overview-metrics,
-  .coverage-selection-summary {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .coverage-overview-metrics > span:nth-child(3):last-child,
-  .coverage-selection-summary > span:nth-child(3):last-child {
-    grid-column: 1 / -1;
-  }
-
-  .coverage-overview-actions,
-  .coverage-full-map-actions,
-  .full-map-actions {
-    grid-template-columns: 1fr;
-  }
-
-  .coverage-legend {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .persistence-badge {
-    width: 100%;
-    justify-content: flex-start;
-  }
-
-  .saved-session-item {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  .saved-session-item-progress {
-    width: max-content;
-  }
-
-  .saved-session-item-actions {
-    grid-column: 1 / -1;
-    justify-content: flex-end;
-  }
-
-  .saved-session-item-actions button {
-    min-height: 40px;
-  }
-
-  .atlas-selection-summary {
-    grid-template-columns: 1fr;
-  }
-
-  .atlas-selection-summary > button {
-    width: 100%;
-  }
-
-  .saved-session-actions {
-    flex-wrap: wrap;
-  }
-
-  .saved-session-actions button {
-    min-width: calc(50% - 3px);
-  }
-}
-
-@media (min-width: 721px) and (max-height: 650px) and (orientation: landscape) {
+@media (max-height: 650px) {
   .topbar {
     top: 8px;
   }

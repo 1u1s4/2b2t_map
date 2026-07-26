@@ -715,6 +715,45 @@ export function withCurrentCellReviewed(
   return withCellReviewed(state, state.currentIndex, reviewed);
 }
 
+/**
+ * Mark many cells as reviewed in one immutable update. This is primarily used
+ * when consolidating legacy workspace sessions: cloning the complete bitset
+ * once keeps a large LOD-0 migration bounded.
+ */
+export function withCellsReviewed(
+  state: ExplorationState,
+  indexes: Iterable<number>,
+): ExplorationState {
+  assertExplorationState(state);
+  const nextReviewed = state.reviewed.slice();
+  const nextSkipped = state.skipped.slice();
+  let reviewedCount = state.reviewedCount;
+  let skippedCount = state.skippedCount;
+  let changed = false;
+
+  for (const index of indexes) {
+    assertCellIndex(state.region, index);
+    const location = bitLocation(index);
+    if ((nextReviewed[location.byte] & location.mask) !== 0) continue;
+    nextReviewed[location.byte] |= location.mask;
+    reviewedCount += 1;
+    if ((nextSkipped[location.byte] & location.mask) !== 0) {
+      nextSkipped[location.byte] &= ~location.mask;
+      skippedCount -= 1;
+    }
+    changed = true;
+  }
+
+  if (!changed) return state;
+  return Object.freeze({
+    ...state,
+    reviewed: nextReviewed,
+    reviewedCount,
+    skipped: nextSkipped,
+    skippedCount,
+  });
+}
+
 export function withCellSkipped(
   state: ExplorationState,
   index: number,

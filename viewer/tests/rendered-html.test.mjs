@@ -58,9 +58,11 @@ test("server-renders the Obsidian Atlas product shell and metadata", async () =>
   assert.match(html, /Solo local/);
   assert.match(html, /Explorar/);
   assert.match(html, /class="atlas-shell[^"]*is-atlas-mode/i);
-  assert.match(html, /Atlas global/);
+  assert.match(html, /Mapa general/);
   assert.match(html, /Vista completa · Overworld/i);
   assert.match(html, /1,089 sectores en una sola vista/i);
+  assert.match(html, /El mapa general no descarga archivos/i);
+  assert.doesNotMatch(html, /descarga global/i);
   assert.doesNotMatch(html, /mchinchimoran\.chatgpt\.site/i);
   assert.doesNotMatch(
     html,

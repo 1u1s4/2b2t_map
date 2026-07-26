@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -82,6 +82,99 @@ async function withCoverageServer(rows, operation) {
     await rm(tileRoot, { recursive: true, force: true });
   }
 }
+
+async function withCombinedCoverageServer(
+  primaryRows,
+  regionalRows,
+  operation,
+) {
+  const root = await mkdtemp(join(tmpdir(), "atlas-combined-coverage-"));
+  const primaryRoot = join(root, "primary");
+  const regionalRoot = join(root, "regional");
+  await mkdir(primaryRoot, { recursive: true });
+  await mkdir(regionalRoot, { recursive: true });
+  for (const [catalogRoot, rows] of [
+    [primaryRoot, primaryRows],
+    [regionalRoot, regionalRows],
+  ]) {
+    execFileSync(
+      "python3",
+      [
+        "-c",
+        CREATE_COVERAGE_FIXTURE,
+        join(catalogRoot, "tiles.sqlite3"),
+        JSON.stringify(rows),
+      ],
+      { stdio: "pipe" },
+    );
+  }
+  const runtime = createLocalAtlasMiddleware({
+    tileRoot: primaryRoot,
+    regionalTileRoot: regionalRoot,
+    pythonBin: "python3",
+  });
+  const server = createServer((request, response) => {
+    void runtime.middleware(request, response, () => {
+      response.statusCode = 404;
+      response.end();
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    return await operation(`http://127.0.0.1:${address.port}`);
+  } finally {
+    runtime.close();
+    await new Promise((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("coverage combines catalogs once per tile with regional precedence", async () => {
+  const published = [];
+  for (let tileZ = -132; tileZ < -124; tileZ += 1) {
+    for (let tileX = -132; tileX < -124; tileX += 1) {
+      if (isObservedLod3TileAvailable(tileX, tileZ)) {
+        published.push([tileX, tileZ]);
+      }
+    }
+  }
+  const [overridden, primaryOnly, regionalOnly] = published;
+  await withCombinedCoverageServer(
+    [
+      [3, ...overridden, "complete"],
+      [3, ...primaryOnly, "complete"],
+    ],
+    [
+      [3, ...overridden, "pending"],
+      [3, ...regionalOnly, "complete"],
+    ],
+    async (baseUrl) => {
+      const response = await fetch(
+        `${baseUrl}/api/local-atlas/coverage?layer=base&lod=3`,
+      );
+      assert.equal(response.status, 200);
+      const snapshot = parseLocalAtlasCoverage(await response.json());
+      assert.ok(snapshot);
+      assert.deepEqual(snapshot.cells, [
+        {
+          row: 0,
+          column: 0,
+          completeCount: 2,
+          queuedCount: 1,
+          failedCount: 0,
+          absentCount: 0,
+        },
+      ]);
+    },
+  );
+});
 
 test("coverage endpoint filters unpublished gaps and treats unknown failures conservatively", async () => {
   const published = [];

@@ -37,23 +37,23 @@ test("navigation preserves the exact user zoom while recentering", () => {
   assert.deepEqual(view.camera, { x: 768, z: 256 });
 });
 
-test("initial activation still fits desktop and mobile viewports", () => {
+test("initial activation fits wide and compact desktop viewports", () => {
   const state = exploration();
   const desktop = resolveExplorationFocusView(
     state,
     { width: 1_440, height: 900 },
     { mode: "fit" },
   );
-  const mobile = resolveExplorationFocusView(
+  const compactDesktop = resolveExplorationFocusView(
     state,
-    { width: 640, height: 480 },
+    { width: 1_024, height: 768 },
     { mode: "fit" },
   );
 
   assert.equal(desktop.scale, 1);
   assert.deepEqual(desktop.camera, { x: 256, z: 256 });
-  assert.equal(mobile.scale, 260 / 512);
-  assert.deepEqual(mobile.camera, { x: 256, z: 256 });
+  assert.equal(compactDesktop.scale, 484 / 512);
+  assert.deepEqual(compactDesktop.camera, { x: 256, z: 256 });
 });
 
 test("preserved exploration zoom remains inside safe limits", () => {

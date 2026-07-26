@@ -10,6 +10,9 @@ const CONFIG_DIRECTORY = fileURLToPath(new URL(".", import.meta.url));
 const REPOSITORY_TILE_ROOT = fileURLToPath(
   new URL("../2b2t_tiles", import.meta.url),
 );
+const REPOSITORY_REGIONAL_TILE_ROOT = fileURLToPath(
+  new URL("../2b2t_tiles_regions", import.meta.url),
+);
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
@@ -33,14 +36,17 @@ export default defineConfig(async ({ command, mode }) => {
     CONFIG_DIRECTORY,
     "OBSIDIAN_ATLAS_",
   );
-  const { tileRoot, backingRoot } =
+  const { tileRoot, regionalTileRoot, backingRoot } =
     resolveLocalAtlasDevelopmentPaths({
       command,
       configuredTileRoot:
         atlasEnvironment.OBSIDIAN_ATLAS_TILE_ROOT,
+      configuredRegionalTileRoot:
+        atlasEnvironment.OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT,
       configuredBackingRoot:
         atlasEnvironment.OBSIDIAN_ATLAS_BACKING_ROOT,
       repositoryTileRoot: REPOSITORY_TILE_ROOT,
+      repositoryRegionalTileRoot: REPOSITORY_REGIONAL_TILE_ROOT,
     });
   const pythonBin = atlasEnvironment.OBSIDIAN_ATLAS_PYTHON;
   const requirementText =
@@ -63,6 +69,7 @@ export default defineConfig(async ({ command, mode }) => {
     plugins: [
       localAtlas({
         tileRoot,
+        regionalTileRoot,
         backingRoot,
         pythonBin,
         projectRoot: fileURLToPath(new URL("..", import.meta.url)),

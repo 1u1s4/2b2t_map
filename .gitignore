@@ -5,6 +5,7 @@ __pycache__/
 
 # Descargas y estado de ejecución
 2b2t_tiles/
+2b2t_tiles_regions/
 *.sqlite3-wal
 *.sqlite3-shm
 *.part

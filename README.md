@@ -12,12 +12,16 @@ direcciones y registra qué celdas ya fueron revisadas. El zoom y el
 desplazamiento cambian únicamente la presentación: no reducen el nivel de
 detalle de la sesión.
 
-La aplicación se sirve únicamente en `localhost`. Los datos persistentes se
-guardan de forma atómica en LuisA y mantienen una copia de recuperación en el
-navegador. La biblioteca existente se conserva: el visor solo abre WebP
-locales válidos. Antes de explorar, comprueba la región exacta contra SQLite y
-el filesystem; si falta algo, descarga únicamente lo pendiente y reutiliza
-tanto los WebP válidos como los `404` ya confirmados.
+La aplicación web de escritorio se sirve únicamente en `localhost`. Los datos
+persistentes se guardan de forma atómica en LuisA como una única sesión
+canónica. El navegador conserva solamente una WAL temporal mientras se confirma
+una escritura; nunca crea otra versión autoritativa. La biblioteca primaria
+conserva únicamente el panorama Overworld LOD 10 necesario para la vista
+completamente alejada. Todo detalle se escribe, solo después de una decisión
+del usuario, en una biblioteca regional APFS separada y respaldada por LuisA.
+Antes de explorar, comprueba la región exacta contra SQLite y el filesystem; si
+falta algo, descarga únicamente lo pendiente y reutiliza tanto los WebP válidos
+como los `404` ya confirmados.
 
 La versión actual admite únicamente **Overworld**.
 
@@ -37,7 +41,7 @@ La versión actual admite únicamente **Overworld**.
 - zoom y desplazamiento visuales sin cambiar el LOD de datos;
 - zoom acotado a un presupuesto seguro de tiles visibles y cámara contenida en
   la región;
-- varias sesiones pausables con progreso persistente y exportable;
+- una única sesión de exploración, persistente, pausable y exportable;
 - conteo automático al visitar una celda; la celda actual nueva permanece sin
   relleno y muestra su marca al abandonarla o al volver a ella;
 - ausencias `404` persistentes y omitidas automáticamente, separadas de las
@@ -46,7 +50,7 @@ La versión actual admite únicamente **Overworld**.
 - capas `base`, `overlay` y `newchunks`;
 - puntos y áreas con nombre, color y notas privadas;
 - lectura exclusiva de la biblioteca local;
-- tarjeta de capacidad de LuisA, sin iniciar trabajos por sí sola;
+- tarjeta de espacio disponible en LuisA, sin metas ni trabajos globales;
 - composición opcional de una región como PNG o WebP desde el CLI.
 
 ## Inicio rápido en LuisA
@@ -54,12 +58,12 @@ La versión actual admite únicamente **Overworld**.
 Requisitos:
 
 - macOS con `/Volumes/LuisA` montado;
-- el sparsebundle existente en
-  `/Volumes/LuisA/2b2t_map/2b2t_tiles.sparsebundle` es opcional; el lanzador
-  lo monta en `/Volumes/2b2t Tiles` y, si no existe, usa `./2b2t_tiles`;
+- el sparsebundle APFS de LuisA en
+  `/Volumes/LuisA/2b2t_map/2b2t_tiles.sparsebundle`; el lanzador lo monta en
+  `/Volumes/2b2t Tiles`;
 - Python 3.10 o posterior;
 - Node.js `>=22.13.0`;
-- Google Chrome actualizado;
+- Google Chrome de escritorio actualizado, con viewport mínimo de 960 px;
 - `screen`, `npm` y `/usr/bin/lockf`.
 
 Instala las dependencias una vez:
@@ -135,7 +139,7 @@ PYTHON_BIN='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
    estructura: los datos continúan en LOD 0 y el zoom manual se conserva
    exactamente al moverte a otra celda.
 9. **Pausar sesión** la conserva en LuisA; después puedes abrirla desde
-   **Workspace durable**. **Guardar ahora** fuerza una escritura inmediata.
+   **Guardado local · LuisA**. **Guardar ahora** fuerza una escritura inmediata.
 
 La descarga y la revisión siguen siendo conceptos distintos. La primera ocurre
 por región y debe terminar antes de entrar; la segunda se registra
@@ -169,18 +173,19 @@ LOD superiores resumen áreas cada vez mayores. El visor une automáticamente
 las piezas visibles, por eso puedes desplazarte como si fuera una sola imagen
 sin cargar el mapa completo en memoria.
 
-No necesitas pausar manualmente para cambiar de zona: al elegir otra región,
-la sesión activa se guarda en el workspace y la selección nueva pasa por la
-comprobación o descarga obligatoria antes de abrirse.
+No necesitas pausar manualmente para cambiar de zona: la sesión canónica actual
+permanece intacta mientras la selección nueva pasa por la comprobación o
+descarga obligatoria. Solo cuando la región queda completa reemplaza
+atómicamente a la sesión anterior.
 
 El Atlas se puede abrir mientras una sesión está activa. La cámara y el zoom
-regionales se conservan y se restauran al volver. Un toque o clic selecciona el
-sector; en móvil una cruceta permite corregir el foco con objetivos táctiles de
-44 px. El inspector ofrece anterior/siguiente y límites X/Z exactos. La vista
-global consulta `tiles.sqlite3` en modo lectura y usa internamente la huella
-irregular publicada para calcular el objetivo LOD 0. Los `404` confirmados se
-excluyen, de modo que una descarga exhaustiva pueda alcanzar 100% sin presentar
-tiles inexistentes como pendientes eternos.
+regionales se conservan y se restauran al volver. Un clic selecciona el sector
+y la cruceta permite corregir el foco desde escritorio. El inspector ofrece
+anterior/siguiente y límites X/Z exactos. La vista global consulta los
+catálogos locales en modo lectura y usa internamente la huella irregular
+publicada para calcular el objetivo LOD 0. Los `404` confirmados se excluyen,
+de modo que una descarga exhaustiva pueda alcanzar 100% sin presentar tiles
+inexistentes como pendientes eternos.
 
 ## Rejilla LOD 0 y coordenadas
 
@@ -206,11 +211,12 @@ la cámara no puede perder la región seleccionada. El modelo admite hasta
 1,048,576 celdas por sesión y avisa antes de iniciar una selección que supere
 ese límite.
 
-Las sesiones creadas por versiones anteriores conservan su LOD, escala, celda
-actual y progreso al restaurarlas o importarlas. Antes de reabrir una sesión
-LOD 0, el visor vuelve a verificar su región completa. Las sesiones con LOD
-heredado son de solo lectura; **Crear versión en LOD 0** conserva la original y
-lleva la copia nueva al mismo paso obligatorio de descarga.
+Las sesiones creadas por versiones anteriores pueden importarse conservando su
+LOD, escala, celda actual y progreso. Antes de reemplazar la sesión canónica por
+una importada en LOD 0, el visor vuelve a verificar su región completa. Las
+sesiones con LOD
+heredado son de solo lectura; **Crear versión en LOD 0** lleva la copia nueva al
+mismo paso obligatorio de descarga y solo entonces reemplaza la anterior.
 
 ## Capacidad de LuisA
 
@@ -218,23 +224,15 @@ El lanzador usa estas ubicaciones:
 
 ```text
 Biblioteca preferida: /Volumes/2b2t Tiles/2b2t_tiles
-Fallback automático: ./2b2t_tiles
+Predescargas regionales: /Volumes/2b2t Tiles/ObsidianAtlasRegions/2b2t_tiles
 Respaldo físico: /Volumes/LuisA
 ```
 
-La tarjeta **Capacidad local · LuisA** consulta en tiempo real el espacio de
-ambos volúmenes y toma el menor valor disponible. Si existe `estimate.json`,
-usa el `full_plan.required_with_headroom` del último preflight estricto de
-Overworld; así muestra el mismo déficit que el descargador. Sin un preflight
-válido usa la referencia predeterminada de `1,458,909,433,254` bytes,
-aproximadamente `1.327 TiB`. Una variable local explícita conserva prioridad
-sobre ambos valores.
-
-Cuando `progress.json` contiene una descarga global válida, la misma tarjeta
-muestra su alcance LOD, porcentaje, WebP completos, ausencias, pendientes,
-tiles/s, MB/s, datos transferidos y ETA. El runtime proyecta únicamente esas
-métricas; no expone la ruta de salida ni el comando de reanudación al
-navegador.
+La tarjeta **Espacio para regiones · LuisA** consulta en tiempo real el espacio
+de la biblioteca regional y su respaldo. No calcula el costo de descargar todo
+el Overworld, no interpreta reportes globales antiguos y no inicia trabajos.
+Cada región elegida realiza su propio preflight con 20% de margen antes de
+descargar.
 
 El resultado puede ser:
 
@@ -242,208 +240,35 @@ El resultado puede ser:
 - margen insuficiente;
 - runtime local no configurado.
 
-Es un diagnóstico de almacenamiento. No crea trabajos ni recorre el mapa. La
-biblioteca actual, su SQLite y los WebP existentes permanecen en su lugar.
+Es un diagnóstico de almacenamiento. No crea trabajos ni recorre el mapa.
 
-## CLI global reanudable
+## Panorama local y política bajo demanda
 
-`download_all_2b2t.py` descubre el árbol publicado, estima cada LOD y solo
-descarga el alcance que cabe con un 20% adicional de espacio. El preflight no
-supone un cuadrado de 1,024,000 bloques: usa la huella irregular verificada de
-66,464 tiles LOD 3 y un máximo conservador de 5,673,192 solicitudes para
-Overworld/base completo. En LuisA, la biblioteca vive en el sparsebundle APFS
-existente:
+El lanzador monta el sparsebundle APFS de LuisA, pero no inicia ni reanuda
+`download_all_2b2t.py`. La biblioteca primaria contiene solo las tres capas
+Overworld LOD 10 necesarias para orientar, encuadrar y seleccionar desde la
+vista completamente alejada. No existe una meta porcentual mundial.
 
-```bash
-hdiutil attach -nobrowse -owners on \
-  '/Volumes/LuisA/2b2t_map/2b2t_tiles.sparsebundle'
-```
+Los LOD 0–9 se obtienen exclusivamente mediante **Descargar región completa** y
+se escriben en la biblioteca regional. Una selección terminada permanece en
+LuisA y puede reabrirse en ejecuciones posteriores. Cambiar de región no crea
+una descarga de fondo ni amplía automáticamente el alcance.
 
-Esto monta `/Volumes/2b2t Tiles`; no crea ni formatea una imagen.
-El lanzador del visor ejecuta ese montaje automáticamente cuando el
-sparsebundle existe. El comando manual solo hace falta para operar el
-descargador global sin iniciar la UI.
+`download_all_2b2t.py` permanece en el repositorio como herramienta técnica de
+diagnóstico y migración, pero no forma parte del flujo operativo del Atlas.
 
-El alcance operativo actual es Overworld/base y se recorre desde los LOD más
-alejados y pequeños hacia LOD 0:
-
-```bash
-python download_all_2b2t.py \
-  --all \
-  --dimensions overworld \
-  --layers base \
-  --lods all \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --workers 4 \
-  --requests-per-second 2 \
-  --resume
-```
-
-Para recalcular solicitudes, almacenamiento, tiempo y espacio faltante sin
-iniciar descargas adicionales cuando la prueba 3×3 ya está registrada:
-
-```bash
-python download_all_2b2t.py \
-  --estimate-only \
-  --dimensions overworld \
-  --layers base \
-  --lods all \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --requests-per-second 2 \
-  --resume \
-  --skip-smoke-test
-```
-
-El preflight genera `discovery.json` y `estimate.json`. Cuando falta espacio,
-`estimate.json` conserva dos vistas: `plan`, el tramo seguro que sí se ejecuta,
-y `full_plan`, el desglose completo **del alcance solicitado** con su déficit.
-La ejecución actualiza `progress.json`, `download.log` y `tiles.sqlite3`; el
-resumen final contiene el comando exacto para continuar. Los WebP válidos y
-los `404` confirmados no se solicitan otra vez. `--revalidate` vuelve a
-comprobar los archivos completos antes de reanudar.
-
-Mientras el escritor global está activo se puede generar, sin competir con él,
-el informe detallado de las tres capas y los 11 LOD del Overworld:
-
-```bash
-python download_all_2b2t.py \
-  --cached-estimate-only \
-  --dimensions overworld \
-  --layers base,overlay,newchunks \
-  --lods all \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --workers 8 \
-  --requests-per-second 8
-```
-
-Este modo abre SQLite con `mode=ro` y `query_only=ON`, no usa red ni toma el
-lock de descarga, y no modifica `progress.json`, `estimate.json` ni
-`download.log`. Valida los WebP de las muestras locales y escribe únicamente
-un informe bajo `reports/`, con una fila por combinación solicitada, márgenes,
-déficit y comandos exactos de continuación. El alcance completo actual de
-Overworld conserva el nombre `reports/overworld-estimate.json` y sus 33 filas.
-Los demás subconjuntos usan un nombre determinista que incorpora dimensiones,
-capas y LOD.
-
-Por ejemplo, el informe offline de las 99 combinaciones publicadas se genera
-sin interferir con la descarga activa:
-
-```bash
-python download_all_2b2t.py \
-  --cached-estimate-only \
-  --dimensions overworld,nether,end \
-  --layers base,overlay,newchunks \
-  --lods all \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --workers 8 \
-  --requests-per-second 8
-```
-
-Su salida es
-`reports/cached-estimate-overworld-nether-end__base-overlay-newchunks__lod-all.json`.
-Incluye 99 filas, totales por dimensión, capa y pareja dimensión/capa, además
-de nueve comandos independientes de continuación sujetos a preflight.
-
-El volumen actual permite continuar Overworld/base hasta LOD 1 con todas las
-reservas exigidas, pero no admite aún LOD 0. Cuando haya capacidad adicional,
-este comando intenta exclusivamente el detalle pendiente y se niega a empezar
-si no conserva el 20%:
-
-```bash
-python download_all_2b2t.py \
-  --all \
-  --dimensions overworld \
-  --layers base \
-  --lods 0 \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --workers 8 \
-  --requests-per-second 8 \
-  --resume \
-  --skip-smoke-test \
-  --no-fallback
-```
-
-Después de completar base, se vuelven a estimar en vivo las otras capas de
-Overworld sin iniciar otra transferencia:
-
-```bash
-python download_all_2b2t.py \
-  --estimate-only \
-  --dimensions overworld \
-  --layers overlay,newchunks \
-  --lods all \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --requests-per-second 8 \
-  --resume \
-  --skip-smoke-test
-```
-
-Si ese preflight cabe, los comandos exactos de continuación son:
-
-```bash
-/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 \
-  /Users/luisalvarado/Documents/GitHub/2b2t_map/download_all_2b2t.py \
-  --all --dimensions overworld --layers overlay \
-  --lods 10,9,8,7,6,5,4,3,2,1,0 \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --workers 8 --requests-per-second 8 \
-  --timeout 30 --retries 5 --discovery-samples 25 \
-  --max-tile-bytes 16777216 --space-headroom-percent 20 \
-  --resume --skip-smoke-test --no-fallback
-
-/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 \
-  /Users/luisalvarado/Documents/GitHub/2b2t_map/download_all_2b2t.py \
-  --all --dimensions overworld --layers newchunks \
-  --lods 10,9,8,7,6,5,4,3,2,1,0 \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --workers 8 --requests-per-second 8 \
-  --timeout 30 --retries 5 --discovery-samples 25 \
-  --max-tile-bytes 16777216 --space-headroom-percent 20 \
-  --resume --skip-smoke-test --no-fallback
-```
-
-No ejecutes esos comandos mientras exista otra descarga activa sobre la misma
-biblioteca; el bloqueo compartido los rechazará para proteger SQLite y los
-WebP.
-
-También se puede validar toda la biblioteca independientemente del
-descargador:
-
-```bash
-python verify_download.py \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --workers 8
-```
-
-Sin `--requeue-corrupt`, el verificador abre SQLite mediante URI `mode=ro`,
-activa `PRAGMA query_only=ON` y no ejecuta `UPDATE` ni `COMMIT`; únicamente
-lee la biblioteca y escribe el informe JSON. Por eso puede auditar una
-descarga activa sin alterar su cola.
-
-La reparación es una operación distinta y explícita:
-
-```bash
-python verify_download.py \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --workers 8 \
-  --requeue-corrupt
-```
-
-Ese modo abre SQLite con escritura y obtiene el mismo bloqueo exclusivo que
-los descargadores. Si existe una descarga activa, termina con código 2 antes
-de abrir la base; espera a que la descarga finalice o se detenga normalmente
-antes de reencolar.
-
-El contrato conserva soporte para `overworld,nether,end` y para
-`base,overlay,newchunks`, pero la ejecución y la UI permanecen limitadas a
-Overworld por ahora.
+`reset_atlas_to_on_demand.py` reproduce de forma explícita la migración al modo
+bajo demanda. Sin `--apply` solo muestra el inventario; con `--apply` exige las
+rutas canónicas, rechaza descargas activas, respalda catálogo y hashes en LuisA,
+conserva Overworld LOD 10 y vacía el detalle regional. No modifica el workspace.
 
 ## Descargar una región desde la interfaz
 
-La UI ofrece cuatro perfiles:
+La UI ofrece cinco perfiles y empieza en **Máximo** para dedicar toda la
+capacidad disponible a la región elegida:
 
 ```text
-Cauteloso 0.5 req/s · Normal 2 req/s · Rápido 8 req/s · Turbo 16 req/s
+Mínimo 0.25 req/s · Suave 0.5 req/s · Normal 2 req/s · Rápido 8 req/s · Máximo 16 req/s
 ```
 
 La descarga obligatoria incluye `base`, `overlay` y `newchunks` para todos los
@@ -456,10 +281,11 @@ reduce el ritmo; `Retry-After` pausa globalmente a todos los workers.
 **Detener descarga** termina el streaming activo, guarda el lote SQLite y
 permite reanudar sin volver a pedir WebP válidos ni `404` conocidos.
 
-Turbo usa ocho workers y un techo global de 16 solicitudes por segundo. No usa
-Tor, proxies rotatorios ni cambios de IP para esquivar protecciones; la
-velocidad se obtiene con conexiones persistentes, paralelismo acotado y control
-adaptativo.
+El techo regional es 16 solicitudes por segundo y no se comparte con ningún
+trabajo global. Los perfiles menores siguen disponibles si el usuario prefiere
+reducir el ritmo. No usa Tor, proxies rotatorios ni cambios de IP para esquivar
+protecciones; la velocidad se obtiene con conexiones persistentes, paralelismo
+acotado y control adaptativo.
 
 ## CLI regional
 
@@ -477,7 +303,7 @@ python download_region_2b2t.py \
   --dimension overworld \
   --lod 0 \
   --layers base,overlay,newchunks \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --out '/Volumes/2b2t Tiles/ObsidianAtlasRegions/2b2t_tiles' \
   --workers 8 \
   --requests-per-second 16 \
   --max-tiles 3
@@ -494,7 +320,7 @@ python download_region_2b2t.py \
   --dimension overworld \
   --lod 1 \
   --layers base,overlay \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --out '/Volumes/2b2t Tiles/ObsidianAtlasRegions/2b2t_tiles' \
   --workers 2 \
   --requests-per-second 0.5
 ```
@@ -511,7 +337,7 @@ python download_region_2b2t.py \
   --dimension overworld \
   --lod 0 \
   --layers base,overlay \
-  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --out '/Volumes/2b2t Tiles/ObsidianAtlasRegions/2b2t_tiles' \
   --workers 2 \
   --requests-per-second 1 \
   --compose exports/region.webp \
@@ -564,11 +390,12 @@ Los shards agrupan 32 tiles y truncan hacia cero, igual que el cliente público.
 La ubicación del tile en el mundo, en cambio, usa piso matemático. El visor y
 el CLI aplican cada regla en su lugar correspondiente.
 
-El visor consulta exclusivamente esta biblioteca. Chrome también puede abrir la
-carpeta `2b2t_tiles` con permiso de solo lectura desde **Explorar → Biblioteca
-local**. `/api/tile` nunca obtiene imágenes remotas: también ignora el parámetro
-heredado `online=1`. Solo el trabajo regional explícito obtiene archivos de la
-fuente, y la sesión no se abre hasta resolver toda el área.
+El visor consulta primero la biblioteca regional y después el panorama LOD 10.
+Chrome también puede abrir una carpeta `2b2t_tiles` con permiso de solo lectura
+desde **Explorar → Biblioteca local**. `/api/tile` nunca obtiene imágenes
+remotas: también ignora el parámetro heredado `online=1`. Solo el trabajo
+regional explícito obtiene archivos de la fuente, y la sesión no se abre hasta
+resolver toda el área.
 
 ## Workspace, sesiones y highlights
 
@@ -581,14 +408,19 @@ El runtime guarda el workspace autoritativo en una ruta fija derivada de
 
 Las escrituras usan revisión CAS, identificador idempotente, temporal en el
 mismo directorio, `fsync`, renombrado atómico y backup. El documento conserva
-hasta 128 sesiones, 10,000 highlights, la sesión activa y la selección global.
-Las sesiones pausadas se pueden eliminar desde su tarjeta para liberar cupo.
-Una copia completa permanece en `localStorage`, aislada por pestaña, para
-recuperación cuando el volumen no está conectado. **Pausar y guardar** no
-desactiva una sesión hasta asegurar disco o navegador; si aparece un conflicto,
-la rama local se conserva y la UI exige confirmar antes de descartarla. El badge
-distingue comprobando, guardando, guardado, solo lectura, sin disco, conflicto
-y error.
+exactamente cero o una sesión, hasta 10,000 highlights y la selección global.
+Una WAL fija en `localStorage` existe únicamente mientras una escritura está
+pendiente; si su revisión base ya no coincide, LuisA gana automáticamente.
+Nunca se crean ramas por pestaña. Si LuisA no está disponible o está en solo
+lectura, la edición se bloquea para evitar otra fuente de verdad.
+
+La primera migración desde un workspace multisesión une el progreso revisado de
+regiones LOD equivalentes que se solapan, conserva la sesión con más trabajo y
+guarda el documento completo anterior bajo:
+
+```text
+/Volumes/LuisA/ObsidianAtlas/backups/single-session-<fecha>-<uuid>/
+```
 
 La exportación manual de una sesión crea:
 
@@ -598,7 +430,7 @@ obsidian-atlas-exploracion.json
 
 El archivo contiene región, zoom, LOD, celda actual y bitsets independientes de
 celdas revisadas y celdas sin datos. La importación valida versión, dimensión,
-límites, contadores y codificación antes de añadirla al workspace.
+límites, contadores y codificación antes de reemplazar la sesión canónica.
 
 Los highlights pueden ser puntos o áreas con nombre, nota, color y visibilidad.
 Su exportación crea
@@ -608,14 +440,15 @@ Su exportación crea
 
 Para ejecutar `npm run dev` manualmente desde `viewer/`:
 
-Si existe `../2b2t_tiles`, el modo de desarrollo la detecta
-automáticamente y usa esa misma raíz para el workspace local. Las variables
-siguientes solo son necesarias para elegir otra biblioteca o conservar el
-workspace en otro volumen.
+Si existe `../2b2t_tiles`, el modo de desarrollo la detecta automáticamente,
+lee la biblioteca global desde allí y crea las predescargas en
+`../2b2t_tiles_regions`. Las variables siguientes solo son necesarias para
+elegir otras ubicaciones.
 
 | Variable | Uso |
 | --- | --- |
 | `OBSIDIAN_ATLAS_TILE_ROOT` | raíz canónica `2b2t_tiles` |
+| `OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT` | raíz aislada y persistente para predescargas |
 | `OBSIDIAN_ATLAS_BACKING_ROOT` | volumen físico usado en la comprobación |
 | `OBSIDIAN_ATLAS_PYTHON` | intérprete para `download_region_2b2t.py` |
 | `OBSIDIAN_ATLAS_OVERWORLD_REQUIREMENT_BYTES` | override explícito del preflight de capacidad |
@@ -625,6 +458,7 @@ Ejemplo:
 ```bash
 cd viewer
 OBSIDIAN_ATLAS_TILE_ROOT='/Volumes/2b2t Tiles/2b2t_tiles' \
+OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT='/Volumes/2b2t Tiles/ObsidianAtlasRegions/2b2t_tiles' \
 OBSIDIAN_ATLAS_BACKING_ROOT='/Volumes/LuisA' \
 OBSIDIAN_ATLAS_PYTHON='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
   npm run dev -- --hostname localhost --port 3001

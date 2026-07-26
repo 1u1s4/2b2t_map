@@ -24,6 +24,7 @@ import {
 } from "../build/local-atlas-workspace.ts";
 import {
   createExplorationState,
+  deserializeExplorationState,
   serializeExplorationState,
   withCellReviewed,
   withCellSkipped,
@@ -36,6 +37,10 @@ import {
   parseLocalAtlasWorkspaceContent,
   parseLocalAtlasWorkspaceExplorations,
 } from "../app/lib/local-atlas-runtime.ts";
+import {
+  consolidateSingleWorkspaceContent,
+  consolidateWorkspaceExplorations,
+} from "../app/lib/single-workspace-session.ts";
 
 const NOW = "2026-07-25T12:00:00.000Z";
 
@@ -153,6 +158,87 @@ test("workspace parser canonicalizes nested state, coverage, and highlights", ()
   );
 });
 
+test("single-session consolidation preserves the richest overlapping review progress", () => {
+  let target = createExplorationState({
+    id: "region-target",
+    name: "Sector principal",
+    bounds: {
+      minX: 0,
+      minZ: 0,
+      maxXExclusive: 2048,
+      maxZExclusive: 1024,
+    },
+    lod: 0,
+    scale: 1,
+  });
+  target = withCellReviewed(target, 0);
+  target = withCellReviewed(target, 1);
+  target = withCellReviewed(target, 2);
+
+  let overlap = createExplorationState({
+    id: "region-overlap",
+    name: "Recorte legado",
+    bounds: {
+      minX: 1024,
+      minZ: 512,
+      maxXExclusive: 2048,
+      maxZExclusive: 1024,
+    },
+    lod: 0,
+    scale: 1,
+  });
+  overlap = withCellReviewed(overlap, 0);
+  overlap = withCellSkipped(overlap, 1);
+
+  const records = [
+    {
+      id: target.region.id,
+      createdAt: "2026-07-25T10:00:00.000Z",
+      updatedAt: "2026-07-25T11:00:00.000Z",
+      state: JSON.parse(serializeExplorationState(target)),
+    },
+    {
+      id: overlap.region.id,
+      createdAt: "2026-07-25T12:00:00.000Z",
+      updatedAt: "2026-07-25T13:00:00.000Z",
+      state: JSON.parse(serializeExplorationState(overlap)),
+    },
+  ];
+  const consolidated = consolidateWorkspaceExplorations(
+    records,
+    overlap.region.id,
+  );
+  assert.ok(consolidated);
+  assert.equal(consolidated.id, target.region.id);
+  const restored = deserializeExplorationState(
+    JSON.stringify(consolidated.state),
+  );
+  assert.equal(restored.reviewedCount, 4);
+  assert.equal(restored.skippedCount, 0);
+
+  const singleton = consolidateSingleWorkspaceContent({
+    schemaVersion: 1,
+    activeExplorationId: overlap.region.id,
+    explorations: records,
+    highlights: [{ id: "highlight-preserved" }],
+    coverageSelection: null,
+  });
+  assert.equal(singleton.activeExplorationId, target.region.id);
+  assert.equal(singleton.explorations.length, 1);
+  assert.deepEqual(singleton.highlights, [{ id: "highlight-preserved" }]);
+  assert.deepEqual(
+    consolidateSingleWorkspaceContent(singleton),
+    singleton,
+  );
+  assert.equal(
+    consolidateSingleWorkspaceContent({
+      ...singleton,
+      activeExplorationId: null,
+    }).activeExplorationId,
+    null,
+  );
+});
+
 test("workspace ETags are strong, canonical, and bounded", () => {
   const workspaceId = randomUUID();
   const etag = `"atlas-${workspaceId}-42"`;
@@ -222,6 +308,88 @@ test("browser recovery cache accepts only canonical saved explorations", () => {
     }),
     null,
   );
+});
+
+test("legacy multi-session write archives the source and commits one canonical session", async () => {
+  await withTemporaryBacking(async (backingRoot) => {
+    const store = new LocalAtlasWorkspaceStore(backingRoot);
+    await store.read();
+    const firstState = explorationState("region-a");
+    const secondState = explorationState("region-b");
+    const legacyContent = parseAtlasWorkspaceContent(
+      content({
+        activeExplorationId: "region-b",
+        explorations: [
+          {
+            id: "region-a",
+            createdAt: "2026-07-25T10:00:00.000Z",
+            updatedAt: "2026-07-25T11:00:00.000Z",
+            state: firstState,
+          },
+          {
+            id: "region-b",
+            createdAt: "2026-07-25T12:00:00.000Z",
+            updatedAt: "2026-07-25T13:00:00.000Z",
+            state: secondState,
+          },
+        ],
+      }),
+    );
+    const workspaceId = randomUUID();
+    const legacyDocument = {
+      ...legacyContent,
+      workspaceId,
+      revision: 57,
+      updatedAt: NOW,
+      lastWriteId: randomUUID(),
+    };
+    await writeFile(
+      store.workspacePath,
+      `${JSON.stringify(legacyDocument)}\n`,
+    );
+
+    const saved = await store.write(
+      legacyContent,
+      { workspaceId, revision: 57 },
+      randomUUID(),
+    );
+    assert.equal(saved.workspace.revision, 58);
+    assert.equal(saved.workspace.explorations.length, 1);
+    assert.equal(saved.workspace.activeExplorationId, "region-b");
+
+    const archiveNames = (
+      await readdir(store.migrationBackupDirectory)
+    ).filter((name) => name.startsWith("single-session-"));
+    assert.equal(archiveNames.length, 1);
+    const archiveDirectory = join(
+      store.migrationBackupDirectory,
+      archiveNames[0],
+    );
+    const manifest = JSON.parse(
+      await readFile(join(archiveDirectory, "manifest.json"), "utf8"),
+    );
+    assert.equal(manifest.currentSessionCount, 2);
+    assert.equal(manifest.candidateSessionCount, 2);
+    assert.equal(manifest.selectedSessionId, "region-b");
+    assert.equal(
+      JSON.parse(
+        await readFile(
+          join(archiveDirectory, "workspace-candidate.json"),
+          "utf8",
+        ),
+      ).explorations.length,
+      2,
+    );
+
+    const reread = await store.read();
+    assert.equal(reread.workspace.revision, 58);
+    assert.equal(
+      (
+        await readdir(store.migrationBackupDirectory)
+      ).filter((name) => name.startsWith("single-session-")).length,
+      1,
+    );
+  });
 });
 
 test("store writes atomically, keeps a previous backup, and is idempotent", async () => {

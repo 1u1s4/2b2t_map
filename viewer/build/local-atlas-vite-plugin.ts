@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import {
+  mkdir,
   open,
   readFile,
   stat,
@@ -42,7 +43,6 @@ const RATE_METRIC_TOLERANCE = 0.001;
 const DEFAULT_ESTIMATED_TILE_BYTES = 512 * 1024;
 const MIN_ESTIMATED_TILE_BYTES = 64 * 1024;
 const MAX_ESTIMATED_TILE_BYTES = 2 * 1024 * 1024;
-const DEFAULT_OVERWORLD_REQUIREMENT_BYTES = 1_458_909_433_254;
 const STOP_GRACE_PERIOD_MS = 15_000;
 const ALLOWED_LAYERS = new Set(["base", "overlay", "newchunks"]);
 const CANONICAL_LAYERS = ["base", "overlay", "newchunks"] as const;
@@ -52,135 +52,49 @@ import json
 import sqlite3
 import sys
 
-database_path = sys.argv[1]
+database_paths = json.loads(sys.argv[1])
 lod = int(sys.argv[2])
 target_runs = json.loads(sys.argv[3])
 tile_span = 512 * (2 ** lod)
 sector_tiles = 32768 // tile_span
 grid_min_tile = -540672 // tile_span
 grid_max_tile = grid_min_tile + (33 * sector_tiles)
-run_placeholders = ",".join("(?, ?, ?, ?, ?)" for _ in target_runs)
-run_parameters = [
-    coordinate
-    for target_run in target_runs
-    for coordinate in target_run
-]
-
-connection = sqlite3.connect(
-    f"file:{database_path}?mode=ro",
-    uri=True,
-    timeout=2.5,
-)
-connection.execute("PRAGMA query_only = ON")
-rows = connection.execute(
-    f"""
-    WITH target_runs(
-      target_lod,
-      min_tile_z,
-      max_tile_z_exclusive,
-      min_tile_x,
-      max_tile_x_exclusive
-    ) AS (
-      VALUES {run_placeholders}
+runs_by_lod = {}
+for (
+    target_lod,
+    min_tile_z,
+    max_tile_z_exclusive,
+    min_tile_x,
+    max_tile_x_exclusive,
+) in target_runs:
+    runs_by_lod.setdefault(int(target_lod), []).append(
+        (
+            int(min_tile_z),
+            int(max_tile_z_exclusive),
+            int(min_tile_x),
+            int(max_tile_x_exclusive),
+        )
     )
-    SELECT
-      CAST((tile_z - ?) / ? AS INTEGER) AS sector_row,
-      CAST((tile_x - ?) / ? AS INTEGER) AS sector_column,
-      SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) AS complete_count,
-      SUM(
-        CASE
-          WHEN status IN ('pending', 'downloading', 'retry', 'running')
-          THEN 1 ELSE 0
-        END
-      ) AS queued_count,
-      SUM(
-        CASE
-          WHEN status NOT IN (
-            'complete',
-            'absent',
-            'pending',
-            'downloading',
-            'retry',
-            'running'
-          )
-          THEN 1 ELSE 0
-        END
-      ) AS failed_count,
-      SUM(CASE WHEN status = 'absent' THEN 1 ELSE 0 END) AS absent_count
-    FROM tiles AS tile
-    INNER JOIN target_runs AS target
-      ON tile.lod = target.target_lod
-      AND tile.tile_z >= target.min_tile_z
-      AND tile.tile_z < target.max_tile_z_exclusive
-      AND tile.tile_x >= target.min_tile_x
-      AND tile.tile_x < target.max_tile_x_exclusive
-    WHERE tile.dimension = 'overworld'
-      AND tile.layer = 'base'
-      AND tile.lod = ?
-      AND tile.tile_x >= ?
-      AND tile.tile_x < ?
-      AND tile.tile_z >= ?
-      AND tile.tile_z < ?
-    GROUP BY sector_row, sector_column
-    ORDER BY sector_row, sector_column
-    """,
-    (
-      *run_parameters,
-      grid_min_tile,
-      sector_tiles,
-      grid_min_tile,
-      sector_tiles,
-      lod,
-      grid_min_tile,
-      grid_max_tile,
-      grid_min_tile,
-      grid_max_tile,
-    ),
-).fetchall()
-absent_rows = connection.execute(
-    f"""
-    WITH target_runs(
-      target_lod,
-      min_tile_z,
-      max_tile_z_exclusive,
-      min_tile_x,
-      max_tile_x_exclusive
-    ) AS (
-      VALUES {run_placeholders}
-    )
-    SELECT tile.lod, tile.tile_x, tile.tile_z
-    FROM tiles AS tile
-    INNER JOIN target_runs AS target
-      ON tile.lod = target.target_lod
-      AND tile.tile_z >= target.min_tile_z
-      AND tile.tile_z < target.max_tile_z_exclusive
-      AND tile.tile_x >= target.min_tile_x
-      AND tile.tile_x < target.max_tile_x_exclusive
-    WHERE tile.dimension = 'overworld'
-      AND tile.layer = 'base'
-      AND tile.lod >= ?
-      AND tile.lod <= 3
-      AND tile.status = 'absent'
-    """,
-    (*run_parameters, lod),
-)
 
-counts_by_cell = {
-    (int(row), int(column)): {
-        "completeCount": int(complete_count or 0),
-        "queuedCount": int(queued_count or 0),
-        "failedCount": int(failed_count or 0),
-    }
-    for (
-        row,
-        column,
-        complete_count,
-        queued_count,
-        failed_count,
-        absent_count,
-    ) in rows
-    if 0 <= row < 33 and 0 <= column < 33
+def is_target_tile(target_lod, tile_x, tile_z):
+    return any(
+        min_tile_z <= tile_z < max_tile_z_exclusive
+        and min_tile_x <= tile_x < max_tile_x_exclusive
+        for (
+            min_tile_z,
+            max_tile_z_exclusive,
+            min_tile_x,
+            max_tile_x_exclusive,
+        ) in runs_by_lod.get(target_lod, ())
+    )
+
+pending_statuses = {
+    "pending",
+    "downloading",
+    "retry",
+    "running",
 }
+counts_by_cell = {}
 
 # An absent ancestor prunes its entire descendant branch, so those finer rows
 # are intentionally never materialized. Project every non-shadowed 404 into
@@ -189,8 +103,95 @@ absent_by_lod = {
     ancestor_lod: set()
     for ancestor_lod in range(lod, 4)
 }
-for ancestor_lod, tile_x, tile_z in absent_rows:
-    absent_by_lod[int(ancestor_lod)].add((int(tile_x), int(tile_z)))
+seen_catalog_tiles = set()
+
+def consume_row(row):
+    target_lod, tile_x, tile_z, status = row
+    target_lod = int(target_lod)
+    tile_x = int(tile_x)
+    tile_z = int(tile_z)
+    key = (target_lod, tile_x, tile_z)
+    if key in seen_catalog_tiles:
+        return
+    seen_catalog_tiles.add(key)
+    if not is_target_tile(target_lod, tile_x, tile_z):
+        return
+    if target_lod == lod:
+        column = (tile_x - grid_min_tile) // sector_tiles
+        row_index = (tile_z - grid_min_tile) // sector_tiles
+        if 0 <= row_index < 33 and 0 <= column < 33:
+            counts = counts_by_cell.setdefault(
+                (row_index, column),
+                {
+                    "completeCount": 0,
+                    "queuedCount": 0,
+                    "failedCount": 0,
+                },
+            )
+            if status == "complete":
+                counts["completeCount"] += 1
+            elif status in pending_statuses:
+                counts["queuedCount"] += 1
+            elif status != "absent":
+                counts["failedCount"] += 1
+    if status == "absent":
+        absent_by_lod[target_lod].add((tile_x, tile_z))
+
+# Catalogs are ordered primary -> regional. Read them in reverse so the first
+# row seen for an exact tile identity is the authoritative regional row. Only
+# higher-priority overlays need their full LOD range materialized; the large
+# primary catalog is reduced by indexed queries to the requested LOD plus its
+# sparse 404 ancestors.
+for catalog_index in range(len(database_paths) - 1, -1, -1):
+    database_path = database_paths[catalog_index]
+    connection = sqlite3.connect(
+        f"file:{database_path}?mode=ro",
+        uri=True,
+        timeout=2.5,
+    )
+    connection.execute("PRAGMA query_only = ON")
+    if catalog_index > 0:
+        rows = connection.execute(
+            """
+            SELECT lod, tile_x, tile_z, status
+            FROM tiles
+            WHERE dimension = 'overworld'
+              AND layer = 'base'
+              AND lod >= ?
+              AND lod <= 3
+            """,
+            (lod,),
+        )
+        for row in rows:
+            consume_row(row)
+    else:
+        rows = connection.execute(
+            """
+            SELECT lod, tile_x, tile_z, status
+            FROM tiles
+            WHERE dimension = 'overworld'
+              AND layer = 'base'
+              AND lod = ?
+            """,
+            (lod,),
+        )
+        for row in rows:
+            consume_row(row)
+        absent_rows = connection.execute(
+            """
+            SELECT lod, tile_x, tile_z, status
+            FROM tiles
+            WHERE dimension = 'overworld'
+              AND layer = 'base'
+              AND lod >= ?
+              AND lod <= 3
+              AND status = 'absent'
+            """,
+            (lod,),
+        )
+        for row in absent_rows:
+            consume_row(row)
+    connection.close()
 
 excluded_by_cell = {}
 for ancestor_lod in range(3, lod - 1, -1):
@@ -238,12 +239,12 @@ for row, column in sorted(set(counts_by_cell) | set(excluded_by_cell)):
 print(json.dumps(cells, separators=(",", ":")))
 `;
 const MAX_LOCAL_COVERAGE_BYTES = 512 * 1024;
-const LOCAL_COVERAGE_QUERY_TIMEOUT_MS = 5_000;
+const LOCAL_COVERAGE_QUERY_TIMEOUT_MS = 15_000;
 const MAX_LOCAL_REGION_STATUS_BYTES = 64 * 1024 * 1024;
 const LOCAL_REGION_STATUS_QUERY_TIMEOUT_MS = 120_000;
-const LOCAL_REGION_STATUS_CACHE_MS = 5_000;
 
 const LOCAL_REGION_STATUS_QUERY = String.raw`
+import hashlib
 import json
 import sqlite3
 import sys
@@ -273,7 +274,9 @@ rows = connection.execute(
       tile_z,
       status,
       relative_path,
-      size_bytes
+      size_bytes,
+      http_code,
+      sha256
     FROM tiles
     WHERE dimension = 'overworld'
       AND lod = 0
@@ -309,7 +312,19 @@ valid_complete_bytes = 0
 absent_cells = []
 row_count = 0
 
-def validate_complete(relative_path, expected_size):
+def validate_complete(relative_path, expected_size, expected_sha256):
+    if (
+        not isinstance(expected_size, int)
+        or expected_size < 12
+        or expected_size > maximum_tile_bytes
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+    ):
+        return ("failed", 0)
+    try:
+        bytes.fromhex(expected_sha256)
+    except ValueError:
+        return ("failed", 0)
     try:
         candidate = (tile_root / str(relative_path)).resolve()
         candidate.relative_to(tile_root)
@@ -325,13 +340,17 @@ def validate_complete(relative_path, expected_size):
         not candidate.is_file()
         or metadata.st_size < 12
         or metadata.st_size > maximum_tile_bytes
+        or expected_size != metadata.st_size
     ):
-        return ("failed", 0)
-    if expected_size is not None and int(expected_size) != metadata.st_size:
         return ("failed", 0)
     try:
         with candidate.open("rb") as handle:
             header = handle.read(12)
+            digest = hashlib.sha256()
+            digest.update(header)
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after_metadata = candidate.stat()
     except OSError:
         return ("failed", 0)
     if (
@@ -339,14 +358,47 @@ def validate_complete(relative_path, expected_size):
         or header[:4] != b"RIFF"
         or header[8:12] != b"WEBP"
         or int.from_bytes(header[4:8], "little") + 8 != metadata.st_size
+        or digest.hexdigest().lower() != expected_sha256.lower()
+        or after_metadata.st_size != metadata.st_size
+        or after_metadata.st_mtime_ns != metadata.st_mtime_ns
+        or after_metadata.st_ino != metadata.st_ino
     ):
         return ("failed", 0)
     return ("complete", metadata.st_size)
 
-for layer, tile_x, tile_z, status, relative_path, size_bytes in rows:
+def validate_absent(relative_path, http_code):
+    if http_code != 404:
+        return False
+    try:
+        candidate = (tile_root / str(relative_path)).resolve()
+        candidate.relative_to(tile_root)
+    except (OSError, ValueError):
+        return False
+    try:
+        candidate.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+for (
+    layer,
+    tile_x,
+    tile_z,
+    status,
+    relative_path,
+    size_bytes,
+    http_code,
+    sha256,
+) in rows:
     row_count += 1
     if status == "complete":
-        file_status, file_size = validate_complete(relative_path, size_bytes)
+        file_status, file_size = validate_complete(
+            relative_path,
+            size_bytes,
+            sha256,
+        )
         if file_status == "complete":
             complete_count += 1
             valid_complete_bytes += file_size
@@ -354,7 +406,7 @@ for layer, tile_x, tile_z, status, relative_path, size_bytes in rows:
             missing_complete_count += 1
         else:
             failed_count += 1
-    elif status == "absent":
+    elif status == "absent" and validate_absent(relative_path, http_code):
         absent_count += 1
         if layer == "base":
             absent_cells.append(
@@ -418,6 +470,7 @@ type MiddlewareNext = (error?: unknown) => void;
 
 export interface LocalAtlasOptions {
   readonly tileRoot?: string;
+  readonly regionalTileRoot?: string;
   readonly backingRoot?: string;
   readonly pythonBin?: string;
   readonly projectRoot?: string;
@@ -982,274 +1035,6 @@ async function readArchiveBytes(tileRoot: string): Promise<number> {
   return 0;
 }
 
-const GLOBAL_DOWNLOAD_STATUSES = new Set([
-  "running",
-  "complete",
-  "fallback_complete",
-  "stopped",
-  "incomplete",
-  "error",
-]);
-
-function isNonNegativeFiniteNumber(value: unknown): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isFinite(value) &&
-    value >= 0
-  );
-}
-
-function readGlobalDownloadScope(value: unknown) {
-  if (!isRecord(value)) return null;
-  const dimensions = value.dimensions;
-  const layers = value.layers;
-  const lods = value.lods;
-  if (
-    !Array.isArray(dimensions) ||
-    dimensions.length === 0 ||
-    !dimensions.every(
-      (dimension) =>
-        dimension === "overworld" ||
-        dimension === "nether" ||
-        dimension === "end",
-    ) ||
-    !Array.isArray(layers) ||
-    layers.length === 0 ||
-    !layers.every(
-      (layer) =>
-        layer === "base" ||
-        layer === "overlay" ||
-        layer === "newchunks",
-    ) ||
-    !Array.isArray(lods) ||
-    lods.length === 0 ||
-    !lods.every(
-      (lod) =>
-        Number.isSafeInteger(lod) &&
-        Number(lod) >= 0 &&
-        Number(lod) <= 10,
-    )
-  ) {
-    return null;
-  }
-  return {
-    dimensions: [...dimensions],
-    layers: [...layers],
-    lods: [...lods].sort((left, right) => Number(left) - Number(right)),
-  };
-}
-
-async function readGlobalDownloadProgress(tileRoot: string) {
-  try {
-    const value = JSON.parse(
-      await readFile(resolve(tileRoot, "progress.json"), "utf8"),
-    ) as unknown;
-    if (
-      !isRecord(value) ||
-      value.phase !== "download" ||
-      typeof value.status !== "string" ||
-      !GLOBAL_DOWNLOAD_STATUSES.has(value.status) ||
-      !isNonNegativeSafeInteger(value.processed_requests) ||
-      !isNonNegativeSafeInteger(value.planned_requests) ||
-      value.processed_requests > value.planned_requests ||
-      !isNonNegativeSafeInteger(value.tiles_completed) ||
-      !isNonNegativeSafeInteger(value.tiles_absent) ||
-      !isNonNegativeSafeInteger(value.tiles_corrupt) ||
-      !isNonNegativeSafeInteger(value.tiles_pending) ||
-      !isNonNegativeFiniteNumber(value.progress_percent) ||
-      value.progress_percent > 100 ||
-      typeof value.fallback !== "boolean" ||
-      typeof value.updated_at !== "string"
-    ) {
-      return null;
-    }
-    const updatedAt = new Date(value.updated_at);
-    if (!Number.isFinite(updatedAt.getTime())) return null;
-    const scope = readGlobalDownloadScope(value.effective_scope);
-    if (!scope) return null;
-
-    const dataBytes = isNonNegativeSafeInteger(value.space_used_bytes)
-      ? value.space_used_bytes
-      : isNonNegativeSafeInteger(value.data_downloaded_bytes)
-        ? value.data_downloaded_bytes
-        : null;
-    const tilesPerSecond = isNonNegativeFiniteNumber(value.tiles_per_second)
-      ? value.tiles_per_second
-      : null;
-    const megabytesPerSecond = isNonNegativeFiniteNumber(
-      value.megabytes_per_second,
-    )
-      ? value.megabytes_per_second
-      : null;
-    const etaSeconds =
-      value.eta_seconds === null
-        ? null
-        : isNonNegativeFiniteNumber(value.eta_seconds)
-          ? value.eta_seconds
-          : null;
-    const failed = isNonNegativeSafeInteger(value.tiles_failed)
-      ? value.tiles_failed
-      : 0;
-
-    return {
-      status: value.status,
-      processedRequests: value.processed_requests,
-      plannedRequests: value.planned_requests,
-      completeTiles: value.tiles_completed,
-      absentTiles: value.tiles_absent,
-      corruptTiles: value.tiles_corrupt,
-      failedTiles: failed,
-      pendingTiles: value.tiles_pending,
-      progressPercent: value.progress_percent,
-      dataBytes,
-      tilesPerSecond,
-      megabytesPerSecond,
-      etaSeconds,
-      updatedAt: updatedAt.toISOString(),
-      fallback: value.fallback,
-      scope,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function isPositiveSafeInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value > 0
-  );
-}
-
-async function readLiveOverworldRequirementBytes(
-  tileRoot: string,
-): Promise<number | null> {
-  try {
-    const value = JSON.parse(
-      await readFile(resolve(tileRoot, "estimate.json"), "utf8"),
-    ) as unknown;
-    if (!isRecord(value) || !isRecord(value.requested)) return null;
-    const dimensions = value.requested.dimensions;
-    const fullPlan = value.full_plan;
-    if (
-      !Array.isArray(dimensions) ||
-      dimensions.length !== 1 ||
-      dimensions[0] !== "overworld" ||
-      !isRecord(fullPlan) ||
-      fullPlan.fallback !== false ||
-      fullPlan.meets_required_space_headroom !== true ||
-      !Array.isArray(fullPlan.rows) ||
-      fullPlan.rows.length === 0
-    ) {
-      return null;
-    }
-    const requiredBytes = fullPlan.required_with_headroom;
-    const configuredHeadroom = fullPlan.space_headroom_percent;
-    const requiredHeadroom = fullPlan.required_space_headroom_percent;
-    if (
-      !isPositiveSafeInteger(requiredBytes) ||
-      typeof configuredHeadroom !== "number" ||
-      !Number.isFinite(configuredHeadroom) ||
-      typeof requiredHeadroom !== "number" ||
-      !Number.isFinite(requiredHeadroom) ||
-      configuredHeadroom < requiredHeadroom ||
-      requiredHeadroom < 20
-    ) {
-      return null;
-    }
-    return requiredBytes;
-  } catch {
-    return null;
-  }
-}
-
-async function readCachedOverworldRequirementBytes(
-  tileRoot: string,
-): Promise<number | null> {
-  try {
-    const value = JSON.parse(
-      await readFile(
-        resolve(tileRoot, "reports", "overworld-estimate.json"),
-        "utf8",
-      ),
-    ) as unknown;
-    if (
-      !isRecord(value) ||
-      value.mode !== "cached_estimate_only" ||
-      !isRecord(value.requested) ||
-      !isRecord(value.source) ||
-      !isRecord(value.margins) ||
-      !isRecord(value.total) ||
-      value.source.network_requests !== 0 ||
-      value.source.sqlite_query_only !== true
-    ) {
-      return null;
-    }
-    const dimensions = value.requested.dimensions;
-    const layers = value.requested.layers;
-    const lods = value.requested.lods;
-    if (
-      !Array.isArray(dimensions) ||
-      dimensions.length !== 1 ||
-      dimensions[0] !== "overworld" ||
-      !Array.isArray(layers) ||
-      new Set(layers).size !== 3 ||
-      !["base", "overlay", "newchunks"].every((layer) =>
-        layers.includes(layer),
-      ) ||
-      !Array.isArray(lods) ||
-      lods.length !== 11 ||
-      !Array.from({ length: 11 }, (_, lod) => lod).every((lod) =>
-        lods.includes(lod),
-      )
-    ) {
-      return null;
-    }
-    const samplingUncertainty =
-      value.margins.sampling_uncertainty_percent;
-    const spaceHeadroom = value.margins.space_headroom_percent;
-    const requiredBytes =
-      value.total.required_with_space_headroom_bytes;
-    if (
-      typeof samplingUncertainty !== "number" ||
-      !Number.isFinite(samplingUncertainty) ||
-      samplingUncertainty < 25 ||
-      typeof spaceHeadroom !== "number" ||
-      !Number.isFinite(spaceHeadroom) ||
-      spaceHeadroom < 20 ||
-      !isPositiveSafeInteger(requiredBytes)
-    ) {
-      return null;
-    }
-    return requiredBytes;
-  } catch {
-    return null;
-  }
-}
-
-async function readEstimatedOverworldRequirementBytes(
-  tileRoot: string,
-): Promise<number | null> {
-  const requirements = await Promise.all([
-    readLiveOverworldRequirementBytes(tileRoot),
-    readCachedOverworldRequirementBytes(tileRoot),
-  ]);
-  const valid = requirements.filter(
-    (value): value is number => value !== null,
-  );
-  return valid.length > 0 ? Math.max(...valid) : null;
-}
-
-async function optionalFileFingerprint(path: string): Promise<string> {
-  try {
-    const metadata = await stat(path);
-    return `${metadata.size}:${metadata.mtimeMs}`;
-  } catch {
-    return "missing";
-  }
-}
-
 async function readLocalCatalogSnapshot(
   tileRoot: string,
 ): Promise<{
@@ -1312,14 +1097,23 @@ function isCoverageCell(value: unknown): value is LocalCoverageResult["cells"][n
 }
 
 async function queryLocalCoverage(
-  tileRoot: string,
+  catalogRoots: readonly string[],
   pythonBin: string,
   lod: number,
+  databaseUpdatedAt: string,
 ): Promise<LocalCoverageResult> {
-  const databasePath = resolve(tileRoot, "tiles.sqlite3");
-  const databaseStat = await stat(databasePath);
-  if (!databaseStat.isFile()) {
-    throw new Error("El catálogo local de tiles no es un archivo");
+  const catalogs = await Promise.all(
+    catalogRoots.map(async (catalogRoot) => {
+      const databasePath = resolve(catalogRoot, "tiles.sqlite3");
+      const databaseStat = await stat(databasePath);
+      if (!databaseStat.isFile()) {
+        throw new Error("El catálogo local de tiles no es un archivo");
+      }
+      return { databasePath, databaseStat };
+    }),
+  );
+  if (catalogs.length === 0) {
+    throw new Error("No hay catálogos locales de tiles");
   }
 
   const cells = await new Promise<LocalCoverageResult["cells"]>(
@@ -1329,7 +1123,9 @@ async function queryLocalCoverage(
         [
           "-c",
           LOCAL_COVERAGE_QUERY,
-          databasePath,
+          JSON.stringify(
+            catalogs.map((catalog) => catalog.databasePath),
+          ),
           String(lod),
           JSON.stringify(localCoverageTargetRuns(lod)),
         ],
@@ -1424,7 +1220,7 @@ async function queryLocalCoverage(
     dimension: "overworld",
     layer: "base",
     lod,
-    databaseUpdatedAt: databaseStat.mtime.toISOString(),
+    databaseUpdatedAt,
     cells,
   });
 }
@@ -1716,12 +1512,9 @@ async function readCapacity(
   backingRoot: string | undefined,
   requirementOverrideBytes: number | undefined,
 ) {
-  const requirementBytes =
-    requirementOverrideBytes ??
-    (tileRoot
-      ? await readEstimatedOverworldRequirementBytes(tileRoot)
-      : null) ??
-    DEFAULT_OVERWORLD_REQUIREMENT_BYTES;
+  // On-demand mode has no whole-world storage target. Keep these legacy
+  // fields in the response contract so older clients remain parseable.
+  const requirementBytes = requirementOverrideBytes ?? 0;
   if (!tileRoot) {
     return {
       configured: false,
@@ -1749,8 +1542,6 @@ async function readCapacity(
       );
     }
     const archiveBytes = await readArchiveBytes(tileRoot);
-    // Compare against free bytes alone. This is deliberately stronger than
-    // crediting the existing mixed archive toward the Overworld reference.
     const availableForAtlasBytes = effectiveFreeBytes;
     const marginBytes = availableForAtlasBytes - requirementBytes;
     return {
@@ -2281,6 +2072,9 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   const tileRoot = options.tileRoot?.trim()
     ? resolve(options.tileRoot)
     : undefined;
+  const regionalTileRoot = options.regionalTileRoot?.trim()
+    ? resolve(options.regionalTileRoot)
+    : tileRoot;
   const backingRoot = options.backingRoot?.trim()
     ? resolve(options.backingRoot)
     : undefined;
@@ -2309,7 +2103,6 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     string,
     {
       readonly fingerprint: string;
-      readonly checkedAt: number;
       readonly inventory: LocalRegionStatusInventory;
     }
   >();
@@ -2321,20 +2114,57 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   const readCachedLocalCoverage = async (
     lod: number,
   ): Promise<LocalCoverageResult> => {
-    if (!tileRoot) {
+    const configuredRoots = [tileRoot, regionalTileRoot].filter(
+      (catalogRoot, index, roots): catalogRoot is string =>
+        Boolean(catalogRoot) &&
+        roots.indexOf(catalogRoot) === index,
+    );
+    if (configuredRoots.length === 0) {
       throw new Error("La biblioteca local no está configurada");
     }
-    const databasePath = resolve(tileRoot, "tiles.sqlite3");
-    const fingerprint = [
-      await optionalFileFingerprint(databasePath),
-      await optionalFileFingerprint(`${databasePath}-wal`),
-    ].join("|");
+    const snapshots = await Promise.all(
+      configuredRoots.map(async (catalogRoot) => ({
+        catalogRoot,
+        snapshot: await readLocalCatalogSnapshot(catalogRoot),
+      })),
+    );
+    const availableCatalogs = snapshots.filter(
+      (
+        entry,
+      ): entry is {
+        readonly catalogRoot: string;
+        readonly snapshot: NonNullable<
+          Awaited<ReturnType<typeof readLocalCatalogSnapshot>>
+        >;
+      } => entry.snapshot !== null,
+    );
+    if (availableCatalogs.length === 0) {
+      throw new Error("No hay catálogos locales de tiles");
+    }
+    const fingerprint = snapshots
+      .map(
+        ({ catalogRoot, snapshot }) =>
+          `${catalogRoot}:${snapshot?.fingerprint ?? "missing"}`,
+      )
+      .join("|");
     const cached = coverageCache.get(lod);
     if (cached?.fingerprint === fingerprint) return cached.result;
     const queryKey = `${lod}:${fingerprint}`;
     const existingQuery = coverageQueries.get(queryKey);
     if (existingQuery) return existingQuery;
-    const query = queryLocalCoverage(tileRoot, pythonBin, lod)
+    const databaseUpdatedAt = new Date(
+      Math.max(
+        ...availableCatalogs.map(({ snapshot }) =>
+          Date.parse(snapshot.updatedAt),
+        ),
+      ),
+    ).toISOString();
+    const query = queryLocalCoverage(
+      availableCatalogs.map(({ catalogRoot }) => catalogRoot),
+      pythonBin,
+      lod,
+      databaseUpdatedAt,
+    )
       .then((result) => {
         coverageCache.set(lod, { fingerprint, result });
         return result;
@@ -2347,31 +2177,28 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   };
 
   const readCachedLocalRegionStatus = async (
+    catalogRoot: string,
     request: LocalRegionStatusRequest,
   ): Promise<LocalRegionStatusInventory> => {
-    if (!tileRoot) {
-      throw new Error("La biblioteca local no está configurada");
-    }
     const requestKey = [
+      catalogRoot,
       request.bounds.minX,
       request.bounds.minZ,
       request.bounds.maxXExclusive,
       request.bounds.maxZExclusive,
       request.layers.join(","),
     ].join(":");
-    const snapshot = await readLocalCatalogSnapshot(tileRoot);
+    const snapshot = await readLocalCatalogSnapshot(catalogRoot);
     if (!snapshot) return emptyLocalRegionStatus(request);
     const cached = regionStatusCache.get(requestKey);
-    if (
-      cached?.fingerprint === snapshot.fingerprint &&
-      Date.now() - cached.checkedAt < LOCAL_REGION_STATUS_CACHE_MS
-    ) {
+    if (cached?.fingerprint === snapshot.fingerprint) {
       return cached.inventory;
     }
-    const existingQuery = regionStatusQueries.get(requestKey);
+    const queryKey = `${requestKey}:${snapshot.fingerprint}`;
+    const existingQuery = regionStatusQueries.get(queryKey);
     if (existingQuery) return existingQuery;
     const query = queryLocalRegionStatus(
-      tileRoot,
+      catalogRoot,
       pythonBin,
       request,
       snapshot.updatedAt,
@@ -2379,16 +2206,41 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
       .then((inventory) => {
         regionStatusCache.set(requestKey, {
           fingerprint: snapshot.fingerprint,
-          checkedAt: Date.now(),
           inventory,
         });
         return inventory;
       })
       .finally(() => {
-        regionStatusQueries.delete(requestKey);
+        regionStatusQueries.delete(queryKey);
       });
-    regionStatusQueries.set(requestKey, query);
+    regionStatusQueries.set(queryKey, query);
     return query;
+  };
+
+  const readPreferredLocalRegionStatus = async (
+    request: LocalRegionStatusRequest,
+  ): Promise<LocalRegionStatusInventory> => {
+    if (!regionalTileRoot) {
+      throw new Error("La biblioteca local no está configurada");
+    }
+    const regionalInventory = await readCachedLocalRegionStatus(
+      regionalTileRoot,
+      request,
+    );
+    if (
+      regionalInventory.result.ready ||
+      !tileRoot ||
+      tileRoot === regionalTileRoot
+    ) {
+      return regionalInventory;
+    }
+    const primaryInventory = await readCachedLocalRegionStatus(
+      tileRoot,
+      request,
+    );
+    return primaryInventory.result.ready
+      ? primaryInventory
+      : regionalInventory;
   };
 
   const middleware = async (
@@ -2421,14 +2273,15 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
         });
         return;
       }
-      if (!tileRoot) {
+      if (!regionalTileRoot) {
         writeJson(response, 503, {
           error: "La biblioteca local no está configurada",
         });
         return;
       }
       try {
-        const inventory = await readCachedLocalRegionStatus(regionRequest);
+        const inventory =
+          await readPreferredLocalRegionStatus(regionRequest);
         writeJson(response, 200, inventory.result);
       } catch {
         writeJson(response, 503, {
@@ -2446,7 +2299,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
         });
         return;
       }
-      if (!tileRoot) {
+      if (!tileRoot && !regionalTileRoot) {
         writeJson(response, 503, {
           error: "La biblioteca local no está configurada",
         });
@@ -2475,7 +2328,15 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
         next();
         return;
       }
-      if (tileRoot) {
+      if (regionalTileRoot) {
+        const result = await tryServeLocalTile(
+          request,
+          response,
+          regionalTileRoot,
+        );
+        if (result === "served") return;
+      }
+      if (tileRoot && tileRoot !== regionalTileRoot) {
         const result = await tryServeLocalTile(request, response, tileRoot);
         if (result === "served") return;
       }
@@ -2484,9 +2345,9 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     }
 
     if (path === STATUS_ENDPOINT && request.method === "GET") {
-      const [capacity, persistence, globalDownload] = await Promise.all([
+      const [capacity, persistence] = await Promise.all([
         readCapacity(
-          tileRoot,
+          regionalTileRoot,
           backingRoot,
           requirementOverrideBytes,
         ),
@@ -2499,16 +2360,15 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
               revision: null,
               updatedAt: null,
             }),
-        tileRoot
-          ? readGlobalDownloadProgress(tileRoot)
-          : Promise.resolve(null),
       ]);
       writeJson(response, 200, {
         localOnly: true,
         mutationToken,
         capacity,
         persistence,
-        globalDownload,
+        // Kept for wire compatibility. Global downloading is deliberately
+        // disabled; only user-selected regional jobs can consume bandwidth.
+        globalDownload: null,
         job: publicJob(state.job),
       });
       return;
@@ -2597,7 +2457,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
         });
         return;
       }
-      if (!tileRoot) {
+      if (!regionalTileRoot) {
         writeJson(response, 503, {
           error: "La biblioteca local no está configurada",
         });
@@ -2617,23 +2477,27 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
         const region = parseRegionDownloadRequest(
           await readRequestBody(request),
         );
+        await mkdir(regionalTileRoot, { recursive: true });
         const capacity = await readCapacity(
-          tileRoot,
+          regionalTileRoot,
           backingRoot,
           requirementOverrideBytes,
         );
         let inventory: LocalRegionStatusInventory;
         try {
-          inventory = await readCachedLocalRegionStatus({
-            bounds: {
-              minX: region.xMin,
-              minZ: region.zMin,
-              maxXExclusive: region.xMaxExclusive,
-              maxZExclusive: region.zMaxExclusive,
+          inventory = await readCachedLocalRegionStatus(
+            regionalTileRoot,
+            {
+              bounds: {
+                minX: region.xMin,
+                minZ: region.zMin,
+                maxXExclusive: region.xMaxExclusive,
+                maxZExclusive: region.zMaxExclusive,
+              },
+              lod: 0,
+              layers: region.layers,
             },
-            lod: 0,
-            layers: region.layers,
-          });
+          );
         } catch {
           writeJson(response, 503, {
             error: "No se pudo comprobar el inventario regional local",
@@ -2658,7 +2522,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
           return;
         }
         const job = startRegionJob(state, region, {
-          tileRoot,
+          tileRoot: regionalTileRoot,
           pythonBin,
           projectRoot,
         });

@@ -91,7 +91,6 @@ import {
   coverageSelectionBetweenCells,
   overviewCellAtWorld,
   overviewCellForIndex,
-  parseCoverageSelection,
   type OverworldCoverageSelection,
   type OverworldOverviewCell,
 } from "./lib/overworld-coverage";
@@ -104,7 +103,6 @@ import {
   LocalAtlasWorkspaceConflictError,
   localAtlasWorkspaceContent,
   parseLocalAtlasWorkspaceContent,
-  parseLocalAtlasWorkspaceExplorations,
   readLocalAtlasCoverage,
   readLocalAtlasRegionStatus,
   readLocalAtlasRuntime,
@@ -115,10 +113,15 @@ import {
   type LocalAtlasRegionStatus,
   type LocalAtlasRuntime,
   type LocalAtlasCoverageSnapshot,
+  type LocalAtlasWorkspace,
   type LocalAtlasWorkspaceContent,
   type LocalAtlasWorkspaceExploration,
   type LocalAtlasWorkspacePrecondition,
 } from "./lib/local-atlas-runtime";
+import {
+  consolidateSingleWorkspaceContent,
+  mergeWorkspaceContentCandidates,
+} from "./lib/single-workspace-session";
 import {
   type ChangeEvent,
   type FormEvent,
@@ -137,18 +140,17 @@ const INITIAL_VIEW_SIZE = { width: 1280, height: 760 };
 const MIN_SCALE = 1 / 1_500;
 const ATLAS_MIN_SCALE = 1 / 10_000;
 const MAX_SCALE = 8;
-const MAX_WORKSPACE_EXPLORATIONS = 128;
+const MAX_WORKSPACE_EXPLORATIONS = 1;
 const MAX_WORKSPACE_HIGHLIGHTS = 10_000;
-const HIGHLIGHT_STORAGE_KEY = "obsidian-atlas-highlights-v1";
-const EXPLORATION_STORAGE_KEY = "obsidian-atlas-exploration-v1";
-const SAVED_EXPLORATIONS_STORAGE_KEY =
+const LEGACY_HIGHLIGHT_STORAGE_KEY = "obsidian-atlas-highlights-v1";
+const LEGACY_EXPLORATION_STORAGE_KEY = "obsidian-atlas-exploration-v1";
+const LEGACY_SAVED_EXPLORATIONS_STORAGE_KEY =
   "obsidian-atlas-saved-explorations-v1";
-const LEGACY_WORKSPACE_RECOVERY_STORAGE_KEY =
+const WORKSPACE_RECOVERY_STORAGE_KEY =
   "obsidian-atlas-workspace-recovery-v1";
-const WORKSPACE_RECOVERY_STORAGE_PREFIX =
+const LEGACY_WORKSPACE_RECOVERY_STORAGE_PREFIX =
   "obsidian-atlas-workspace-recovery-v1:";
-const WORKSPACE_TAB_ID_SESSION_KEY = "obsidian-atlas-workspace-tab-id-v1";
-const COVERAGE_SELECTION_STORAGE_KEY =
+const LEGACY_COVERAGE_SELECTION_STORAGE_KEY =
   "obsidian-atlas-overworld-selection-v1";
 const COLORS = ["#ff5f57", "#ffbd4a", "#26d9c7", "#62a8ff", "#c58cff"];
 const REGIONAL_DOWNLOAD_LAYERS = [
@@ -232,7 +234,6 @@ type PersistenceState =
   | "saved"
   | "readonly"
   | "offline"
-  | "conflict"
   | "error";
 
 type ActivePointer = {
@@ -250,9 +251,6 @@ type BrowserWorkspaceRecovery = {
   readonly content: LocalAtlasWorkspaceContent;
   readonly storageKey: string;
 };
-
-let browserWorkspaceTabId: string | null = null;
-const activeBrowserWorkspaceBranches = new Set<string>();
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));
@@ -322,46 +320,6 @@ function parseBrowserWorkspaceRecovery(
   };
 }
 
-function currentBrowserWorkspaceTabIdentifier() {
-  if (!browserWorkspaceTabId) {
-    try {
-      browserWorkspaceTabId =
-        window.sessionStorage.getItem(WORKSPACE_TAB_ID_SESSION_KEY);
-      if (!browserWorkspaceTabId) {
-        browserWorkspaceTabId = crypto.randomUUID();
-        window.sessionStorage.setItem(
-          WORKSPACE_TAB_ID_SESSION_KEY,
-          browserWorkspaceTabId,
-        );
-      }
-    } catch {
-      browserWorkspaceTabId = crypto.randomUUID();
-    }
-  }
-  return browserWorkspaceTabId;
-}
-
-function currentBrowserWorkspaceRecoveryKey() {
-  return `${WORKSPACE_RECOVERY_STORAGE_PREFIX}${currentBrowserWorkspaceTabIdentifier()}`;
-}
-
-function rotateBrowserWorkspaceRecoveryBranch() {
-  const previous = readRecoveryAtKey(currentBrowserWorkspaceRecoveryKey());
-  browserWorkspaceTabId = crypto.randomUUID();
-  try {
-    window.sessionStorage.setItem(
-      WORKSPACE_TAB_ID_SESSION_KEY,
-      browserWorkspaceTabId,
-    );
-  } catch {
-    // The in-memory branch id still separates this page instance.
-  }
-  if (previous) {
-    writeBrowserWorkspaceRecovery(previous.content, previous.base);
-  }
-  return browserWorkspaceTabId;
-}
-
 function readRecoveryAtKey(
   storageKey: string,
 ): BrowserWorkspaceRecovery | null {
@@ -378,29 +336,16 @@ function readRecoveryAtKey(
   }
 }
 
-function readBrowserWorkspaceRecovery(options?: {
-  includeOtherBranches?: boolean;
-}): BrowserWorkspaceRecovery | null {
-  const own = readRecoveryAtKey(currentBrowserWorkspaceRecoveryKey());
-  if (own || !options?.includeOtherBranches) return own;
+function readBrowserWorkspaceRecoveries(): BrowserWorkspaceRecovery[] {
   const candidates: BrowserWorkspaceRecovery[] = [];
-  const legacy = readRecoveryAtKey(LEGACY_WORKSPACE_RECOVERY_STORAGE_KEY);
-  if (legacy) candidates.push(legacy);
+  const primary = readRecoveryAtKey(WORKSPACE_RECOVERY_STORAGE_KEY);
+  if (primary) candidates.push(primary);
   try {
     for (let index = 0; index < window.localStorage.length; index += 1) {
       const storageKey = window.localStorage.key(index);
       if (
         !storageKey ||
-        !storageKey.startsWith(WORKSPACE_RECOVERY_STORAGE_PREFIX)
-      ) {
-        continue;
-      }
-      const branchId = storageKey.slice(
-        WORKSPACE_RECOVERY_STORAGE_PREFIX.length,
-      );
-      if (
-        branchId !== currentBrowserWorkspaceTabIdentifier() &&
-        activeBrowserWorkspaceBranches.has(branchId)
+        !storageKey.startsWith(LEGACY_WORKSPACE_RECOVERY_STORAGE_PREFIX)
       ) {
         continue;
       }
@@ -408,13 +353,15 @@ function readBrowserWorkspaceRecovery(options?: {
       if (recovery) candidates.push(recovery);
     }
   } catch {
-    // A current-tab branch is still sufficient when storage enumeration fails.
+    // The fixed recovery is sufficient when storage enumeration fails.
   }
-  return (
-    candidates.sort((left, right) =>
-      right.updatedAt.localeCompare(left.updatedAt),
-    )[0] ?? null
+  return candidates.sort((left, right) =>
+    right.updatedAt.localeCompare(left.updatedAt),
   );
+}
+
+function readBrowserWorkspaceRecovery(): BrowserWorkspaceRecovery | null {
+  return readBrowserWorkspaceRecoveries()[0] ?? null;
 }
 
 function writeBrowserWorkspaceRecovery(
@@ -430,7 +377,7 @@ function writeBrowserWorkspaceRecovery(
       content,
     } as const;
     window.localStorage.setItem(
-      currentBrowserWorkspaceRecoveryKey(),
+      WORKSPACE_RECOVERY_STORAGE_KEY,
       JSON.stringify(recovery),
     );
     return true;
@@ -439,47 +386,38 @@ function writeBrowserWorkspaceRecovery(
   }
 }
 
-function clearBrowserWorkspaceRecovery(
-  expectedContent?: LocalAtlasWorkspaceContent,
-) {
+function clearLegacyBrowserWorkspaceCaches() {
   try {
-    const ownKey = currentBrowserWorkspaceRecoveryKey();
-    if (!expectedContent) {
-      window.localStorage.removeItem(ownKey);
-      return;
-    }
-    const expectedSignature = JSON.stringify(expectedContent);
-    const candidateKeys = new Set<string>([
-      ownKey,
-      LEGACY_WORKSPACE_RECOVERY_STORAGE_KEY,
-    ]);
+    const candidateKeys = new Set<string>([WORKSPACE_RECOVERY_STORAGE_KEY]);
     for (let index = 0; index < window.localStorage.length; index += 1) {
       const storageKey = window.localStorage.key(index);
-      if (storageKey?.startsWith(WORKSPACE_RECOVERY_STORAGE_PREFIX)) {
+      if (
+        storageKey?.startsWith(
+          LEGACY_WORKSPACE_RECOVERY_STORAGE_PREFIX,
+        )
+      ) {
         candidateKeys.add(storageKey);
       }
     }
     for (const storageKey of candidateKeys) {
-      const branchId = storageKey.startsWith(
-        WORKSPACE_RECOVERY_STORAGE_PREFIX,
-      )
-        ? storageKey.slice(WORKSPACE_RECOVERY_STORAGE_PREFIX.length)
-        : null;
-      if (
-        storageKey !== ownKey &&
-        branchId &&
-        activeBrowserWorkspaceBranches.has(branchId)
-      ) {
-        continue;
-      }
-      const recovery = readRecoveryAtKey(storageKey);
-      if (
-        recovery &&
-        JSON.stringify(recovery.content) === expectedSignature
-      ) {
-        window.localStorage.removeItem(storageKey);
-      }
+      window.localStorage.removeItem(storageKey);
     }
+    for (const storageKey of [
+      LEGACY_HIGHLIGHT_STORAGE_KEY,
+      LEGACY_EXPLORATION_STORAGE_KEY,
+      LEGACY_SAVED_EXPLORATIONS_STORAGE_KEY,
+      LEGACY_COVERAGE_SELECTION_STORAGE_KEY,
+    ]) {
+      window.localStorage.removeItem(storageKey);
+    }
+  } catch {
+    // The canonical disk workspace remains safe if browser cleanup is blocked.
+  }
+}
+
+function clearBrowserWorkspaceRecovery() {
+  try {
+    window.localStorage.removeItem(WORKSPACE_RECOVERY_STORAGE_KEY);
   } catch {
     // The canonical disk workspace remains safe if browser cleanup is blocked.
   }
@@ -672,16 +610,10 @@ function upsertWorkspaceExploration(
   items: LocalAtlasWorkspaceExploration[],
   state: ExplorationState,
 ): LocalAtlasWorkspaceExploration[] {
-  const existingIndex = items.findIndex(
-    (item) => item.id === state.region.id,
-  );
-  const existing = existingIndex === -1 ? undefined : items[existingIndex];
+  const existing = items.find((item) => item.id === state.region.id);
   const next = workspaceExplorationFromState(state, existing);
-  if (next === existing) return items;
-  if (existingIndex === -1) return [...items, next];
-  return items.map((item, index) =>
-    index === existingIndex ? next : item,
-  );
+  if (items.length === 1 && next === existing) return items;
+  return [next];
 }
 
 async function copyText(text: string) {
@@ -755,7 +687,6 @@ export function MapViewer() {
   const workspaceRuntimeRef = useRef<LocalAtlasRuntime | null>(null);
   const explorationStateRef = useRef<ExplorationState | null>(null);
   const workspaceSavePromiseRef = useRef<Promise<boolean> | null>(null);
-  const workspaceConflictRef = useRef(false);
   const workspaceSaveTimerRef = useRef<number | null>(null);
   const lastSavedWorkspaceRef = useRef<string | null>(null);
   const pendingWorkspaceWriteRef = useRef<{
@@ -861,7 +792,6 @@ export function MapViewer() {
   const [runtimeChecked, setRuntimeChecked] = useState(false);
   const [downloadClockMs, setDownloadClockMs] = useState(0);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
-  const [workspaceBranchReady, setWorkspaceBranchReady] = useState(false);
   const [workspaceReady, setWorkspaceReady] = useState(false);
   const [persistenceState, setPersistenceState] =
     useState<PersistenceState>("checking");
@@ -951,6 +881,24 @@ export function MapViewer() {
   const activeDownloadProgress = matchingRegionDownloadJob
     ? localRuntime?.job?.progress
     : undefined;
+  const displayedRegionPercent =
+    matchingRegionDownloadRunning && activeDownloadProgress
+      ? activeDownloadProgress.percent
+      : (regionStatus?.percent ?? 0);
+  const displayedRegionResolved =
+    matchingRegionDownloadRunning && activeDownloadProgress
+      ? activeDownloadProgress.complete + activeDownloadProgress.absent
+      : regionStatus?.resolvedCount;
+  const displayedRegionTotal =
+    matchingRegionDownloadRunning && activeDownloadProgress
+      ? activeDownloadProgress.requested
+      : regionStatus?.totalCount;
+  const matchingRegionDownloadError =
+    matchingRegionDownloadJob && localRuntime?.job?.status === "error"
+      ? localRuntime.job.message
+      : null;
+  const regionalRateLimit = 16;
+  const effectiveRegionalRequestRate = requestsPerSecond;
   const downloadCooldownUntilMs = activeDownloadProgress?.cooldownUntil
     ? Date.parse(activeDownloadProgress.cooldownUntil)
     : null;
@@ -1003,6 +951,7 @@ export function MapViewer() {
       if (interval !== null) window.clearInterval(interval);
     };
   }, [downloadCooldownUntilMs]);
+
   const explorationPercent = explorationState
     ? reviewableCellCount === 0
       ? 100
@@ -1025,6 +974,15 @@ export function MapViewer() {
       )
     );
   }, [coverageSelection]);
+  const selectedRegionFileBudget =
+    coverageRegionStatus?.totalCount ??
+    selectedLod0CellCount * REGIONAL_DOWNLOAD_LAYERS.length;
+  const plannedRegionFileBudget =
+    regionStatus?.totalCount ??
+    (explorationPlan?.state.region.cellCount ?? 0) *
+      REGIONAL_DOWNLOAD_LAYERS.length;
+  const plannedRegionPendingFiles =
+    regionStatus?.pendingCount ?? plannedRegionFileBudget;
   const coverageSelectionTooLarge =
     selectedLod0CellCount > MAX_EXPLORATION_CELLS;
   const workspaceContent = useMemo<LocalAtlasWorkspaceContent>(
@@ -1032,15 +990,17 @@ export function MapViewer() {
       schemaVersion: 1,
       activeExplorationId:
         explorationState?.region.id ??
-        explorationPlan?.state.region.id ??
-        null,
+        (explorationPlan?.source === "hydrated" ||
+        explorationPlan?.source === "restored"
+          ? explorationPlan.state.region.id
+          : null),
       explorations: savedExplorations,
       highlights,
       coverageSelection,
     }),
     [
       coverageSelection,
-      explorationPlan?.state.region.id,
+      explorationPlan,
       explorationState?.region.id,
       highlights,
       savedExplorations,
@@ -1095,93 +1055,25 @@ export function MapViewer() {
     localRuntime?.persistence.writable ?? false;
   const workspaceMutationsBlocked =
     !runtimeChecked ||
-    !workspaceBranchReady ||
     pauseBusy ||
-    (runtimePersistenceConfigured && !workspaceReady);
+    !runtimePersistenceConfigured ||
+    !runtimePersistenceWritable ||
+    !workspaceReady;
+  const persistenceLabel =
+    persistenceState === "checking"
+      ? "Comprobando"
+      : persistenceState === "saving"
+        ? "Guardando"
+        : persistenceState === "saved"
+          ? "Guardado"
+          : persistenceState === "readonly"
+            ? "Solo lectura"
+            : persistenceState === "offline"
+              ? "Sin disco"
+              : "Atención";
   const notify = useCallback((message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(null), 1_700);
-  }, []);
-
-  useEffect(() => {
-    const pageInstanceId = crypto.randomUUID();
-    let branchId = currentBrowserWorkspaceTabIdentifier();
-    let channel: BroadcastChannel | null = null;
-    const readyTimer = window.setTimeout(
-      () => setWorkspaceBranchReady(true),
-      150,
-    );
-    if ("BroadcastChannel" in window) {
-      channel = new BroadcastChannel("obsidian-atlas-workspace-branches-v1");
-      channel.onmessage = (event: MessageEvent<unknown>) => {
-        if (
-          typeof event.data !== "object" ||
-          event.data === null ||
-          Array.isArray(event.data)
-        ) {
-          return;
-        }
-        const message = event.data as Record<string, unknown>;
-        if (
-          typeof message.pageInstanceId !== "string" ||
-          message.pageInstanceId === pageInstanceId
-        ) {
-          return;
-        }
-        if (message.type === "branch-query") {
-          channel?.postMessage({
-            type: "branch-presence",
-            branchId,
-            pageInstanceId,
-          });
-          return;
-        }
-        if (typeof message.branchId !== "string") return;
-        if (message.type === "branch-release") {
-          activeBrowserWorkspaceBranches.delete(message.branchId);
-          return;
-        }
-        if (message.type === "branch-presence") {
-          activeBrowserWorkspaceBranches.add(message.branchId);
-          return;
-        }
-        if (message.type !== "branch-claim") return;
-        activeBrowserWorkspaceBranches.add(message.branchId);
-        if (message.branchId !== branchId) return;
-        if (pageInstanceId > message.pageInstanceId) {
-          branchId = rotateBrowserWorkspaceRecoveryBranch();
-          channel?.postMessage({
-            type: "branch-claim",
-            branchId,
-            pageInstanceId,
-          });
-        } else {
-          channel?.postMessage({
-            type: "branch-claim",
-            branchId,
-            pageInstanceId,
-          });
-        }
-      };
-      channel.postMessage({
-        type: "branch-claim",
-        branchId,
-        pageInstanceId,
-      });
-      channel.postMessage({
-        type: "branch-query",
-        pageInstanceId,
-      });
-    }
-    return () => {
-      window.clearTimeout(readyTimer);
-      channel?.postMessage({
-        type: "branch-release",
-        branchId,
-        pageInstanceId,
-      });
-      channel?.close();
-    };
   }, []);
 
   const clearTileCache = useCallback(() => {
@@ -1263,15 +1155,6 @@ export function MapViewer() {
               name: `${requestedState.region.name} · LOD 0`,
               bounds: requestedState.region.bounds,
             });
-      const active = explorationStateRef.current;
-      if (active && active.region.id !== state.region.id) {
-        setSavedExplorations((items) =>
-          upsertWorkspaceExploration(items, active),
-        );
-      }
-      setSavedExplorations((items) =>
-        upsertWorkspaceExploration(items, state),
-      );
       explorationStateRef.current = null;
       setExplorationState(null);
       setExplorationPlan({
@@ -1287,13 +1170,7 @@ export function MapViewer() {
       setConfirmCloseExploration(false);
       setMarkMode(null);
       clearTileCache();
-      setDrawer(
-        source === "hydrated"
-          ? "atlas"
-          : window.matchMedia("(max-width: 720px)").matches
-            ? null
-            : "exploration",
-      );
+      setDrawer(source === "hydrated" ? "atlas" : "exploration");
     },
     [clearTileCache],
   );
@@ -1321,13 +1198,7 @@ export function MapViewer() {
       if (plan.reveal) {
         focusExploration(next, { mode: "fit" });
       }
-      setDrawer(
-        plan.reveal
-          ? window.matchMedia("(max-width: 720px)").matches
-            ? null
-            : "exploration"
-          : "atlas",
-      );
+      setDrawer(plan.reveal ? "exploration" : "atlas");
       notify(
         `${next.region.name} lista · la primera celda quedó explorada`,
       );
@@ -1351,7 +1222,7 @@ export function MapViewer() {
             localRuntime.job,
             plan.state.region.bounds,
           )
-            ? "La descarga completa de esta región ya está en curso"
+            ? "Esta región ya se está guardando"
             : "Hay otra región descargándose; espera o detén ese trabajo",
         );
         return;
@@ -1362,10 +1233,10 @@ export function MapViewer() {
           localRuntime,
           plan.state.region.bounds,
           REGIONAL_DOWNLOAD_LAYERS,
-          requestsPerSecond,
+          effectiveRegionalRequestRate,
         );
         setLocalRuntime(await readLocalAtlasRuntime());
-        notify("Descarga completa de la región iniciada");
+        notify("Guardado regional iniciado a máxima velocidad");
       } catch (error) {
         notify(
           error instanceof Error
@@ -1376,7 +1247,7 @@ export function MapViewer() {
         setRuntimeBusy(false);
       }
     },
-    [localRuntime, notify, requestsPerSecond],
+    [effectiveRegionalRequestRate, localRuntime, notify],
   );
 
   useEffect(() => {
@@ -1394,130 +1265,21 @@ export function MapViewer() {
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       setLocalSupported(getFileSystemAccessSupport().supported);
-      try {
-        const stored = window.localStorage.getItem(HIGHLIGHT_STORAGE_KEY);
-        if (stored) {
-          const parsed = readHighlightList(JSON.parse(stored), {
-            discardInvalid: true,
-          });
-          if (parsed) {
-            setHighlights(parsed);
-          }
-        }
-      } catch {
-        // A malformed local preference should never block the map.
-      }
       setHighlightsReady(true);
-
-      try {
-        const stored = window.localStorage.getItem(
-          COVERAGE_SELECTION_STORAGE_KEY,
-        );
-        if (stored) {
-          const parsed = parseCoverageSelection(JSON.parse(stored) as unknown);
-          if (parsed) setCoverageSelection(parsed);
-        }
-      } catch {
-        // The disk-backed workspace can repair a malformed browser cache.
-      }
       setCoverageSelectionReady(true);
-
-      try {
-        const stored = window.localStorage.getItem(
-          SAVED_EXPLORATIONS_STORAGE_KEY,
-        );
-        if (stored) {
-          const parsed = parseLocalAtlasWorkspaceExplorations(
-            JSON.parse(stored) as unknown,
-          );
-          if (parsed) setSavedExplorations(parsed);
-        }
-      } catch {
-        // A malformed recovery cache must never block disk hydration.
-      }
-
-      let restoredExploration: ExplorationState | null = null;
-      try {
-        const stored = window.localStorage.getItem(EXPLORATION_STORAGE_KEY);
-        if (stored) {
-          restoredExploration = deserializeExplorationState(stored);
-          stageExplorationPlan(restoredExploration, "hydrated");
-        }
-      } catch {
-        // Invalid or obsolete sessions are ignored instead of blocking the map.
-      }
       setExplorationReady(true);
-
-      if (!restoredExploration) {
-        const location = parseLocation(window.location.hash, []);
-        if (location) {
-          atlasReturnViewRef.current = {
-            camera: { x: location.x, z: location.z },
-            scale: location.scale ?? INITIAL_SCALE,
-          };
-          const cell = overviewCellAtWorld(location.x, location.z);
-          if (cell) setAtlasFocusedCellIndex(cell.index);
-        }
+      const location = parseLocation(window.location.hash, []);
+      if (location) {
+        atlasReturnViewRef.current = {
+          camera: { x: location.x, z: location.z },
+          scale: location.scale ?? INITIAL_SCALE,
+        };
+        const cell = overviewCellAtWorld(location.x, location.z);
+        if (cell) setAtlasFocusedCellIndex(cell.index);
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [stageExplorationPlan]);
-
-  useEffect(() => {
-    if (!highlightsReady) return;
-    try {
-      window.localStorage.setItem(
-        HIGHLIGHT_STORAGE_KEY,
-        JSON.stringify(highlights),
-      );
-    } catch {
-      const timeout = window.setTimeout(
-        () => notify("No se pudieron guardar los highlights en este navegador"),
-        0,
-      );
-      return () => window.clearTimeout(timeout);
-    }
-  }, [highlights, highlightsReady, notify]);
-
-  useEffect(() => {
-    if (!explorationReady) return;
-    try {
-      const durableState = explorationState ?? explorationPlan?.state ?? null;
-      if (durableState) {
-        window.localStorage.setItem(
-          EXPLORATION_STORAGE_KEY,
-          serializeExplorationState(durableState),
-        );
-      } else {
-        window.localStorage.removeItem(EXPLORATION_STORAGE_KEY);
-      }
-    } catch {
-      const timeout = window.setTimeout(
-        () => notify("No se pudo guardar la sesión de exploración"),
-        0,
-      );
-      return () => window.clearTimeout(timeout);
-    }
-  }, [explorationPlan?.state, explorationReady, explorationState, notify]);
-
-  useEffect(() => {
-    if (!explorationReady) return;
-    try {
-      window.localStorage.setItem(
-        SAVED_EXPLORATIONS_STORAGE_KEY,
-        JSON.stringify(savedExplorations),
-      );
-    } catch {
-      const timeout = window.setTimeout(
-        () =>
-          notify(
-            "No se pudo guardar la lista de sesiones en este navegador",
-          ),
-        0,
-      );
-      return () => window.clearTimeout(timeout);
-    }
-  }, [explorationReady, notify, savedExplorations]);
+  }, []);
 
   useEffect(() => {
     if (!explorationReady || !explorationState) return;
@@ -1528,26 +1290,6 @@ export function MapViewer() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [explorationReady, explorationState]);
-
-  useEffect(() => {
-    if (!coverageSelectionReady) return;
-    try {
-      if (coverageSelection) {
-        window.localStorage.setItem(
-          COVERAGE_SELECTION_STORAGE_KEY,
-          JSON.stringify(coverageSelection),
-        );
-      } else {
-        window.localStorage.removeItem(COVERAGE_SELECTION_STORAGE_KEY);
-      }
-    } catch {
-      const timeout = window.setTimeout(
-        () => notify("No se pudo guardar la selección global en el navegador"),
-        0,
-      );
-      return () => window.clearTimeout(timeout);
-    }
-  }, [coverageSelection, coverageSelectionReady, notify]);
 
   useEffect(() => {
     if (atlasMode) return;
@@ -1716,14 +1458,9 @@ export function MapViewer() {
       }
     };
     void refresh();
-    const refreshIntervalMs =
-      localRuntime?.job?.status === "running" ||
-      localRuntime?.job?.status === "stopping"
-        ? 2_500
-        : 15_000;
     const interval = window.setInterval(() => {
       void refresh();
-    }, refreshIntervalMs);
+    }, 60_000);
     return () => {
       controller.abort();
       window.clearInterval(interval);
@@ -1775,10 +1512,7 @@ export function MapViewer() {
       }
     };
     void refresh();
-    const interval = window.setInterval(
-      () => void refresh(),
-      anyRegionDownloadRunning ? 2_500 : 15_000,
-    );
+    const interval = window.setInterval(() => void refresh(), 60_000);
     return () => {
       disposed = true;
       controller.abort();
@@ -1795,29 +1529,74 @@ export function MapViewer() {
     regionStatusKey,
   ]);
 
+  const applyWorkspaceSnapshot = useCallback(
+    (
+      workspace: LocalAtlasWorkspace,
+      message: string,
+      writable: boolean,
+    ) => {
+      const canonical = consolidateSingleWorkspaceContent(
+        localAtlasWorkspaceContent(workspace),
+      ) as LocalAtlasWorkspaceContent;
+      const restoredHighlights = readHighlightList(
+        canonical.highlights,
+        { discardInvalid: false },
+      );
+      if (!restoredHighlights) {
+        throw new Error("Los highlights de LuisA no son válidos");
+      }
+      const singleton = canonical.explorations[0];
+      const restoredExploration =
+        singleton &&
+        canonical.activeExplorationId === singleton.id
+          ? explorationStateFromWorkspace(singleton)
+          : null;
+
+      pendingWorkspaceWriteRef.current = null;
+      workspacePreconditionRef.current = {
+        workspaceId: workspace.workspaceId,
+        revision: workspace.revision,
+      };
+      lastSavedWorkspaceRef.current = JSON.stringify(canonical);
+      workspaceContentRef.current = canonical;
+      setSavedExplorations([...canonical.explorations]);
+      setHighlights(restoredHighlights);
+      setCoverageSelection(canonical.coverageSelection);
+      if (restoredExploration) {
+        stageExplorationPlan(restoredExploration, "hydrated");
+      } else {
+        explorationStateRef.current = null;
+        setExplorationPlan(null);
+        setExplorationState(null);
+      }
+      setWorkspaceReady(true);
+      setPersistenceState(writable ? "saved" : "readonly");
+      setPersistenceMessage(message);
+    },
+    [stageExplorationPlan],
+  );
+
   const flushWorkspace = useCallback(async (): Promise<boolean> => {
     const inFlight = workspaceSavePromiseRef.current;
     if (inFlight) return inFlight;
 
     const task = (async (): Promise<boolean> => {
+      let conflictRetries = 0;
       while (true) {
         const runtime = workspaceRuntimeRef.current;
-        const latestContent = workspaceContentRef.current;
+        const latestContent = workspaceContentRef.current
+          ? (consolidateSingleWorkspaceContent(
+              workspaceContentRef.current,
+            ) as LocalAtlasWorkspaceContent)
+          : null;
         if (!runtime?.persistence.configured || !latestContent) {
           setPersistenceState("offline");
-          setPersistenceMessage("Sin guardar en LuisA · copia local activa");
+          setPersistenceMessage("LuisA no está disponible · edición bloqueada");
           return false;
         }
         if (!runtime.persistence.writable) {
           setPersistenceState("readonly");
-          setPersistenceMessage("LuisA está en solo lectura · copia local activa");
-          return false;
-        }
-        if (workspaceConflictRef.current) {
-          setPersistenceState("conflict");
-          setPersistenceMessage(
-            "Conflicto pendiente · recarga LuisA antes de volver a guardar",
-          );
+          setPersistenceMessage("LuisA está en solo lectura · edición bloqueada");
           return false;
         }
         const latestSignature = JSON.stringify(latestContent);
@@ -1873,11 +1652,8 @@ export function MapViewer() {
               workspacePreconditionRef.current,
             );
           } else {
-            clearBrowserWorkspaceRecovery(
-              localAtlasWorkspaceContent(saved),
-            );
+            clearBrowserWorkspaceRecovery();
           }
-          workspaceConflictRef.current = false;
           setPersistenceState("saved");
           setPersistenceMessage(
             `Guardado en LuisA · ${new Date(saved.updatedAt ?? Date.now()).toLocaleTimeString("es-GT", {
@@ -1886,27 +1662,55 @@ export function MapViewer() {
             })}`,
           );
         } catch (error) {
-          if (error instanceof LocalAtlasWorkspaceConflictError) {
-            writeBrowserWorkspaceRecovery(
+          if (
+            error instanceof LocalAtlasWorkspaceConflictError &&
+            error.current &&
+            conflictRetries < 2
+          ) {
+            conflictRetries += 1;
+            const currentContent = localAtlasWorkspaceContent(error.current);
+            const localCanonical = consolidateSingleWorkspaceContent(
               workspaceContentRef.current ?? pending.content,
-              pending.expected,
+            ) as LocalAtlasWorkspaceContent;
+            const currentCanonical = consolidateSingleWorkspaceContent(
+              currentContent,
+            ) as LocalAtlasWorkspaceContent;
+            const localId = localCanonical.explorations[0]?.id ?? null;
+            const currentId = currentCanonical.explorations[0]?.id ?? null;
+            if (localId !== null && localId === currentId) {
+              const merged = consolidateSingleWorkspaceContent(
+                mergeWorkspaceContentCandidates([
+                  localCanonical,
+                  currentCanonical,
+                ]),
+              ) as LocalAtlasWorkspaceContent;
+              workspaceContentRef.current = merged;
+              setSavedExplorations([...merged.explorations]);
+              pendingWorkspaceWriteRef.current = {
+                content: merged,
+                expected: {
+                  workspaceId: error.current.workspaceId,
+                  revision: error.current.revision,
+                },
+                signature: JSON.stringify(merged),
+                writeId: crypto.randomUUID(),
+              };
+              continue;
+            }
+            clearBrowserWorkspaceRecovery();
+            applyWorkspaceSnapshot(
+              error.current,
+              "LuisA cambió en otra pestaña · se cargó la sesión canónica",
+              true,
             );
-            pendingWorkspaceWriteRef.current = null;
-            workspacePreconditionRef.current = null;
-            lastSavedWorkspaceRef.current = null;
-            workspaceConflictRef.current = true;
-            setPersistenceState("conflict");
-            setPersistenceMessage(
-              "Conflicto con otra pestaña · no se sobrescribió ningún dato",
-            );
-          } else {
-            setPersistenceState("error");
-            setPersistenceMessage(
-              error instanceof Error
-                ? error.message
-                : "No se pudo guardar en LuisA",
-            );
+            return true;
           }
+          setPersistenceState("error");
+          setPersistenceMessage(
+            error instanceof Error
+              ? error.message
+              : "No se pudo guardar en LuisA",
+          );
           return false;
         }
 
@@ -1928,31 +1732,21 @@ export function MapViewer() {
         workspaceSavePromiseRef.current = null;
       }
     }
-  }, []);
+  }, [applyWorkspaceSnapshot]);
 
   useEffect(() => {
     if (
       !highlightsReady ||
       !explorationReady ||
-      !coverageSelectionReady ||
-      !workspaceBranchReady
+      !coverageSelectionReady
     ) {
       return;
     }
     if (!runtimePersistenceConfigured || !runtimeMutationToken) {
-      if (
-        runtimeChecked &&
-        lastSavedWorkspaceRef.current === null &&
-        workspaceContentRef.current
-      ) {
-        lastSavedWorkspaceRef.current = JSON.stringify(
-          workspaceContentRef.current,
-        );
-      }
       const timeout = window.setTimeout(() => {
         setPersistenceState("offline");
-        setPersistenceMessage("Sin LuisA · guardando copia en el navegador");
-        if (runtimeChecked) setWorkspaceReady(true);
+        setPersistenceMessage("LuisA no está disponible · edición bloqueada");
+        setWorkspaceReady(false);
       }, 0);
       return () => window.clearTimeout(timeout);
     }
@@ -1961,16 +1755,11 @@ export function MapViewer() {
     ) {
       const timeout = window.setTimeout(() => {
         if (!runtimePersistenceWritable) {
+          setWorkspaceReady(true);
           setPersistenceState("readonly");
-          setPersistenceMessage(
-            "LuisA está en solo lectura · copia local activa",
-          );
-        } else if (workspaceConflictRef.current) {
-          setPersistenceState("conflict");
-          setPersistenceMessage(
-            "Conflicto pendiente · recarga LuisA antes de volver a guardar",
-          );
+          setPersistenceMessage("LuisA está en solo lectura · edición bloqueada");
         } else {
+          setWorkspaceReady(true);
           const latest = workspaceContentRef.current;
           if (
             latest &&
@@ -1992,9 +1781,6 @@ export function MapViewer() {
     void (async () => {
       await Promise.resolve();
       if (cancelled) return;
-      const hydrationStartSignature = JSON.stringify(
-        workspaceContentRef.current,
-      );
       setWorkspaceReady(false);
       setPersistenceState("checking");
       setPersistenceMessage("Leyendo workspace de LuisA…");
@@ -2008,278 +1794,92 @@ export function MapViewer() {
           throw new Error("LuisA no devolvió un workspace");
         }
         pendingWorkspaceWriteRef.current = null;
-        workspaceConflictRef.current = false;
-
-        const contentAfterRead = workspaceContentRef.current;
-        if (
-          contentAfterRead &&
-          JSON.stringify(contentAfterRead) !== hydrationStartSignature
-        ) {
-          writeBrowserWorkspaceRecovery(contentAfterRead, null);
-        }
-        let browserRecovery = readBrowserWorkspaceRecovery({
-          includeOtherBranches: true,
-        });
-        if (
-          browserRecovery &&
-          browserRecovery.storageKey !== currentBrowserWorkspaceRecoveryKey() &&
-          writeBrowserWorkspaceRecovery(
-            browserRecovery.content,
-            browserRecovery.base,
-          )
-        ) {
-          browserRecovery =
-            readBrowserWorkspaceRecovery() ?? browserRecovery;
-        }
-        if (browserRecovery) {
-          const diskContent = localAtlasWorkspaceContent(diskWorkspace);
-          const recoveryMatchesDisk =
-            JSON.stringify(browserRecovery.content) ===
+        const recoveries = readBrowserWorkspaceRecoveries();
+        const diskContent = localAtlasWorkspaceContent(diskWorkspace);
+        const legacyMigration =
+          diskContent.explorations.length > MAX_WORKSPACE_EXPLORATIONS ||
+          recoveries.some(
+            (recovery) =>
+              recovery.content.explorations.length >
+              MAX_WORKSPACE_EXPLORATIONS,
+          );
+        const matchingRecovery = recoveries.find(
+          (recovery) =>
+            recovery.base?.workspaceId === diskWorkspace.workspaceId &&
+            recovery.base.revision === diskWorkspace.revision,
+        );
+        const shouldReplayRecovery =
+          matchingRecovery &&
+          JSON.stringify(matchingRecovery.content) !==
             JSON.stringify(diskContent);
-          const baseMatchesDisk =
-            browserRecovery.base?.workspaceId === diskWorkspace.workspaceId &&
-            browserRecovery.base.revision === diskWorkspace.revision;
-          const diskIsEmpty =
-            diskWorkspace.revision === 0 &&
-            diskWorkspace.explorations.length === 0 &&
-            diskWorkspace.highlights.length === 0 &&
-            diskWorkspace.coverageSelection === null;
 
-          if (recoveryMatchesDisk) {
-            clearBrowserWorkspaceRecovery(browserRecovery.content);
-          } else if (
-            runtime.persistence.writable &&
-            (baseMatchesDisk || diskIsEmpty)
-          ) {
+        if (
+          runtime.persistence.writable &&
+          (legacyMigration || shouldReplayRecovery)
+        ) {
+          const candidates = legacyMigration
+            ? [
+                ...recoveries.map((recovery) => recovery.content),
+                diskContent,
+              ]
+            : [matchingRecovery!.content, diskContent];
+          const migrationCandidate =
+            mergeWorkspaceContentCandidates(candidates);
+          try {
             diskWorkspace = await writeLocalAtlasWorkspace(
               runtime,
-              browserRecovery.content,
+              migrationCandidate,
               {
                 workspaceId: diskWorkspace.workspaceId,
                 revision: diskWorkspace.revision,
               },
             );
-            clearBrowserWorkspaceRecovery(browserRecovery.content);
-          } else {
-            const recoveredHighlights = readHighlightList(
-              browserRecovery.content.highlights,
-              { discardInvalid: false },
-            );
-            if (!recoveredHighlights) {
-              throw new Error("La copia de recuperación no es válida");
+          } catch (error) {
+            if (
+              !(error instanceof LocalAtlasWorkspaceConflictError) ||
+              !error.current
+            ) {
+              throw error;
             }
-            const recoveredActive = browserRecovery.content.activeExplorationId
-              ? browserRecovery.content.explorations.find(
-                  (item) =>
-                    item.id ===
-                    browserRecovery.content.activeExplorationId,
-                )
-              : undefined;
-            const recoveredExploration = recoveredActive
-              ? explorationStateFromWorkspace(recoveredActive)
-              : null;
-            workspacePreconditionRef.current = baseMatchesDisk
-              ? {
-                  workspaceId: diskWorkspace.workspaceId,
-                  revision: diskWorkspace.revision,
-                }
-              : null;
-            lastSavedWorkspaceRef.current = JSON.stringify(diskContent);
-            workspaceContentRef.current = browserRecovery.content;
-            setSavedExplorations([
-              ...browserRecovery.content.explorations,
+            const retryCandidate = mergeWorkspaceContentCandidates([
+              ...candidates,
+              localAtlasWorkspaceContent(error.current),
             ]);
-            setHighlights(recoveredHighlights);
-            setCoverageSelection(browserRecovery.content.coverageSelection);
-            if (recoveredExploration) {
-              stageExplorationPlan(recoveredExploration, "hydrated");
-            } else {
-              setExplorationPlan(null);
-              setExplorationState(null);
-            }
-            setWorkspaceReady(true);
-            if (!runtime.persistence.writable && baseMatchesDisk) {
-              setPersistenceState("readonly");
-              setPersistenceMessage(
-                "Cambios locales conservados · LuisA está en solo lectura",
-              );
-            } else {
-              workspaceConflictRef.current = true;
-              setPersistenceState("conflict");
-              setPersistenceMessage(
-                "Cambios locales en conflicto · elige qué versión conservar",
-              );
-            }
-            hydrationCompleted = true;
-            return;
-          }
-        }
-
-        if (
-          diskWorkspace.revision === 0 &&
-          diskWorkspace.explorations.length === 0 &&
-          diskWorkspace.highlights.length === 0 &&
-          diskWorkspace.coverageSelection === null
-        ) {
-          const cached = workspaceContentRef.current;
-          if (!cached) {
-            throw new Error("El workspace local todavía no está listo");
-          }
-          const explorations = [...cached.explorations];
-          const cachedExploration = explorationStateRef.current;
-          if (
-            cachedExploration &&
-            !explorations.some(
-              (item) => item.id === cachedExploration.region.id,
-            )
-          ) {
-            explorations.push(
-              workspaceExplorationFromState(cachedExploration),
+            diskWorkspace = await writeLocalAtlasWorkspace(
+              runtime,
+              retryCandidate,
+              {
+                workspaceId: error.current.workspaceId,
+                revision: error.current.revision,
+              },
             );
           }
-          const legacyContent: LocalAtlasWorkspaceContent = {
-            ...cached,
-            activeExplorationId: cachedExploration?.region.id ?? null,
-            explorations,
-          };
-          const hasLegacyData =
-            legacyContent.explorations.length > 0 ||
-            legacyContent.highlights.length > 0 ||
-            legacyContent.coverageSelection !== null;
-          const migrated = hasLegacyData && runtime.persistence.writable
-            ? await writeLocalAtlasWorkspace(
-                runtime,
-                legacyContent,
-                {
-                  workspaceId: diskWorkspace.workspaceId,
-                  revision: diskWorkspace.revision,
-                },
-              )
-            : diskWorkspace;
           if (cancelled) return;
-          workspacePreconditionRef.current = {
-            workspaceId: migrated.workspaceId,
-            revision: migrated.revision,
-          };
-          lastSavedWorkspaceRef.current = JSON.stringify(
-            localAtlasWorkspaceContent(migrated),
+          clearLegacyBrowserWorkspaceCaches();
+          applyWorkspaceSnapshot(
+            diskWorkspace,
+            legacyMigration
+              ? "Sesión única saneada y guardada en LuisA"
+              : "Recuperación aplicada a la sesión única",
+            true,
           );
-          if (hasLegacyData && runtime.persistence.writable) {
-            clearBrowserWorkspaceRecovery(legacyContent);
-          }
-          setSavedExplorations([...legacyContent.explorations]);
-          setWorkspaceReady(true);
+        } else {
           if (runtime.persistence.writable) {
-            setPersistenceState("saved");
-            setPersistenceMessage(
-              hasLegacyData
-                ? "Datos del navegador migrados a LuisA"
-                : "Workspace de LuisA listo",
-            );
-          } else {
-            setPersistenceState("readonly");
-            setPersistenceMessage(
-              hasLegacyData
-                ? "LuisA en solo lectura · copia local conservada"
-                : "LuisA está en solo lectura",
-            );
+            clearLegacyBrowserWorkspaceCaches();
           }
-          hydrationCompleted = true;
-          return;
-        }
-
-        const restoredHighlights = readHighlightList(
-          diskWorkspace.highlights,
-          { discardInvalid: false },
-        );
-        if (!restoredHighlights) {
-          throw new Error("Los highlights de LuisA no son válidos");
-        }
-        const activeExploration = diskWorkspace.activeExplorationId
-          ? diskWorkspace.explorations.find(
-              (item) => item.id === diskWorkspace.activeExplorationId,
-            )
-          : undefined;
-        const restoredExploration = activeExploration
-          ? explorationStateFromWorkspace(activeExploration)
-          : null;
-
-        workspacePreconditionRef.current = {
-          workspaceId: diskWorkspace.workspaceId,
-          revision: diskWorkspace.revision,
-        };
-        lastSavedWorkspaceRef.current = JSON.stringify(
-          localAtlasWorkspaceContent(diskWorkspace),
-        );
-        setSavedExplorations([...diskWorkspace.explorations]);
-        setHighlights(restoredHighlights);
-        setCoverageSelection(diskWorkspace.coverageSelection);
-        if (restoredExploration) {
-          stageExplorationPlan(restoredExploration, "hydrated");
-        } else {
-          setExplorationPlan(null);
-          setExplorationState(null);
-        }
-        setWorkspaceReady(true);
-        if (runtime.persistence.writable) {
-          setPersistenceState("saved");
-          setPersistenceMessage(
-            diskWorkspace.updatedAt
-              ? `Restaurado desde LuisA · rev. ${diskWorkspace.revision}`
-              : "Workspace de LuisA listo",
+          applyWorkspaceSnapshot(
+            diskWorkspace,
+            runtime.persistence.writable
+              ? diskWorkspace.updatedAt
+                ? `Sesión única restaurada desde LuisA · rev. ${diskWorkspace.revision}`
+                : "Sesión única de LuisA lista"
+              : "Restaurado desde LuisA · solo lectura",
+            runtime.persistence.writable,
           );
-        } else {
-          setPersistenceState("readonly");
-          setPersistenceMessage("Restaurado desde LuisA · solo lectura");
         }
         hydrationCompleted = true;
       } catch (error) {
         if (cancelled) return;
-        if (error instanceof LocalAtlasWorkspaceConflictError) {
-          const recovery = readBrowserWorkspaceRecovery({
-            includeOtherBranches: true,
-          });
-          if (recovery) {
-            const recoveredHighlights = readHighlightList(
-              recovery.content.highlights,
-              { discardInvalid: false },
-            );
-            if (recoveredHighlights) {
-              const recoveredActive = recovery.content.activeExplorationId
-                ? recovery.content.explorations.find(
-                    (item) =>
-                      item.id === recovery.content.activeExplorationId,
-                  )
-                : undefined;
-              const recoveredExploration = recoveredActive
-                ? explorationStateFromWorkspace(recoveredActive)
-                : null;
-              pendingWorkspaceWriteRef.current = null;
-              workspacePreconditionRef.current = null;
-              lastSavedWorkspaceRef.current = error.current
-                ? JSON.stringify(localAtlasWorkspaceContent(error.current))
-                : null;
-              workspaceContentRef.current = recovery.content;
-              workspaceConflictRef.current = true;
-              setSavedExplorations([...recovery.content.explorations]);
-              setHighlights(recoveredHighlights);
-              setCoverageSelection(recovery.content.coverageSelection);
-              if (recoveredExploration) {
-                stageExplorationPlan(recoveredExploration, "hydrated");
-              } else {
-                setExplorationPlan(null);
-                setExplorationState(null);
-              }
-              setWorkspaceReady(true);
-              setPersistenceState("conflict");
-              setPersistenceMessage(
-                "LuisA cambió durante la recuperación · tu copia local sigue intacta",
-              );
-              hydrationCompleted = true;
-              return;
-            }
-          }
-        }
         workspaceHydrationTokenRef.current = null;
         setWorkspaceReady(false);
         setPersistenceState("error");
@@ -2303,14 +1903,13 @@ export function MapViewer() {
   }, [
     coverageSelectionReady,
     explorationReady,
+    applyWorkspaceSnapshot,
     flushWorkspace,
     highlightsReady,
     runtimeMutationToken,
     runtimePersistenceConfigured,
     runtimePersistenceWritable,
     runtimeChecked,
-    stageExplorationPlan,
-    workspaceBranchReady,
   ]);
 
   useEffect(() => {
@@ -2339,7 +1938,6 @@ export function MapViewer() {
       !workspaceReady ||
       !runtimePersistenceConfigured ||
       !runtimePersistenceWritable ||
-      workspaceConflictRef.current ||
       JSON.stringify(workspaceContent) === lastSavedWorkspaceRef.current
     ) {
       return;
@@ -2350,7 +1948,7 @@ export function MapViewer() {
     workspaceSaveTimerRef.current = window.setTimeout(() => {
       workspaceSaveTimerRef.current = null;
       void flushWorkspace();
-    }, 650);
+    }, 300);
     return () => {
       if (workspaceSaveTimerRef.current !== null) {
         window.clearTimeout(workspaceSaveTimerRef.current);
@@ -3171,8 +2769,8 @@ export function MapViewer() {
         ...current,
         name:
           selection.cellCount === 1
-            ? `Sector global F${selection.minRow + 1} · C${selection.minColumn + 1}`
-            : `Selección global ${selection.rows}×${selection.columns}`,
+            ? `Sector F${selection.minRow + 1} · C${selection.minColumn + 1}`
+            : `Región ${selection.rows}×${selection.columns}`,
         minX: String(selection.bounds.minX),
         minZ: String(selection.bounds.minZ),
         maxXExclusive: String(selection.bounds.maxXExclusive),
@@ -3211,13 +2809,10 @@ export function MapViewer() {
 
   const fitAtlasView = useCallback(() => {
     const bounds = OVERWORLD_OVERVIEW_GRID_BOUNDS;
-    const mobile = viewSize.width <= 720;
-    const leftInset = mobile ? 18 : 456;
-    const rightInset = mobile ? 18 : 28;
-    const topInset = mobile ? 76 : 96;
-    const bottomInset = mobile
-      ? Math.min(430, viewSize.height * 0.46) + 126
-      : 72;
+    const leftInset = 550;
+    const rightInset = 28;
+    const topInset = 96;
+    const bottomInset = 72;
     const availableWidth = Math.max(
       120,
       viewSize.width - leftInset - rightInset,
@@ -3292,18 +2887,6 @@ export function MapViewer() {
 
   const startMaxDetailExploration = useCallback(
     (bounds: WorldBounds, name: string) => {
-      const knownExplorationIds = new Set(
-        savedExplorations.map((exploration) => exploration.id),
-      );
-      if (explorationState) {
-        knownExplorationIds.add(explorationState.region.id);
-      }
-      if (knownExplorationIds.size >= MAX_WORKSPACE_EXPLORATIONS) {
-        notify(
-          "El workspace alcanzó el límite de 128 sesiones; exporta una antes de crear otra",
-        );
-        return null;
-      }
       try {
         const next = createMaxDetailExplorationState({
           id: `region-${Date.now().toString(36)}`,
@@ -3313,7 +2896,7 @@ export function MapViewer() {
         stageExplorationPlan(next, "new");
         atlasReturnViewRef.current = null;
         notify(
-          `${next.region.cellCount.toLocaleString("es-GT")} celdas · comprobando descarga completa`,
+          `${next.region.cellCount.toLocaleString("es-GT")} celdas · calculando presupuesto regional`,
         );
         return next;
       } catch (error) {
@@ -3323,26 +2906,11 @@ export function MapViewer() {
         return null;
       }
     },
-    [
-      explorationState,
-      notify,
-      savedExplorations,
-      stageExplorationPlan,
-    ],
+    [notify, stageExplorationPlan],
   );
 
   const createMaxDetailVersionOfLegacy = useCallback(() => {
     if (!explorationState || activeExplorationIsMaxDetail) return;
-    const knownExplorationIds = new Set(
-      savedExplorations.map((exploration) => exploration.id),
-    );
-    knownExplorationIds.add(explorationState.region.id);
-    if (knownExplorationIds.size >= MAX_WORKSPACE_EXPLORATIONS) {
-      notify(
-        "El workspace alcanzó el límite de 128 sesiones; elimina o exporta una antes de crear la versión LOD 0",
-      );
-      return;
-    }
     try {
       const next = createMaxDetailExplorationState({
         id: `region-${Date.now().toString(36)}`,
@@ -3366,7 +2934,6 @@ export function MapViewer() {
     archiveExploration,
     explorationState,
     notify,
-    savedExplorations,
     stageExplorationPlan,
   ]);
 
@@ -3420,12 +2987,6 @@ export function MapViewer() {
       coverageStartRef.current = null;
       setCoveragePreview(null);
       pinStartRef.current = null;
-      if (
-        window.matchMedia("(max-width: 720px)").matches &&
-        !(mode === "coverage" && atlasMode)
-      ) {
-        setDrawer(null);
-      }
     },
     [atlasMode, closeAtlas],
   );
@@ -3778,7 +3339,7 @@ export function MapViewer() {
         return;
       }
       setAtlasFocusedCellIndex(cell.index);
-      notify(`${cell.id} seleccionado en la vista global`);
+      notify(`${cell.id} seleccionado en el mapa general`);
       return;
     }
     if (explorationState) {
@@ -4088,12 +3649,6 @@ export function MapViewer() {
         [...savedExplorations],
         explorationState,
       );
-      if (nextExplorations.length > MAX_WORKSPACE_EXPLORATIONS) {
-        notify(
-          "No se puede pausar: el workspace alcanzó el límite de 128 sesiones",
-        );
-        return;
-      }
       const nextContent: LocalAtlasWorkspaceContent = {
         ...workspaceContent,
         activeExplorationId: null,
@@ -4118,15 +3673,6 @@ export function MapViewer() {
           return;
         }
       }
-      try {
-        window.localStorage.setItem(
-          SAVED_EXPLORATIONS_STORAGE_KEY,
-          JSON.stringify(nextExplorations),
-        );
-        window.localStorage.removeItem(EXPLORATION_STORAGE_KEY);
-      } catch {
-        // The full recovery record or the completed disk write is already safe.
-      }
       setSavedExplorations(nextExplorations);
       workspaceContentRef.current = nextContent;
       explorationStateRef.current = null;
@@ -4136,7 +3682,7 @@ export function MapViewer() {
       notify(
         savedToDisk
           ? "Sesión pausada y guardada en LuisA"
-          : "Sesión pausada · copia de recuperación conservada",
+          : "No se pudo confirmar el guardado en LuisA",
       );
     } finally {
       setPauseBusy(false);
@@ -4164,20 +3710,6 @@ export function MapViewer() {
     if (!file) return;
     try {
       const next = deserializeExplorationState(await file.text());
-      const knownExplorationIds = new Set(
-        savedExplorations.map((exploration) => exploration.id),
-      );
-      if (explorationState) {
-        knownExplorationIds.add(explorationState.region.id);
-      }
-      if (
-        !knownExplorationIds.has(next.region.id) &&
-        knownExplorationIds.size >= MAX_WORKSPACE_EXPLORATIONS
-      ) {
-        throw new Error(
-          "El workspace alcanzó el límite de 128 sesiones; exporta una antes de importar otra",
-        );
-      }
       stageExplorationPlan(next, "imported");
       notify(
         `${next.reviewedCount.toLocaleString("es-GT")} celdas restauradas · verificando descarga regional`,
@@ -4195,7 +3727,7 @@ export function MapViewer() {
     try {
       const next = explorationStateFromWorkspace(exploration);
       stageExplorationPlan(next, "restored");
-      notify(`Verificando la descarga completa de “${next.region.name}”`);
+      notify(`Verificando los archivos locales de “${next.region.name}”`);
     } catch {
       notify("La sesión guardada ya no es compatible");
     }
@@ -4333,7 +3865,7 @@ export function MapViewer() {
   const drawerTitle = useMemo(
     () =>
       ({
-        atlas: "Atlas global",
+        atlas: "Mapa general",
         layers: "Capas del mapa",
         exploration: "Exploración regional",
         highlights: "Highlights",
@@ -4430,7 +3962,7 @@ export function MapViewer() {
           </div>
           <div className="coordinate-meta">
             <span>
-              {atlasMode ? "Vista global" : `Zoom ${formatMapZoom(scale)}×`}
+              {atlasMode ? "Vista general" : `Zoom ${formatMapZoom(scale)}×`}
             </span>
             <i />
             <span>{atlasMode ? atlasFocusedCell.id : `LOD ${lod}`}</span>
@@ -4466,11 +3998,6 @@ export function MapViewer() {
         <DockButton
           active={atlasMode}
           label="Atlas"
-          badge={
-            atlasProgress
-              ? Math.round(atlasProgress.percent)
-              : undefined
-          }
           onClick={() => toggleDrawer("atlas")}
         >
           <MapIcon />
@@ -4530,6 +4057,39 @@ export function MapViewer() {
             </button>
           </div>
 
+          {(drawer === "atlas" || drawer === "exploration") && (
+            <div className="atlas-flow" aria-label="Flujo de exploración">
+              <span
+                data-state={
+                  atlasMode
+                    ? "current"
+                    : explorationPlan || explorationState
+                      ? "complete"
+                      : "current"
+                }
+              >
+                <i>1</i>
+                Seleccionar
+              </span>
+              <span
+                data-state={
+                  explorationPlan
+                    ? "current"
+                    : explorationState
+                      ? "complete"
+                      : "pending"
+                }
+              >
+                <i>2</i>
+                Predescargar
+              </span>
+              <span data-state={explorationState ? "current" : "pending"}>
+                <i>3</i>
+                Explorar
+              </span>
+            </div>
+          )}
+
           {drawer === "atlas" && (
             <div className="drawer-content atlas-overview-panel">
               <section className="atlas-overview-hero">
@@ -4544,8 +4104,8 @@ export function MapViewer() {
                   <span className="coverage-overview-status">33 × 33</span>
                 </div>
                 <p>
-                  Elige una región, descárgala completa y después recórrela
-                  celda por celda con el detalle original LOD 0.
+                  Esta vista es solo para orientarte. Elige una región y sus
+                  tres capas se guardarán en LuisA antes de explorarla.
                 </p>
                 {explorationState ? (
                   <button
@@ -4563,22 +4123,14 @@ export function MapViewer() {
                 ) : null}
               </section>
 
-              <section className="atlas-detail-lock">
-                <LockKeyhole size={18} />
-                <span>
-                  <strong>Máximo detalle fijo</strong>
-                  <small>LOD 0 · 512 × 512 bloques por celda</small>
-                </span>
-                <span className="atlas-detail-badge">L0</span>
-              </section>
-
-              {coverageSelection ? (
+              {coverageSelection && !explorationPlan ? (
                 <section className="atlas-selection-summary">
                   <div>
                     <span>SELECCIÓN LISTA</span>
                     <strong>
                       {coverageSelection.rows} × {coverageSelection.columns} ·{" "}
-                      {selectedLod0CellCount.toLocaleString("es-GT")} celdas L0
+                      {selectedRegionFileBudget.toLocaleString("es-GT")}{" "}
+                      archivos
                     </strong>
                   </div>
                   <button
@@ -4594,8 +4146,8 @@ export function MapViewer() {
                       coverageSelectionTooLarge
                         ? "Reduce la región para mantener una descarga segura"
                         : coverageRegionStatus?.ready
-                          ? "Abrir la región ya descargada"
-                          : "Descargar las tres capas de toda la región"
+                          ? "Abrir la región ya guardada"
+                          : "Guardar esta región en LuisA"
                     }
                     onClick={startCoverageSelection}
                   >
@@ -4605,12 +4157,12 @@ export function MapViewer() {
                       <Download size={15} />
                     )}
                     {coverageRegionDownloadRunning
-                      ? "Descargando región…"
+                      ? "Guardando región…"
                       : coverageRegionStatus?.ready
                         ? "Explorar región"
                         : (coverageRegionStatus?.resolvedCount ?? 0) > 0
-                          ? "Reanudar descarga"
-                          : "Descargar región completa"}
+                          ? "Reanudar guardado"
+                          : "Guardar región"}
                   </button>
                   {coverageSelectionTooLarge ? (
                     <small className="atlas-selection-warning">
@@ -4639,30 +4191,18 @@ export function MapViewer() {
                 </section>
               ) : null}
 
-              <section className="atlas-progress-card">
+              <section className="atlas-progress-card atlas-availability-card">
                 <div className="atlas-progress-heading">
                   <div>
-                    <span>DESCARGA LOCAL · LOD 0</span>
-                    <strong>Overworld en máximo detalle</strong>
+                    <span>DISPONIBILIDAD REGIONAL · LOD 0</span>
+                    <strong>El mapa general no descarga archivos</strong>
                   </div>
-                  <strong>
-                    {atlasProgress
-                      ? `${formatProgressPercent(atlasProgress.percent)}%`
-                      : "—"}
-                  </strong>
+                  <span className="atlas-navigation-badge">NAVEGACIÓN</span>
                 </div>
-                {atlasProgress ? (
-                  <div
-                    className="atlas-progress-track"
-                    role="progressbar"
-                    aria-label="Cobertura local LOD 0"
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuenow={atlasProgress.percent}
-                  >
-                    <span style={{ width: `${atlasProgress.percent}%` }} />
-                  </div>
-                ) : null}
+                <p className="atlas-availability-copy">
+                  Los colores indican qué sectores ya tienen datos locales.
+                  Nada se descarga hasta que tú eliges una región.
+                </p>
                 {localCoverageState === "loading" ? (
                   <p className="atlas-progress-loading" role="status">
                     Leyendo la biblioteca local…
@@ -4678,17 +4218,17 @@ export function MapViewer() {
                       [
                         [
                           "complete",
-                          "Listas",
+                          "En LuisA",
                           atlasProgress?.completeSectorCount ?? 0,
                         ],
                         [
                           "in-progress",
-                          "En curso",
+                          "Parciales",
                           atlasProgress?.inProgressSectorCount ?? 0,
                         ],
                         [
                           "pending",
-                          "Por explorar",
+                          "Sin descarga",
                           atlasProgress?.pendingSectorCount ?? 0,
                         ],
                       ] as const
@@ -4717,12 +4257,6 @@ export function MapViewer() {
                   <p className="atlas-progress-stale" role="status">
                     Mostrando la última lectura válida; se reintentará
                     automáticamente.
-                  </p>
-                ) : null}
-                {(atlasProgress?.queuedCount ?? 0) > 0 ? (
-                  <p className="atlas-sector-note">
-                    {atlasProgress?.queuedCount.toLocaleString("es-GT")} tiles
-                    en cola o descargándose
                   </p>
                 ) : null}
                 {(atlasProgress?.failedCount ?? 0) > 0 ? (
@@ -4769,7 +4303,7 @@ export function MapViewer() {
                     }}
                   >
                     <Navigation size={15} />
-                    Ir al siguiente por explorar
+                    Elegir siguiente zona sin descarga
                   </button>
                 ) : null}
               </section>
@@ -4777,10 +4311,12 @@ export function MapViewer() {
               <section
                 className="atlas-sector-inspector"
                 id="atlas-sector-announcement"
-                aria-live="polite"
-                aria-atomic="true"
               >
-                <div className="atlas-sector-heading">
+                <div
+                  className="atlas-sector-heading"
+                  aria-live="polite"
+                  aria-atomic="true"
+                >
                   <Crosshair size={18} />
                   <div>
                     <span>SECTOR EN FOCO</span>
@@ -4794,8 +4330,8 @@ export function MapViewer() {
                       {atlasFocusedProgress.status === "complete"
                         ? "Completo"
                         : atlasFocusedProgress.status === "in-progress"
-                          ? "En curso"
-                          : "Pendiente"}
+                          ? "Parcial"
+                          : "Sin descarga"}
                     </span>
                   ) : (
                     <span
@@ -4824,7 +4360,7 @@ export function MapViewer() {
                     </strong>
                   </span>
                   <span>
-                    Descarga
+                    Disponible
                     <strong>
                       {atlasFocusedProgress
                         ? `${formatProgressPercent(
@@ -4839,7 +4375,7 @@ export function MapViewer() {
                     {atlasFocusedProgress?.queuedCount.toLocaleString(
                       "es-GT",
                     )}{" "}
-                    tiles en cola o descargándose
+                    archivos parciales detectados en este sector
                   </p>
                 ) : null}
                 {(atlasFocusedLocalCell?.failedCount ?? 0) > 0 ? (
@@ -5061,57 +4597,27 @@ export function MapViewer() {
 
           {drawer === "exploration" && (
             <div className="drawer-content exploration-panel">
-              <section className="atlas-launch-card">
+              {!explorationPlan && !explorationState ? (
+                <section className="atlas-launch-card">
                 <div className="atlas-launch-heading">
                   <MapIcon size={19} />
                   <div>
-                    <span>ATLAS GLOBAL · OVERWORLD</span>
-                    <strong>Ve lo terminado y lo que todavía falta</strong>
+                    <span>MAPA GENERAL · OVERWORLD</span>
+                    <strong>Tú decides qué región guardar</strong>
                   </div>
                   <span className="coverage-overview-status">33 × 33</span>
                 </div>
                 <p>
-                  Abre el mapa completo, selecciona una región y guarda sus tres
-                  capas antes de iniciar el recorrido en LOD 0.
+                  Úsalo para navegar y elegir una zona. Solo esa región se
+                  predescarga en LuisA y queda disponible en futuras
+                  ejecuciones.
                 </p>
-                {atlasProgress ? (
-                  <>
-                    <div className="atlas-launch-stats">
-                      <span>
-                        <strong>
-                          {atlasProgress.completeSectorCount}
-                        </strong>
-                        listas · L0
-                      </span>
-                      <span>
-                        <strong>
-                          {atlasProgress.inProgressSectorCount}
-                        </strong>
-                        en curso
-                      </span>
-                      <span>
-                        <strong>
-                          {atlasProgress.pendingSectorCount}
-                        </strong>
-                        por explorar
-                      </span>
-                    </div>
-                    {localCoverageError ? (
-                      <p className="atlas-launch-loading" role="status">
-                        Última lectura válida; reintentando automáticamente.
-                      </p>
-                    ) : null}
-                  </>
-                ) : localCoverageError ? (
+                {localCoverageError ? (
                   <p className="atlas-launch-loading" role="alert">
-                    No se pudo medir la biblioteca local. Se reintentará
-                    automáticamente.
+                    No se pudo leer la disponibilidad local. Puedes seguir
+                    navegando y se reintentará automáticamente.
                   </p>
-                ) : (
-                  <p className="atlas-launch-loading" role="status">
-                    Midiendo el detalle LOD 0 guardado en LuisA…
-                  </p>
-                )}
+                ) : null}
                 <button
                   type="button"
                   className="atlas-launch-button"
@@ -5120,14 +4626,16 @@ export function MapViewer() {
                   <Maximize2 size={16} />
                   Abrir mapa completo
                 </button>
-              </section>
+                </section>
+              ) : null}
 
-              <section
-                className={`coverage-selection-card ${
-                  coverageSelection ? "" : "is-empty"
-                }`}
-                data-active={coverageSelection ? "true" : "false"}
-              >
+              {!explorationPlan && !explorationState ? (
+                <section
+                  className={`coverage-selection-card ${
+                    coverageSelection ? "" : "is-empty"
+                  }`}
+                  data-active={coverageSelection ? "true" : "false"}
+                >
                 <div className="coverage-selection-heading">
                   <SquareMousePointer size={18} />
                   <div>
@@ -5148,27 +4656,19 @@ export function MapViewer() {
                   <>
                     <div className="coverage-selection-summary">
                       <span>
-                        Sectores
-                        <strong>{coverageSelection.cellCount}</strong>
-                      </span>
-                      <span>
-                        Filas L0
+                        Celdas L0
                         <strong>
-                          {Math.ceil(
-                            (coverageSelection.bounds.maxZExclusive -
-                              coverageSelection.bounds.minZ) /
-                              blocksPerTileAtLod(MAX_DETAIL_EXPLORATION_LOD),
-                          ).toLocaleString("es-GT")}
+                          {selectedLod0CellCount.toLocaleString("es-GT")}
                         </strong>
                       </span>
                       <span>
-                        Columnas L0
+                        Capas
+                        <strong>{REGIONAL_DOWNLOAD_LAYERS.length}</strong>
+                      </span>
+                      <span>
+                        Archivos
                         <strong>
-                          {Math.ceil(
-                            (coverageSelection.bounds.maxXExclusive -
-                              coverageSelection.bounds.minX) /
-                              blocksPerTileAtLod(MAX_DETAIL_EXPLORATION_LOD),
-                          ).toLocaleString("es-GT")}
+                          {selectedRegionFileBudget.toLocaleString("es-GT")}
                         </strong>
                       </span>
                     </div>
@@ -5198,8 +4698,8 @@ export function MapViewer() {
                           coverageSelectionTooLarge
                             ? "Reduce la selección para descargarla en LOD 0"
                             : coverageRegionStatus?.ready
-                              ? "Abrir la región ya descargada"
-                              : "Descargar las tres capas de toda la región"
+                              ? "Abrir la región ya guardada"
+                              : "Guardar esta región en LuisA"
                         }
                         onClick={startCoverageSelection}
                       >
@@ -5209,31 +4709,43 @@ export function MapViewer() {
                           <Download size={15} />
                         )}
                         {coverageRegionDownloadRunning
-                          ? "Descargando región…"
+                          ? "Guardando región…"
                           : coverageRegionStatus?.ready
                             ? "Explorar región"
                             : (coverageRegionStatus?.resolvedCount ?? 0) > 0
-                              ? "Reanudar descarga"
-                              : "Descargar región completa"}
+                              ? "Reanudar guardado"
+                              : "Guardar región en LuisA"}
                       </button>
                     </div>
-                    {explorationState && !coverageSelectionTooLarge ? (
-                      <p className="coverage-selection-hint">
-                        La sesión actual se guardará automáticamente.
-                      </p>
-                    ) : null}
                     {coverageSelectionTooLarge ? (
                       <p className="coverage-selection-warning" role="alert">
                         La región supera el máximo seguro de{" "}
                         {MAX_EXPLORATION_CELLS.toLocaleString("es-GT")} celdas.
                         Selecciona menos sectores.
                       </p>
+                    ) : regionStatusLoading && !coverageRegionStatus ? (
+                      <p className="coverage-selection-hint" role="status">
+                        Comprobando los archivos locales de esta región…
+                      </p>
+                    ) : coverageRegionBlockedByOther ? (
+                      <p className="coverage-selection-warning" role="status">
+                        Hay otra región descargándose. Puedes volver cuando
+                        termine o detenerla desde su gate.
+                      </p>
+                    ) : !localRuntime?.capacity.configured ? (
+                      <p className="coverage-selection-warning" role="alert">
+                        La biblioteca APFS de LuisA no está disponible.
+                      </p>
+                    ) : !coverageRegionStatus && regionStatusDisplayError ? (
+                      <p className="coverage-selection-warning" role="alert">
+                        {regionStatusDisplayError}
+                      </p>
                     ) : null}
                   </>
                 ) : (
                   <>
                     <p className="coverage-selection-hint">
-                      Elige un sector con un toque o arrastra varios sectores en
+                      Elige un sector con un clic o arrastra varios sectores en
                       el Atlas.
                     </p>
                     <button
@@ -5246,60 +4758,47 @@ export function MapViewer() {
                     </button>
                   </>
                 )}
-              </section>
+                </section>
+              ) : null}
 
-              <section className="saved-session-picker">
-                <div className="saved-session-picker-heading">
-                  <HardDrive size={18} />
-                  <div>
-                    <span>WORKSPACE DURABLE</span>
-                    <strong>Progreso, regiones y highlights</strong>
-                  </div>
-                  <span
-                    className="persistence-badge"
-                    data-state={persistenceState}
-                    title={persistenceMessage}
-                  >
-                    <strong>{persistenceMessage}</strong>
-                  </span>
-                </div>
+              {!explorationPlan && !explorationState ? (
+                <details className="saved-session-picker">
+                  <summary className="saved-session-picker-heading">
+                    <HardDrive size={18} />
+                    <div>
+                      <span>SESIÓN ÚNICA · LUISA</span>
+                      <strong>
+                        {orderedSavedExplorations[0]?.state.region.name ??
+                          "Sin sesión guardada"}
+                      </strong>
+                    </div>
+                    <span
+                      className="persistence-badge"
+                      data-state={persistenceState}
+                      title={persistenceMessage}
+                    >
+                      <strong>{persistenceLabel}</strong>
+                    </span>
+                  </summary>
+                  <p className="saved-session-persistence-copy">
+                    {persistenceMessage}
+                    {" · "}
+                    LuisA es la única fuente de verdad.
+                  </p>
                 <div className="saved-session-actions">
                   <button
                     type="button"
                     className="compact-button is-primary"
                     disabled={
                       persistenceState === "saving" ||
-                      persistenceState === "conflict" ||
                       !localRuntime?.persistence.configured ||
                       !localRuntime.persistence.writable
                     }
                     onClick={() => void flushWorkspace()}
                   >
                     <HardDrive size={14} />
-                    Guardar ahora
+                    Sincronizar ahora
                   </button>
-                  {persistenceState === "conflict" ? (
-                    <button
-                      type="button"
-                      className="compact-button"
-                      onClick={() => {
-                        if (
-                          !window.confirm(
-                            "Esto descartará la copia local en conflicto y cargará la versión guardada en LuisA. ¿Continuar?",
-                          )
-                        ) {
-                          return;
-                        }
-                        clearBrowserWorkspaceRecovery(
-                          workspaceContentRef.current ?? workspaceContent,
-                        );
-                        window.location.reload();
-                      }}
-                    >
-                      <RotateCcw size={14} />
-                      Usar versión de LuisA
-                    </button>
-                  ) : null}
                 </div>
                 {orderedSavedExplorations.length > 0 ? (
                   <div className="saved-session-list">
@@ -5387,238 +4886,78 @@ export function MapViewer() {
                   </div>
                 ) : (
                   <p className="saved-session-empty">
-                    Las regiones que inicies aparecerán aquí y permanecerán en
-                    LuisA aunque cierres el navegador.
+                    La primera región guardada se convertirá en tu sesión
+                    única y permanecerá en LuisA.
                   </p>
                 )}
-              </section>
+                </details>
+              ) : null}
 
-              <details className="exploration-storage-details">
-                <summary>
-                  <HardDrive size={17} />
-                  <span>
-                    <strong>Almacenamiento y capacidad</strong>
-                    <small>
-                      {localRuntime?.globalDownload?.status === "running"
-                        ? `Descarga global ${formatProgressPercent(
-                            localRuntime.globalDownload.progressPercent,
-                          )}% · ${
-                            localRuntime.globalDownload.tilesPerSecond === null
-                              ? "midiendo"
-                              : `${localRuntime.globalDownload.tilesPerSecond.toLocaleString(
-                                  "es-GT",
-                                  { maximumFractionDigits: 2 },
-                                )} tiles/s`
-                          }`
-                        : localRuntime?.capacity.fits === false
-                          ? "LuisA no conserva la reserva del plan global"
-                          : "Estado de LuisA y preflight global"}
-                    </small>
-                  </span>
-                </summary>
-                <section
-                  className={`capacity-card ${
-                    localRuntime?.capacity.fits === true
-                      ? "fits"
-                      : localRuntime?.capacity.fits === false
-                        ? "tight"
-                        : ""
-                  }`}
-                >
-                  <div className="capacity-heading">
-                    <HardDrive size={20} />
-                    <div>
-                      <span>CAPACIDAD LOCAL · LUISA</span>
-                      <strong>
-                        {localRuntime?.capacity.fits === true
-                          ? "Plan global actual: capacidad verificada"
-                          : localRuntime?.capacity.fits === false
-                            ? "Margen insuficiente para el plan global"
+              {!explorationPlan && !explorationState ? (
+                <details className="exploration-storage-details">
+                  <summary>
+                    <HardDrive size={17} />
+                    <span>
+                      <strong>Disco LuisA</strong>
+                      <small>
+                        {localRuntime?.capacity.configured
+                          ? `${formatBytes(localRuntime.capacity.freeBytes)} libres · solo regiones elegidas`
+                          : runtimeChecked
+                            ? "Biblioteca local no disponible"
+                            : "Comprobando almacenamiento…"}
+                      </small>
+                    </span>
+                  </summary>
+                  <section
+                    className={`capacity-card ${
+                      localRuntime?.capacity.configured ? "fits" : ""
+                    }`}
+                  >
+                    <div className="capacity-heading">
+                      <HardDrive size={20} />
+                      <div>
+                        <span>ALMACENAMIENTO REGIONAL · LUISA</span>
+                        <strong>
+                          {localRuntime?.capacity.configured
+                            ? "Destino listo para las regiones que elijas"
                             : runtimeChecked
-                              ? "Runtime local no configurado"
-                              : "Comprobando discos…"}
-                      </strong>
+                              ? "LuisA no está disponible"
+                              : "Comprobando disco…"}
+                        </strong>
+                      </div>
+                      {localRuntime?.capacity.configured && <CheckCircle2 />}
                     </div>
-                    {localRuntime?.capacity.fits === true && <CheckCircle2 />}
-                  </div>
-                  {localRuntime && (
-                    <div className="capacity-metrics">
-                      <span>
-                        Libre
-                        <strong>
-                          {formatBytes(localRuntime.capacity.freeBytes)}
-                        </strong>
-                      </span>
-                      <span>
-                        Plan + reserva
-                        <strong>
-                          {formatBytes(
-                            localRuntime.capacity.overworldRequirementBytes,
-                          )}
-                        </strong>
-                      </span>
-                      <span>
-                        Margen
-                        <strong>
-                          {formatSignedBytes(localRuntime.capacity.marginBytes)}
-                        </strong>
-                      </span>
-                    </div>
-                  )}
-                  {localRuntime?.globalDownload ? (
-                    <section
-                      className="global-download-progress-card"
-                      data-status={localRuntime.globalDownload.status}
-                    >
-                      <div className="global-download-progress-heading">
-                        <div>
-                          <span>DESCARGA GLOBAL · OVERWORLD</span>
-                          <strong>
-                            {localRuntime.globalDownload.scope.layers
-                              .map((layer) => layer.toUpperCase())
-                              .join(" + ")}
-                            {" · "}
-                            LOD{" "}
-                            {Math.max(
-                              ...localRuntime.globalDownload.scope.lods,
-                            )}
-                            →
-                            {Math.min(
-                              ...localRuntime.globalDownload.scope.lods,
-                            )}
-                          </strong>
-                        </div>
-                        <strong>
-                          {formatProgressPercent(
-                            localRuntime.globalDownload.progressPercent,
-                          )}
-                          %
-                        </strong>
-                      </div>
-                      <div
-                        className="global-download-progress-track"
-                        role="progressbar"
-                        aria-label="Progreso de la descarga global"
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={
-                          localRuntime.globalDownload.progressPercent
-                        }
-                      >
-                        <span
-                          style={{
-                            width: `${clamp(
-                              localRuntime.globalDownload.progressPercent,
-                              0,
-                              100,
-                            )}%`,
-                          }}
-                        />
-                      </div>
-                      <div className="global-download-progress-metrics">
+                    {localRuntime ? (
+                      <div className="capacity-metrics">
                         <span>
-                          Procesadas
+                          Libre
                           <strong>
-                            {localRuntime.globalDownload.processedRequests.toLocaleString(
-                              "es-GT",
-                            )}
-                            /
-                            {localRuntime.globalDownload.plannedRequests.toLocaleString(
-                              "es-GT",
-                            )}
+                            {formatBytes(localRuntime.capacity.freeBytes)}
                           </strong>
                         </span>
                         <span>
-                          WebP
+                          Atlas en disco
                           <strong>
-                            {localRuntime.globalDownload.completeTiles.toLocaleString(
-                              "es-GT",
+                            {formatBytes(localRuntime.capacity.archiveBytes)}
+                          </strong>
+                        </span>
+                        <span>
+                          Disponible
+                          <strong>
+                            {formatBytes(
+                              localRuntime.capacity.availableForAtlasBytes,
                             )}
-                          </strong>
-                        </span>
-                        <span>
-                          Ausentes
-                          <strong>
-                            {localRuntime.globalDownload.absentTiles.toLocaleString(
-                              "es-GT",
-                            )}
-                          </strong>
-                        </span>
-                        <span>
-                          Tiles/s
-                          <strong>
-                            {localRuntime.globalDownload.tilesPerSecond === null
-                              ? "—"
-                              : localRuntime.globalDownload.tilesPerSecond.toLocaleString(
-                                  "es-GT",
-                                  { maximumFractionDigits: 2 },
-                                )}
-                          </strong>
-                        </span>
-                        <span>
-                          MB/s
-                          <strong>
-                            {localRuntime.globalDownload
-                              .megabytesPerSecond === null
-                              ? "—"
-                              : localRuntime.globalDownload.megabytesPerSecond.toLocaleString(
-                                  "es-GT",
-                                  { maximumFractionDigits: 2 },
-                                )}
-                          </strong>
-                        </span>
-                        <span>
-                          ETA
-                          <strong>
-                            {formatEta(
-                              localRuntime.globalDownload.etaSeconds,
-                            )}
-                          </strong>
-                        </span>
-                        <span>
-                          Datos
-                          <strong>
-                            {formatBytes(localRuntime.globalDownload.dataBytes)}
-                          </strong>
-                        </span>
-                        <span>
-                          Pendientes
-                          <strong>
-                            {localRuntime.globalDownload.pendingTiles.toLocaleString(
-                              "es-GT",
-                            )}
-                          </strong>
-                        </span>
-                        <span>
-                          Problemas
-                          <strong>
-                            {(
-                              localRuntime.globalDownload.corruptTiles +
-                              localRuntime.globalDownload.failedTiles
-                            ).toLocaleString("es-GT")}
                           </strong>
                         </span>
                       </div>
-                      <p>
-                        {localRuntime.globalDownload.status === "running"
-                          ? "Descarga reanudable activa en segundo plano."
-                          : localRuntime.globalDownload.status ===
-                              "fallback_complete"
-                            ? "El tramo seguro terminó; el detalle restante espera capacidad."
-                            : "Último estado persistido de la descarga global."}
-                        {localRuntime.globalDownload.fallback
-                          ? " Este es el tramo que cabe con la reserva obligatoria."
-                          : ""}
-                      </p>
-                    </section>
-                  ) : null}
-                  <p>
-                    Usa el preflight global más reciente con su reserva
-                    obligatoria y el menor espacio libre entre el APFS de
-                    tiles y LuisA. No inicia una descarga total.
-                  </p>
-                </section>
-              </details>
+                    ) : null}
+                    <p>
+                      Cada selección verifica y guarda únicamente sus propios
+                      archivos. La vista general se conserva como navegación.
+                    </p>
+                  </section>
+                </details>
+              ) : null}
 
               {!explorationState ? (
                 <>
@@ -5630,7 +4969,8 @@ export function MapViewer() {
                           ? "ready"
                           : matchingRegionDownloadRunning
                             ? "running"
-                            : regionStatusDisplayError
+                            : regionStatusDisplayError ||
+                                matchingRegionDownloadError
                               ? "error"
                               : "pending"
                       }
@@ -5644,12 +4984,12 @@ export function MapViewer() {
                           )}
                         </span>
                         <div>
-                          <span>DESCARGA OBLIGATORIA · 3 CAPAS</span>
+                          <span>REGIÓN ELEGIDA · GUARDADO LOCAL</span>
                           <h3>{explorationPlan.state.region.name}</h3>
                         </div>
                         <strong>
-                          {regionStatus
-                            ? `${formatProgressPercent(regionStatus.percent)}%`
+                          {regionStatus || activeDownloadProgress
+                            ? `${formatProgressPercent(displayedRegionPercent)}%`
                             : "—"}
                         </strong>
                       </div>
@@ -5658,56 +4998,101 @@ export function MapViewer() {
                           ? "Comprobando cada archivo de la región…"
                           : regionStatusDisplayError
                             ? regionStatusDisplayError
+                            : matchingRegionDownloadError
+                              ? `${matchingRegionDownloadError}. Puedes reanudar sin perder lo ya guardado.`
                             : matchingRegionDownloadRunning
                               ? localRuntime?.job?.message ??
-                                "Descargando toda la región…"
+                                "Guardando esta región en LuisA…"
                               : regionStatus?.ready
-                                ? "La región completa está guardada. Ya puede abrirse."
-                                : "La exploración se habilita cuando toda el área queda resuelta localmente."}
+                                ? "La región está completa en LuisA y ya puede explorarse."
+                                : "Guarda las tres capas de esta zona para explorarla; el resultado persistirá entre ejecuciones."}
                       </p>
+                      <div className="region-download-budget">
+                        <span className="region-download-budget-title">
+                          PRESUPUESTO DE ESTA REGIÓN
+                        </span>
+                        <div className="region-download-budget-grid">
+                          <span>
+                            Celdas L0
+                            <strong>
+                              {explorationPlan.state.region.cellCount.toLocaleString(
+                                "es-GT",
+                              )}
+                            </strong>
+                          </span>
+                          <span>
+                            Capas
+                            <strong>
+                              {REGIONAL_DOWNLOAD_LAYERS.length}
+                            </strong>
+                          </span>
+                          <span>
+                            Archivos
+                            <strong>
+                              {plannedRegionFileBudget.toLocaleString("es-GT")}
+                            </strong>
+                          </span>
+                          <span>
+                            Pendientes
+                            <strong>
+                              {plannedRegionPendingFiles.toLocaleString(
+                                "es-GT",
+                              )}
+                            </strong>
+                          </span>
+                        </div>
+                      </div>
                       <div
                         className="region-download-progress"
                         role="progressbar"
-                        aria-label="Descarga completa de la región"
+                        aria-label="Progreso de la región elegida"
                         aria-valuemin={0}
                         aria-valuemax={100}
-                        aria-valuenow={regionStatus?.percent ?? 0}
+                        aria-valuenow={displayedRegionPercent}
                       >
                         <span
-                          style={{ width: `${regionStatus?.percent ?? 0}%` }}
+                          style={{ width: `${displayedRegionPercent}%` }}
                         />
                       </div>
-                      <div className="region-download-metrics">
-                        <span>
-                          Resueltos
-                          <strong>
-                            {regionStatus?.resolvedCount.toLocaleString(
-                              "es-GT",
-                            ) ?? "—"}
-                          </strong>
-                        </span>
-                        <span>
-                          Faltantes
-                          <strong>
-                            {regionStatus?.missingCount.toLocaleString(
-                              "es-GT",
-                            ) ?? "—"}
-                          </strong>
-                        </span>
-                        <span>
-                          Sin imagen
-                          <strong>
-                            {regionStatus?.absentCount.toLocaleString(
-                              "es-GT",
-                            ) ?? "—"}
-                          </strong>
-                        </span>
-                      </div>
+                      {matchingRegionDownloadRunning ? (
+                        <div className="region-download-metrics">
+                          <span>
+                            En disco
+                            <strong>
+                              {displayedRegionResolved !== undefined &&
+                              displayedRegionTotal !== undefined
+                                ? `${displayedRegionResolved.toLocaleString(
+                                    "es-GT",
+                                  )}/${displayedRegionTotal.toLocaleString(
+                                    "es-GT",
+                                  )}`
+                                : "—"}
+                            </strong>
+                          </span>
+                          <span>
+                            Velocidad
+                            <strong>
+                              {activeDownloadProgress?.networkTilesPerSecond ===
+                              undefined
+                                ? "—"
+                                : `${activeDownloadProgress.networkTilesPerSecond.toFixed(2)} tiles/s`}
+                            </strong>
+                          </span>
+                          <span>
+                            Tiempo restante
+                            <strong>
+                              {formatEta(activeDownloadProgress?.etaSeconds)}
+                            </strong>
+                          </span>
+                        </div>
+                      ) : null}
                       {activeDownloadProgress ? (
-                        <div
-                          className="region-download-metrics"
-                          aria-label="Métricas de descarga por red"
-                        >
+                        <details className="region-download-technical">
+                          <summary>Detalles técnicos de la descarga</summary>
+                          <div
+                            className="region-download-metrics"
+                            aria-label="Métricas de descarga por red"
+                          >
                           <span>
                             Velocidad de red
                             <strong>
@@ -5792,7 +5177,24 @@ export function MapViewer() {
                                   )}
                             </strong>
                           </span>
-                        </div>
+                          <span>
+                            Faltantes
+                            <strong>
+                              {regionStatus?.missingCount.toLocaleString(
+                                "es-GT",
+                              ) ?? "—"}
+                            </strong>
+                          </span>
+                          <span>
+                            Sin imagen
+                            <strong>
+                              {regionStatus?.absentCount.toLocaleString(
+                                "es-GT",
+                              ) ?? "—"}
+                            </strong>
+                          </span>
+                          </div>
+                        </details>
                       ) : null}
                       {downloadCooldownSeconds > 0 ? (
                         <p className="region-download-warning" role="status">
@@ -5808,10 +5210,40 @@ export function MapViewer() {
                           archivos fallaron; reanuda para volver a intentarlos.
                         </p>
                       ) : null}
+                      <div className="region-persistence-note">
+                        <HardDrive size={16} />
+                        <span>
+                          <strong>
+                            {localRuntime?.capacity.configured
+                              ? "Región persistente en LuisA"
+                              : "LuisA no está disponible"}
+                          </strong>
+                          <small>
+                            {localRuntime?.capacity.configured
+                              ? "Puedes cerrar el Atlas y continuar después sin repetir archivos válidos."
+                              : "Monta la biblioteca APFS antes de iniciar o reanudar la descarga."}
+                          </small>
+                        </span>
+                        <span
+                          className="persistence-badge"
+                          data-state={
+                            localRuntime?.capacity.configured
+                              ? "saved"
+                              : "offline"
+                          }
+                          title="Estado de la biblioteca regional"
+                        >
+                          <strong>
+                            {localRuntime?.capacity.configured
+                              ? "En disco"
+                              : "Sin disco"}
+                          </strong>
+                        </span>
+                      </div>
                       <label className="region-download-rate">
-                        <span>Perfil adaptativo</span>
+                        <span>Velocidad para esta región</span>
                         <select
-                          value={requestsPerSecond}
+                          value={effectiveRegionalRequestRate}
                           disabled={
                             matchingRegionDownloadRunning ||
                             anotherRegionDownloadRunning ||
@@ -5821,11 +5253,26 @@ export function MapViewer() {
                             setRequestsPerSecond(Number(event.target.value))
                           }
                         >
-                          <option value="0.5">Cauteloso · 0.5 req/s</option>
-                          <option value="2">Normal · 2 req/s</option>
-                          <option value="8">Rápido · 8 req/s</option>
-                          <option value="16">Turbo · 16 req/s</option>
+                          <option value="0.25">
+                            Mínimo · 0.25 req/s
+                          </option>
+                          <option value="0.5">
+                            Suave · 0.5 req/s
+                          </option>
+                          <option value="2">
+                            Normal · 2 req/s
+                          </option>
+                          <option value="8">
+                            Rápido · 8 req/s
+                          </option>
+                          <option value="16">
+                            Máximo · 16 req/s · recomendado
+                          </option>
                         </select>
+                        <small className="region-download-rate-note">
+                          Los {regionalRateLimit} req/s están dedicados a esta
+                          región. Puedes reducirlos manualmente si lo necesitas.
+                        </small>
                       </label>
                       {matchingRegionDownloadRunning ? (
                         <button
@@ -5860,8 +5307,8 @@ export function MapViewer() {
                             : regionStatus?.ready
                               ? "Explorar región"
                               : (regionStatus?.resolvedCount ?? 0) > 0
-                                ? "Reanudar descarga"
-                                : "Descargar región completa"}
+                                ? "Reanudar guardado"
+                                : "Guardar región en LuisA"}
                         </button>
                       )}
                       <button
@@ -5956,14 +5403,16 @@ export function MapViewer() {
                       </div>
                     </details>
                   )}
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => explorationImportRef.current?.click()}
-                  >
-                    <Upload size={16} />
-                    Importar sesión anterior
-                  </button>
+                  {!explorationPlan ? (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => explorationImportRef.current?.click()}
+                    >
+                      <Upload size={16} />
+                      Importar sesión anterior
+                    </button>
+                  ) : null}
                 </>
               ) : (
                 <>
@@ -6500,7 +5949,7 @@ export function MapViewer() {
               <div className="shortcut-list">
                 <Shortcut keys="Arrastrar" label="Mover el mapa" />
                 <Shortcut keys="Rueda / ±" label="Cambiar zoom" />
-                <Shortcut keys="0 / Home" label="Abrir Atlas global" />
+                <Shortcut keys="0 / Home" label="Abrir mapa general" />
                 <Shortcut keys="Flechas" label="Saltar entre celdas" />
                 <Shortcut keys="G" label="Ir a coordenadas" />
                 <Shortcut keys="E" label="Abrir exploración" />
@@ -6838,11 +6287,6 @@ function formatEta(value: number | null | undefined) {
   if (hours < 24) return `${hours}h ${minutes % 60}m`;
   const days = Math.floor(hours / 24);
   return `${days}d ${hours % 24}h`;
-}
-
-function formatSignedBytes(value: number | null) {
-  if (value === null) return "—";
-  return `${value >= 0 ? "+" : "−"}${formatBytes(Math.abs(value))}`;
 }
 
 function Metric({

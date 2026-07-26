@@ -65,9 +65,8 @@ export function resolveExplorationFocusView(
       MAX_EXPLORATION_SCALE,
     );
   } else {
-    const mobile = viewport.width <= 720;
-    const horizontalInset = mobile ? 96 : 500;
-    const verticalInset = mobile ? 220 : 160;
+    const horizontalInset = 540;
+    const verticalInset = 160;
     const availableWidth = Math.max(
       220,
       viewport.width - horizontalInset,

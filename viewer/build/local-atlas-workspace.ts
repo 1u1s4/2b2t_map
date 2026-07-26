@@ -24,14 +24,21 @@ import {
   parseCoverageSelection,
   type OverworldCoverageSelection,
 } from "../app/lib/overworld-coverage.ts";
+import { consolidateSingleWorkspaceContent } from "../app/lib/single-workspace-session.ts";
 
 export const ATLAS_WORKSPACE_SCHEMA_VERSION = 1 as const;
 export const MAX_ATLAS_WORKSPACE_BYTES = 16 * 1024 * 1024;
+/** Legacy v1 readers remain permissive so existing multi-session data migrates. */
 export const MAX_WORKSPACE_EXPLORATIONS = 128;
+export const MAX_CANONICAL_WORKSPACE_EXPLORATIONS = 1;
 export const MAX_WORKSPACE_HIGHLIGHTS = 10_000;
 export const ATLAS_WORKSPACE_RELATIVE_DIRECTORY = [
   "ObsidianAtlas",
   "state",
+] as const;
+export const ATLAS_WORKSPACE_BACKUP_RELATIVE_DIRECTORY = [
+  "ObsidianAtlas",
+  "backups",
 ] as const;
 export const ATLAS_WORKSPACE_FILENAME = "atlas-workspace.v1.json";
 
@@ -595,6 +602,7 @@ async function delay(milliseconds: number): Promise<void> {
 export class LocalAtlasWorkspaceStore {
   readonly backingRoot: string;
   readonly stateDirectory: string;
+  readonly migrationBackupDirectory: string;
   readonly workspacePath: string;
   readonly backupPath: string;
   readonly lockPath: string;
@@ -617,9 +625,19 @@ export class LocalAtlasWorkspaceStore {
       this.backingRoot,
       ...ATLAS_WORKSPACE_RELATIVE_DIRECTORY,
     );
+    this.migrationBackupDirectory = resolve(
+      this.backingRoot,
+      ...ATLAS_WORKSPACE_BACKUP_RELATIVE_DIRECTORY,
+    );
     if (!pathIsInside(this.backingRoot, this.stateDirectory)) {
       throw new AtlasWorkspaceError(
         "La ruta de estado sale de LuisA",
+        "UNSAFE_WORKSPACE_PATH",
+      );
+    }
+    if (!pathIsInside(this.backingRoot, this.migrationBackupDirectory)) {
+      throw new AtlasWorkspaceError(
+        "La ruta de respaldos sale de LuisA",
         "UNSAFE_WORKSPACE_PATH",
       );
     }
@@ -690,7 +708,19 @@ export class LocalAtlasWorkspaceStore {
         "INVALID_WORKSPACE",
       );
     }
-    const canonicalContent = parseAtlasWorkspaceContent(content);
+    const legacyContent = parseAtlasWorkspaceContent(content);
+    const canonicalContent = consolidateSingleWorkspaceContent(
+      legacyContent,
+    ) as AtlasWorkspaceContent;
+    if (
+      canonicalContent.explorations.length >
+      MAX_CANONICAL_WORKSPACE_EXPLORATIONS
+    ) {
+      throw new AtlasWorkspaceError(
+        "El workspace canónico admite una sola sesión",
+        "INVALID_WORKSPACE",
+      );
+    }
     const result = await this.enqueue(() =>
       this.withFileLock(async () => {
         const currentResult = await this.readUnderLock();
@@ -724,6 +754,19 @@ export class LocalAtlasWorkspaceStore {
             "El workspace agotó el rango seguro de revisiones",
             "WORKSPACE_UNAVAILABLE",
             { current },
+          );
+        }
+
+        if (
+          current.explorations.length >
+            MAX_CANONICAL_WORKSPACE_EXPLORATIONS ||
+          legacyContent.explorations.length >
+            MAX_CANONICAL_WORKSPACE_EXPLORATIONS
+        ) {
+          await this.archiveMultiSessionMigration(
+            current,
+            legacyContent,
+            canonicalContent,
           );
         }
 
@@ -804,6 +847,124 @@ export class LocalAtlasWorkspaceStore {
       throw new AtlasWorkspaceError(
         "La ruta de estado no pertenece a LuisA",
         "UNSAFE_WORKSPACE_PATH",
+      );
+    }
+  }
+
+  private async ensureMigrationBackupDirectory(): Promise<void> {
+    await this.ensureStateDirectory();
+    const atlasDirectory = resolve(this.backingRoot, "ObsidianAtlas");
+    for (const directory of [
+      atlasDirectory,
+      this.migrationBackupDirectory,
+    ]) {
+      try {
+        const metadata = await lstat(directory);
+        if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+          throw new AtlasWorkspaceError(
+            "La ruta de respaldos contiene un enlace o archivo inseguro",
+            "UNSAFE_WORKSPACE_PATH",
+          );
+        }
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+        try {
+          await mkdir(directory, { mode: 0o700 });
+        } catch (mkdirError) {
+          if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") {
+            throw mkdirError;
+          }
+        }
+      }
+    }
+    const backingRealPath = await realpath(this.backingRoot);
+    const backupRealPath = await realpath(this.migrationBackupDirectory);
+    if (!pathIsInside(backingRealPath, backupRealPath)) {
+      throw new AtlasWorkspaceError(
+        "La ruta de respaldos no pertenece a LuisA",
+        "UNSAFE_WORKSPACE_PATH",
+      );
+    }
+  }
+
+  private async writeMigrationArchiveFile(
+    directory: string,
+    name: string,
+    value: unknown,
+  ): Promise<void> {
+    const path = resolve(directory, name);
+    if (!pathIsInside(directory, path)) {
+      throw new AtlasWorkspaceError(
+        "La ruta del respaldo no es segura",
+        "UNSAFE_WORKSPACE_PATH",
+      );
+    }
+    const handle = await open(path, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async archiveMultiSessionMigration(
+    current: AtlasWorkspaceDocument,
+    incoming: AtlasWorkspaceContent,
+    canonical: AtlasWorkspaceContent,
+  ): Promise<void> {
+    try {
+      await this.ensureMigrationBackupDirectory();
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const archiveDirectory = resolve(
+        this.migrationBackupDirectory,
+        `single-session-${timestamp}-${randomUUID()}`,
+      );
+      if (
+        !pathIsInside(this.migrationBackupDirectory, archiveDirectory)
+      ) {
+        throw new AtlasWorkspaceError(
+          "La ruta del respaldo no es segura",
+          "UNSAFE_WORKSPACE_PATH",
+        );
+      }
+      await mkdir(archiveDirectory, { mode: 0o700 });
+      await this.writeMigrationArchiveFile(
+        archiveDirectory,
+        "workspace-before.json",
+        current,
+      );
+      await this.writeMigrationArchiveFile(
+        archiveDirectory,
+        "workspace-candidate.json",
+        incoming,
+      );
+      await this.writeMigrationArchiveFile(
+        archiveDirectory,
+        "manifest.json",
+        {
+          version: 1,
+          reason: "single-session-migration",
+          createdAt: new Date().toISOString(),
+          workspaceId: current.workspaceId,
+          revision: current.revision,
+          currentSessionCount: current.explorations.length,
+          candidateSessionCount: incoming.explorations.length,
+          selectedSessionId: canonical.activeExplorationId,
+        },
+      );
+      const directoryHandle = await open(archiveDirectory, "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+    } catch (error) {
+      if (error instanceof AtlasWorkspaceError) throw error;
+      throw new AtlasWorkspaceError(
+        "No se pudo respaldar el workspace antes de sanearlo",
+        "WORKSPACE_UNAVAILABLE",
+        { cause: error },
       );
     }
   }

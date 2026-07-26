@@ -129,6 +129,7 @@ export interface LocalGlobalDownloadProgress {
   readonly tilesPerSecond: number | null;
   readonly megabytesPerSecond: number | null;
   readonly etaSeconds: number | null;
+  readonly effectiveRequestsPerSecond: number | null;
   readonly updatedAt: string;
   readonly fallback: boolean;
   readonly scope: {
@@ -688,6 +689,10 @@ function readGlobalDownload(
       value.megabytesPerSecond < 0) ||
     !nullableNumber(value.etaSeconds) ||
     (value.etaSeconds !== null && value.etaSeconds < 0) ||
+    !nullableNumber(value.effectiveRequestsPerSecond) ||
+    (value.effectiveRequestsPerSecond !== null &&
+      (value.effectiveRequestsPerSecond < 0 ||
+        value.effectiveRequestsPerSecond > 16)) ||
     !canonicalTimestamp(value.updatedAt) ||
     typeof value.fallback !== "boolean" ||
     !Array.isArray(dimensions) ||
@@ -737,6 +742,7 @@ function readGlobalDownload(
     tilesPerSecond: value.tilesPerSecond,
     megabytesPerSecond: value.megabytesPerSecond,
     etaSeconds: value.etaSeconds,
+    effectiveRequestsPerSecond: value.effectiveRequestsPerSecond,
     updatedAt: value.updatedAt,
     fallback: value.fallback,
     scope: {
