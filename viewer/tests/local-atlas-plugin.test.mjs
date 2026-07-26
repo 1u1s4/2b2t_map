@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import {
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -56,6 +57,18 @@ test("local atlas accepts an aligned regional LOD 0 inventory and a bounded rate
     requestsPerSecond: 0.25,
   });
   assert.deepEqual(maximum.layers, ["base", "overlay", "newchunks"]);
+  assert.equal(
+    parseRegionDownloadRequest({
+      xMin: 0,
+      zMin: 0,
+      xMaxExclusive: 512,
+      zMaxExclusive: 512,
+      lod: 0,
+      layers: ["base"],
+      requestsPerSecond: 16,
+    }).requestsPerSecond,
+    16,
+  );
 });
 
 test("local atlas rejects non-LOD0, paths-by-proxy, unaligned, and unsafe bulk work", () => {
@@ -78,6 +91,7 @@ test("local atlas rejects non-LOD0, paths-by-proxy, unaligned, and unsafe bulk w
     { ...valid, layers: ["newchunks"] },
     { ...valid, layers: ["../../private"] },
     { ...valid, requestsPerSecond: 0 },
+    { ...valid, requestsPerSecond: 16.001 },
     {
       ...valid,
       xMaxExclusive: 512 * 1_025,
@@ -681,6 +695,20 @@ emit("summary", "complete", 1)
     downloadedBytes: 0,
     percent: 0,
     status: "running",
+    requestAttempts: 0,
+    elapsedSeconds: 0,
+    tilesPerSecond: 0,
+    bytesPerSecond: 0,
+    etaSeconds: null,
+    effectiveRps: 1,
+    targetRps: 1,
+    cooldownSeconds: 0,
+    cooldownUntil: null,
+    networkRequested: null,
+    networkProcessed: 0,
+    resolvedPerSecond: 0,
+    networkTilesPerSecond: 0,
+    achievedRps: 0,
   });
 
   let terminal;
@@ -707,6 +735,10 @@ emit("summary", "complete", 1)
     percent: 100,
     status: "complete",
   });
+  assert.deepEqual(
+    parseLocalAtlasRuntime(terminal.json)?.job?.progress,
+    terminal.json.job.progress,
+  );
 
   const regionStatus = createLocalAtlasMiddleware({ tileRoot });
   const durable = await invokeLocalMiddleware(
@@ -716,4 +748,182 @@ emit("summary", "complete", 1)
   regionStatus.close();
   assert.equal(durable.json.ready, false);
   assert.equal(durable.json.missingCount, 1);
+});
+
+test("regional profiles keep cached and network rates distinct while forwarding workers", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "atlas-job-profiles-"));
+  const tileRoot = join(root, "tiles");
+  const projectRoot = join(root, "project");
+  await mkdir(tileRoot, { recursive: true });
+  await mkdir(projectRoot, { recursive: true });
+  context.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+  await writeFile(
+    join(projectRoot, "download_region_2b2t.py"),
+    `
+import json
+import sys
+import time
+
+arguments = sys.argv[1:]
+target = float(arguments[arguments.index("--requests-per-second") + 1])
+with open("argv.jsonl", "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(arguments) + "\\n")
+
+def emit(event, status, processed, cooldown):
+    print(json.dumps({
+        "type": "region-download",
+        "version": 1,
+        "event": event,
+        "status": status,
+        "requested": 2,
+        "processed": processed,
+        "complete": processed,
+        "absent": 0,
+        "failed": 0,
+        "reused": 1 if processed else 0,
+        "reusedAbsent": 0,
+        "downloadedBytes": 0,
+        "interrupted": False,
+        "percent": processed * 50,
+        "stopReason": None,
+        "requestAttempts": 1 if processed else 0,
+        "elapsedSeconds": 0.1 + processed,
+        "tilesPerSecond": processed,
+        "bytesPerSecond": 0,
+        "etaSeconds": 1 if processed == 0 else None,
+        "effectiveRps": min(4, target),
+        "targetRps": target,
+        "cooldownSeconds": cooldown,
+        "networkRequested": 1,
+        "networkProcessed": 1 if processed else 0,
+        "resolvedPerSecond": processed,
+        "networkTilesPerSecond": 1 if processed else 0,
+        "achievedRps": 1 if processed else 0,
+    }), flush=True)
+
+emit("progress", "running", 0, 2)
+time.sleep(0.3)
+emit("summary", "complete", 2, 0)
+`,
+    "utf8",
+  );
+
+  const runtime = createLocalAtlasMiddleware({
+    tileRoot,
+    projectRoot,
+    pythonBin: "python3",
+  });
+  const initialStatus = await invokeLocalMiddleware(
+    runtime,
+    "/api/local-atlas/status",
+  );
+  const profiles = [
+    [0.5, "2"],
+    [2, "2"],
+    [8, "4"],
+    [16, "8"],
+  ];
+  let observedCooldown = false;
+  let observedCountdown = false;
+  let sampledDeadline = null;
+  let sampledRemaining = null;
+
+  for (const [requestsPerSecond] of profiles) {
+    const started = await invokeLocalMiddleware(
+      runtime,
+      "/api/local-atlas/download",
+      {
+        method: "POST",
+        headers: {
+          "x-atlas-token": initialStatus.json.mutationToken,
+        },
+        json: {
+          xMin: 0,
+          zMin: 0,
+          xMaxExclusive: 512,
+          zMaxExclusive: 512,
+          lod: 0,
+          layers: ["base", "overlay"],
+          requestsPerSecond,
+        },
+      },
+    );
+    assert.equal(started.status, 202);
+
+    let terminal;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      await delay(10);
+      const status = await invokeLocalMiddleware(
+        runtime,
+        "/api/local-atlas/status",
+      );
+      const cooldownUntil = status.json.job?.progress?.cooldownUntil;
+      if (!observedCooldown && typeof cooldownUntil === "string") {
+        observedCooldown = true;
+        const deadline = Date.parse(cooldownUntil);
+        assert.ok(deadline > Date.now());
+        assert.ok(deadline <= Date.now() + 2_500);
+        const parsedProgress =
+          parseLocalAtlasRuntime(status.json)?.job?.progress;
+        assert.equal(
+          parsedProgress?.cooldownUntil,
+          cooldownUntil,
+        );
+        assert.equal(parsedProgress?.networkRequested, 1);
+        assert.equal(parsedProgress?.networkProcessed, 0);
+        assert.equal(parsedProgress?.networkTilesPerSecond, 0);
+        assert.equal(parsedProgress?.achievedRps, 0);
+      }
+      if (
+        typeof cooldownUntil === "string" &&
+        typeof status.json.job?.progress?.cooldownSeconds === "number"
+      ) {
+        const remaining = status.json.job.progress.cooldownSeconds;
+        if (
+          sampledDeadline === cooldownUntil &&
+          sampledRemaining !== null &&
+          remaining < sampledRemaining
+        ) {
+          observedCountdown = true;
+        }
+        sampledDeadline = cooldownUntil;
+        sampledRemaining = remaining;
+      }
+      if (status.json.job?.status === "complete") {
+        terminal = status;
+        break;
+      }
+    }
+    assert.equal(terminal?.json.job.status, "complete");
+    assert.equal(terminal?.json.job.progress.networkProcessed, 1);
+    assert.equal(terminal?.json.job.progress.tilesPerSecond, 2);
+    assert.equal(terminal?.json.job.progress.resolvedPerSecond, 2);
+    assert.equal(terminal?.json.job.progress.networkTilesPerSecond, 1);
+    assert.equal(terminal?.json.job.progress.achievedRps, 1);
+  }
+  runtime.close();
+
+  assert.equal(observedCooldown, true);
+  assert.equal(observedCountdown, true);
+  const invocations = (await readFile(
+    join(projectRoot, "argv.jsonl"),
+    "utf8",
+  ))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(invocations.length, profiles.length);
+  for (const [index, [requestsPerSecond, workers]] of profiles.entries()) {
+    const argumentsList = invocations[index];
+    assert.equal(
+      argumentsList[argumentsList.indexOf("--requests-per-second") + 1],
+      String(requestsPerSecond),
+    );
+    assert.equal(
+      argumentsList[argumentsList.indexOf("--workers") + 1],
+      workers,
+    );
+  }
 });

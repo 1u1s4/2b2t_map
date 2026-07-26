@@ -41,6 +41,17 @@ OBSIDIAN_ATLAS_VIEWER_PORT=3100 ./start_local_atlas_luisa.sh
 
 Node.js debe ser `>=22.13.0`.
 
+Con la biblioteca del repositorio en `../2b2t_tiles`, basta ejecutar:
+
+```bash
+cd viewer
+npm run dev -- --hostname localhost --port 3001
+```
+
+El modo de desarrollo detecta esa carpeta automáticamente y mantiene el
+workspace dentro de la misma raíz ignorada por Git. Para usar otra biblioteca
+o el volumen LuisA explícitamente:
+
 ```bash
 cd viewer
 OBSIDIAN_ATLAS_TILE_ROOT='/Volumes/2b2t Tiles/2b2t_tiles' \
@@ -163,7 +174,7 @@ tamaño LOD 0 antes de iniciar y pide reducir una selección que supere el máxi
 La tarjeta previa a la exploración ofrece:
 
 ```text
-0.25 req/s · 0.5 req/s · 1 req/s · 2 req/s
+Cauteloso 0.5 req/s · Normal 2 req/s · Rápido 8 req/s · Turbo 16 req/s
 ```
 
 **Descargar región completa** envía al runtime:
@@ -172,7 +183,10 @@ La tarjeta previa a la exploración ofrece:
 - Overworld;
 - LOD 0 para toda sesión nueva;
 - las tres capas `base`, `overlay` y `newchunks`;
-- ritmo elegido.
+- techo de ritmo elegido, con arranque gradual y reducción automática;
+- workers derivados del perfil: 2, 4 u 8;
+- cooldown global para `Retry-After`, visible junto con RPS logradas, setpoint,
+  tiles de red por segundo, MiB/s y ETA de red.
 
 El runtime ejecuta `../download_region_2b2t.py`, permite un trabajo a la vez,
 limita la región a 1,048,576 celdas espaciales y realiza un preflight de lo que
@@ -329,7 +343,7 @@ Protecciones:
 - descarga regional únicamente en Overworld LOD 0;
 - capas permitidas por lista cerrada;
 - límites alineados a tiles;
-- ritmo `0.25..2 req/s`;
+- ritmo adaptativo `0.25..16 req/s`;
 - rutas e intérprete definidos por el proceso, nunca por el navegador;
 - un solo trabajo regional activo.
 

@@ -9,6 +9,9 @@ import {
 } from "./overworld-coverage.ts";
 
 export const LOCAL_ATLAS_WORKSPACE_SCHEMA_VERSION = 1 as const;
+const MAX_REGION_REQUESTS_PER_SECOND = 16;
+const MAX_REGION_COOLDOWN_SECONDS = 15 * 60;
+const RATE_METRIC_TOLERANCE = 0.001;
 const LOCAL_ATLAS_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -63,6 +66,20 @@ export interface LocalRegionJobProgress {
   readonly downloadedBytes: number;
   readonly percent: number;
   readonly status: "running" | "complete" | "error" | "interrupted";
+  readonly requestAttempts?: number;
+  readonly elapsedSeconds?: number;
+  readonly tilesPerSecond?: number;
+  readonly bytesPerSecond?: number;
+  readonly etaSeconds?: number | null;
+  readonly effectiveRps?: number;
+  readonly targetRps?: number;
+  readonly cooldownSeconds?: number;
+  readonly cooldownUntil?: string | null;
+  readonly networkRequested?: number | null;
+  readonly networkProcessed?: number;
+  readonly resolvedPerSecond?: number;
+  readonly networkTilesPerSecond?: number;
+  readonly achievedRps?: number;
 }
 
 export type LocalAtlasTileLayer = "base" | "overlay" | "newchunks";
@@ -398,7 +415,7 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
       typeof value.request.requestsPerSecond !== "number" ||
       !Number.isFinite(value.request.requestsPerSecond) ||
       value.request.requestsPerSecond < 0.25 ||
-      value.request.requestsPerSecond > 2
+      value.request.requestsPerSecond > MAX_REGION_REQUESTS_PER_SECOND
     ) {
       return undefined;
     }
@@ -442,6 +459,95 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
     ) {
       return undefined;
     }
+    const optionalFiniteMetrics = [
+      "elapsedSeconds",
+      "tilesPerSecond",
+      "bytesPerSecond",
+    ] as const;
+    const effectiveRps = value.progress.effectiveRps;
+    const targetRps = value.progress.targetRps;
+    const cooldownSeconds = value.progress.cooldownSeconds;
+    const expectedTargetRps = request?.requestsPerSecond;
+    const networkRequested = value.progress.networkRequested;
+    const networkProcessed = value.progress.networkProcessed;
+    const resolvedPerSecond = value.progress.resolvedPerSecond;
+    const networkTilesPerSecond = value.progress.networkTilesPerSecond;
+    const achievedRps = value.progress.achievedRps;
+    if (
+      (value.progress.requestAttempts !== undefined &&
+        !nonNegativeSafeInteger(value.progress.requestAttempts)) ||
+      optionalFiniteMetrics.some((key) => {
+        const metric = value.progress[key];
+        return (
+          metric !== undefined &&
+          (typeof metric !== "number" ||
+            !Number.isFinite(metric) ||
+            metric < 0)
+        );
+      }) ||
+      (targetRps !== undefined &&
+        (typeof targetRps !== "number" ||
+          !Number.isFinite(targetRps) ||
+          targetRps < 0.25 ||
+          targetRps > MAX_REGION_REQUESTS_PER_SECOND ||
+          (expectedTargetRps !== undefined &&
+            Math.abs(targetRps - expectedTargetRps) >
+              RATE_METRIC_TOLERANCE))) ||
+      (effectiveRps !== undefined &&
+        (typeof effectiveRps !== "number" ||
+          !Number.isFinite(effectiveRps) ||
+          effectiveRps < 0 ||
+          effectiveRps > MAX_REGION_REQUESTS_PER_SECOND ||
+          effectiveRps >
+            (targetRps ??
+              expectedTargetRps ??
+              MAX_REGION_REQUESTS_PER_SECOND) +
+              RATE_METRIC_TOLERANCE)) ||
+      (cooldownSeconds !== undefined &&
+        (typeof cooldownSeconds !== "number" ||
+          !Number.isFinite(cooldownSeconds) ||
+          cooldownSeconds < 0 ||
+          cooldownSeconds > MAX_REGION_COOLDOWN_SECONDS)) ||
+      (value.progress.cooldownUntil !== undefined &&
+        value.progress.cooldownUntil !== null &&
+        !canonicalTimestamp(value.progress.cooldownUntil)) ||
+      (networkRequested !== undefined &&
+        networkRequested !== null &&
+        (!nonNegativeSafeInteger(networkRequested) ||
+          networkRequested > value.progress.requested)) ||
+      (networkProcessed !== undefined &&
+        (!nonNegativeSafeInteger(networkProcessed) ||
+          networkProcessed > value.progress.processed ||
+          (typeof networkRequested === "number" &&
+            networkProcessed > networkRequested))) ||
+      [resolvedPerSecond, networkTilesPerSecond, achievedRps].some(
+        (metric) =>
+          metric !== undefined &&
+          (typeof metric !== "number" ||
+            !Number.isFinite(metric) ||
+            metric < 0 ||
+            metric > Number.MAX_SAFE_INTEGER),
+      ) ||
+      (value.progress.tilesPerSecond !== undefined &&
+        resolvedPerSecond !== undefined &&
+        Math.abs(
+          value.progress.tilesPerSecond - resolvedPerSecond,
+        ) > RATE_METRIC_TOLERANCE) ||
+      (resolvedPerSecond !== undefined &&
+        networkTilesPerSecond !== undefined &&
+        networkTilesPerSecond >
+          resolvedPerSecond + RATE_METRIC_TOLERANCE) ||
+      (achievedRps !== undefined &&
+        networkTilesPerSecond !== undefined &&
+        networkTilesPerSecond > achievedRps + RATE_METRIC_TOLERANCE) ||
+      (value.progress.etaSeconds !== undefined &&
+        value.progress.etaSeconds !== null &&
+        (typeof value.progress.etaSeconds !== "number" ||
+          !Number.isFinite(value.progress.etaSeconds) ||
+          value.progress.etaSeconds < 0))
+    ) {
+      return undefined;
+    }
     progress = {
       requested: value.progress.requested,
       processed: value.progress.processed,
@@ -453,6 +559,48 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
       downloadedBytes: value.progress.downloadedBytes,
       percent: value.progress.percent,
       status: value.progress.status,
+      ...(value.progress.requestAttempts !== undefined
+        ? { requestAttempts: value.progress.requestAttempts }
+        : {}),
+      ...(value.progress.elapsedSeconds !== undefined
+        ? { elapsedSeconds: value.progress.elapsedSeconds }
+        : {}),
+      ...(value.progress.tilesPerSecond !== undefined
+        ? { tilesPerSecond: value.progress.tilesPerSecond }
+        : {}),
+      ...(value.progress.bytesPerSecond !== undefined
+        ? { bytesPerSecond: value.progress.bytesPerSecond }
+        : {}),
+      ...(value.progress.etaSeconds !== undefined
+        ? { etaSeconds: value.progress.etaSeconds }
+        : {}),
+      ...(value.progress.effectiveRps !== undefined
+        ? { effectiveRps: value.progress.effectiveRps }
+        : {}),
+      ...(value.progress.targetRps !== undefined
+        ? { targetRps: value.progress.targetRps }
+        : {}),
+      ...(value.progress.cooldownSeconds !== undefined
+        ? { cooldownSeconds: value.progress.cooldownSeconds }
+        : {}),
+      ...(value.progress.cooldownUntil !== undefined
+        ? { cooldownUntil: value.progress.cooldownUntil }
+        : {}),
+      ...(value.progress.networkRequested !== undefined
+        ? { networkRequested: value.progress.networkRequested }
+        : {}),
+      ...(value.progress.networkProcessed !== undefined
+        ? { networkProcessed: value.progress.networkProcessed }
+        : {}),
+      ...(value.progress.resolvedPerSecond !== undefined
+        ? { resolvedPerSecond: value.progress.resolvedPerSecond }
+        : {}),
+      ...(value.progress.networkTilesPerSecond !== undefined
+        ? { networkTilesPerSecond: value.progress.networkTilesPerSecond }
+        : {}),
+      ...(value.progress.achievedRps !== undefined
+        ? { achievedRps: value.progress.achievedRps }
+        : {}),
     };
   }
   return {

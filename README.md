@@ -41,7 +41,7 @@ La versión actual admite únicamente **Overworld**.
 - revisión automática de cada celda al entrar o desplazarse a ella;
 - ausencias `404` persistentes y omitidas automáticamente, separadas de las
   celdas revisadas;
-- descarga regional reanudable entre `0.25` y `2 req/s`;
+- descarga regional reanudable y adaptativa entre `0.25` y `16 req/s`;
 - capas `base`, `overlay` y `newchunks`;
 - puntos y áreas con nombre, color y notas privadas;
 - lectura exclusiva de la biblioteca local;
@@ -198,18 +198,26 @@ biblioteca actual, su SQLite y los WebP existentes permanecen en su lugar.
 
 ## Descargar una región desde la interfaz
 
-La UI ofrece cuatro ritmos:
+La UI ofrece cuatro perfiles:
 
 ```text
-0.25 req/s · 0.5 req/s · 1 req/s · 2 req/s
+Cauteloso 0.5 req/s · Normal 2 req/s · Rápido 8 req/s · Turbo 16 req/s
 ```
 
 La descarga obligatoria incluye `base`, `overlay` y `newchunks` para todos los
 tiles LOD 0 de los límites seleccionados. El runtime permite un trabajo
 regional a la vez, calcula lo que realmente falta, valida espacio con margen y
-publica progreso durable desde SQLite. **Detener descarga** termina las
-solicitudes activas de forma segura; repetirla reanuda sin volver a pedir WebP
-válidos ni `404` conocidos.
+publica resolución total, velocidad real de red, RPS logradas, setpoint,
+transferencia y ETA del trabajo pendiente. Los perfiles rápidos arrancan a un
+ritmo moderado y recuperan gradualmente hasta su objetivo. Un `429` o `403`
+reduce el ritmo; `Retry-After` pausa globalmente a todos los workers.
+**Detener descarga** termina el streaming activo, guarda el lote SQLite y
+permite reanudar sin volver a pedir WebP válidos ni `404` conocidos.
+
+Turbo usa ocho workers y un techo global de 16 solicitudes por segundo. No usa
+Tor, proxies rotatorios ni cambios de IP para esquivar protecciones; la
+velocidad se obtiene con conexiones persistentes, paralelismo acotado y control
+adaptativo.
 
 ## CLI regional
 
@@ -228,8 +236,8 @@ python download_region_2b2t.py \
   --lod 0 \
   --layers base,overlay,newchunks \
   --out '/Volumes/2b2t Tiles/2b2t_tiles' \
-  --workers 1 \
-  --requests-per-second 1 \
+  --workers 8 \
+  --requests-per-second 16 \
   --max-tiles 3
 ```
 
@@ -277,14 +285,19 @@ Opciones importantes:
 | `--center-x`, `--center-z`, `--width`, `--height` | modo alternativo por centro |
 | `--lod 0..10` | resolución de los tiles |
 | `--layers CSV` | capas solicitadas |
-| `--requests-per-second` | ritmo global del trabajo |
+| `--workers 1..8` | transferencias simultáneas para ocultar latencia |
+| `--requests-per-second 0.25..16` | techo global; comienza como máximo en 4 y se recupera gradualmente |
 | `--max-tiles` | rechazo preventivo de inventarios inesperados |
 | `--compose` | mosaico PNG o WebP |
 | `--show-coordinates` | cuadrícula y etiquetas en el mosaico |
 
-El directorio de salida posee un bloqueo regional. `Ctrl+C` espera las
-solicitudes activas y conserva lo obtenido; repetir el mismo comando reutiliza
-los tiles válidos.
+El directorio de salida posee un bloqueo regional. Los resultados se confirman
+en lotes de hasta 32 tiles o un segundo, manteniendo `synchronous=FULL` y
+forzando el commit final. `Ctrl+C` corta el streaming, cierra las conexiones y
+conserva lo obtenido; repetir el mismo comando reutiliza los tiles válidos.
+En una reanudación, un archivo cuyo tamaño y SHA-256 coinciden con el catálogo
+validado evita una segunda decodificación WebP; cualquier diferencia se pone
+en cuarentena y vuelve a descargarse.
 
 Consulta todas las opciones con:
 
@@ -352,6 +365,11 @@ Su exportación crea
 ## Variables locales
 
 Para ejecutar `npm run dev` manualmente desde `viewer/`:
+
+Si existe `../2b2t_tiles`, el modo de desarrollo la detecta
+automáticamente y usa esa misma raíz para el workspace local. Las variables
+siguientes solo son necesarias para elegir otra biblioteca o conservar el
+workspace en otro volumen.
 
 | Variable | Uso |
 | --- | --- |

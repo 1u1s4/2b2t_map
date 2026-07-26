@@ -206,7 +206,13 @@ type TileStats = {
 
 type ExplorationPlan = {
   readonly state: ExplorationState;
-  readonly source: "new" | "restored" | "imported" | "legacy";
+  readonly source:
+    | "new"
+    | "restored"
+    | "hydrated"
+    | "imported"
+    | "legacy";
+  readonly reveal: boolean;
 };
 
 type RegionStatusSnapshot = {
@@ -757,7 +763,7 @@ export function MapViewer() {
   const [scale, setScale] = useState(INITIAL_SCALE);
   const [viewSize, setViewSize] = useState(INITIAL_VIEW_SIZE);
   const [cursor, setCursor] = useState<Camera>(INITIAL_CAMERA);
-  const [drawer, setDrawer] = useState<Drawer>(null);
+  const [drawer, setDrawer] = useState<Drawer>("atlas");
   const [atlasStatusFilter, setAtlasStatusFilter] =
     useState<AtlasStatusFilter>("all");
   const [atlasFocusedCellIndex, setAtlasFocusedCellIndex] = useState(
@@ -843,10 +849,11 @@ export function MapViewer() {
     maxXExclusive: "-84000",
     maxZExclusive: "169000",
   });
-  const [requestsPerSecond, setRequestsPerSecond] = useState(1);
+  const [requestsPerSecond, setRequestsPerSecond] = useState(16);
   const [localRuntime, setLocalRuntime] =
     useState<LocalAtlasRuntime | null>(null);
   const [runtimeChecked, setRuntimeChecked] = useState(false);
+  const [downloadClockMs, setDownloadClockMs] = useState(0);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const [workspaceBranchReady, setWorkspaceBranchReady] = useState(false);
   const [workspaceReady, setWorkspaceReady] = useState(false);
@@ -931,6 +938,20 @@ export function MapViewer() {
         regionStatusBounds &&
         regionJobMatchesBounds(localRuntime?.job ?? null, regionStatusBounds),
     );
+  const matchingRegionDownloadJob = Boolean(
+    regionStatusBounds &&
+      regionJobMatchesBounds(localRuntime?.job ?? null, regionStatusBounds),
+  );
+  const activeDownloadProgress = matchingRegionDownloadJob
+    ? localRuntime?.job?.progress
+    : undefined;
+  const downloadCooldownUntilMs = activeDownloadProgress?.cooldownUntil
+    ? Date.parse(activeDownloadProgress.cooldownUntil)
+    : null;
+  const downloadCooldownSeconds =
+    downloadCooldownUntilMs !== null && downloadClockMs > 0
+      ? Math.max(0, (downloadCooldownUntilMs - downloadClockMs) / 1_000)
+      : (activeDownloadProgress?.cooldownSeconds ?? 0);
   const anotherRegionDownloadRunning =
     anyRegionDownloadRunning && !matchingRegionDownloadRunning;
   const coverageRegionKey = coverageSelection
@@ -955,6 +976,27 @@ export function MapViewer() {
   const reviewableCellCount = explorationState
     ? explorationState.region.cellCount - explorationState.skippedCount
     : 0;
+
+  useEffect(() => {
+    if (downloadCooldownUntilMs === null) return;
+    let interval: number | null = null;
+    const updateClock = () => {
+      const now = Date.now();
+      setDownloadClockMs(now);
+      if (now >= downloadCooldownUntilMs && interval !== null) {
+        window.clearInterval(interval);
+        interval = null;
+      }
+    };
+    const initialTick = window.setTimeout(updateClock, 0);
+    if (downloadCooldownUntilMs > Date.now()) {
+      interval = window.setInterval(updateClock, 1_000);
+    }
+    return () => {
+      window.clearTimeout(initialTick);
+      if (interval !== null) window.clearInterval(interval);
+    };
+  }, [downloadCooldownUntilMs]);
   const explorationPercent = explorationState
     ? reviewableCellCount === 0
       ? 100
@@ -1255,6 +1297,7 @@ export function MapViewer() {
           requestedState.region.lod === MAX_DETAIL_EXPLORATION_LOD
             ? source
             : "legacy",
+        reveal: source !== "hydrated",
       });
       setRegionStatusSnapshot(null);
       setRegionStatusError(null);
@@ -1262,9 +1305,11 @@ export function MapViewer() {
       setMarkMode(null);
       clearTileCache();
       setDrawer(
-        window.matchMedia("(max-width: 720px)").matches
-          ? null
-          : "exploration",
+        source === "hydrated"
+          ? "atlas"
+          : window.matchMedia("(max-width: 720px)").matches
+            ? null
+            : "exploration",
       );
     },
     [clearTileCache],
@@ -1290,11 +1335,15 @@ export function MapViewer() {
       setRegionStatusSnapshot(null);
       setRegionStatusError(null);
       clearTileCache();
-      focusExploration(next);
+      if (plan.reveal) {
+        focusExploration(next);
+      }
       setDrawer(
-        window.matchMedia("(max-width: 720px)").matches
-          ? null
-          : "exploration",
+        plan.reveal
+          ? window.matchMedia("(max-width: 720px)").matches
+            ? null
+            : "exploration"
+          : "atlas",
       );
       notify(
         `${next.region.name} lista · la primera celda quedó explorada`,
@@ -1409,44 +1458,18 @@ export function MapViewer() {
         const stored = window.localStorage.getItem(EXPLORATION_STORAGE_KEY);
         if (stored) {
           restoredExploration = deserializeExplorationState(stored);
-          stageExplorationPlan(restoredExploration, "restored");
+          stageExplorationPlan(restoredExploration, "hydrated");
         }
       } catch {
         // Invalid or obsolete sessions are ignored instead of blocking the map.
       }
       setExplorationReady(true);
 
-      if (restoredExploration) {
-        const cell = cellForIndex(
-          restoredExploration.region,
-          restoredExploration.currentIndex,
-        );
-        const restoredScale = clamp(
-          restoredExploration.region.scale,
-          minimumSafeExplorationScale(
-            restoredExploration.region.tileSpan,
-            INITIAL_VIEW_SIZE,
-          ),
-          MAX_SCALE,
-        );
-        setCamera(
-          clampCameraToExploration(
-            {
-              x: (cell.bounds.minX + cell.bounds.maxXExclusive) / 2,
-              z: (cell.bounds.minZ + cell.bounds.maxZExclusive) / 2,
-            },
-            restoredExploration.region.bounds,
-            restoredExploration.region.tileSpan,
-            restoredScale,
-            INITIAL_VIEW_SIZE,
-          ),
-        );
-        setScale(restoredScale);
-      } else {
+      if (!restoredExploration) {
         const location = parseLocation(window.location.hash, []);
         if (location) {
-          setCamera({ x: location.x, z: location.z });
-          if (location.scale) setScale(location.scale);
+          const cell = overviewCellAtWorld(location.x, location.z);
+          if (cell) setAtlasFocusedCellIndex(cell.index);
         }
       }
     });
@@ -1551,6 +1574,11 @@ export function MapViewer() {
     const onHashChange = () => {
       const location = parseLocation(window.location.hash, []);
       if (!location) return;
+      if (atlasMode) {
+        const cell = overviewCellAtWorld(location.x, location.z);
+        if (cell) setAtlasFocusedCellIndex(cell.index);
+        return;
+      }
       if (explorationState) {
         const index = cellIndexAtWorld(
           explorationState.region,
@@ -1568,7 +1596,7 @@ export function MapViewer() {
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, [explorationState, focusExploration]);
+  }, [atlasMode, explorationState, focusExploration]);
 
   useEffect(() => {
     const element = mapRef.current;
@@ -2074,7 +2102,7 @@ export function MapViewer() {
             setHighlights(recoveredHighlights);
             setCoverageSelection(browserRecovery.content.coverageSelection);
             if (recoveredExploration) {
-              stageExplorationPlan(recoveredExploration, "restored");
+              stageExplorationPlan(recoveredExploration, "hydrated");
             } else {
               setExplorationPlan(null);
               setExplorationState(null);
@@ -2197,7 +2225,7 @@ export function MapViewer() {
         setHighlights(restoredHighlights);
         setCoverageSelection(diskWorkspace.coverageSelection);
         if (restoredExploration) {
-          stageExplorationPlan(restoredExploration, "restored");
+          stageExplorationPlan(restoredExploration, "hydrated");
         } else {
           setExplorationPlan(null);
           setExplorationState(null);
@@ -2247,7 +2275,7 @@ export function MapViewer() {
               setHighlights(recoveredHighlights);
               setCoverageSelection(recovery.content.coverageSelection);
               if (recoveredExploration) {
-                stageExplorationPlan(recoveredExploration, "restored");
+                stageExplorationPlan(recoveredExploration, "hydrated");
               } else {
                 setExplorationPlan(null);
                 setExplorationState(null);
@@ -3358,7 +3386,11 @@ export function MapViewer() {
         : `Región ${coverageSelection.rows}×${coverageSelection.columns}`;
     const next = startMaxDetailExploration(coverageSelection.bounds, name);
     if (!next) return;
-    const plan: ExplorationPlan = { state: next, source: "new" };
+    const plan: ExplorationPlan = {
+      state: next,
+      source: "new",
+      reveal: true,
+    };
     if (coverageRegionStatus.ready) {
       activateDownloadedExploration(plan, coverageRegionStatus);
     } else {
@@ -3744,8 +3776,7 @@ export function MapViewer() {
         return;
       }
       setAtlasFocusedCellIndex(cell.index);
-      setCamera({ x: result.x, z: result.z });
-      notify(`${cell.id} centrado · pulsa 0 para volver a encajar el mundo`);
+      notify(`${cell.id} seleccionado en la vista global`);
       return;
     }
     if (explorationState) {
@@ -5506,6 +5537,104 @@ export function MapViewer() {
                           </strong>
                         </span>
                       </div>
+                      {activeDownloadProgress ? (
+                        <div
+                          className="region-download-metrics"
+                          aria-label="Métricas de descarga por red"
+                        >
+                          <span>
+                            Velocidad de red
+                            <strong>
+                              {activeDownloadProgress.networkTilesPerSecond ===
+                              undefined
+                                ? "—"
+                                : `${activeDownloadProgress.networkTilesPerSecond.toFixed(2)} tiles/s`}
+                            </strong>
+                          </span>
+                          <span>
+                            RPS logrado
+                            <strong>
+                              {activeDownloadProgress.achievedRps === undefined
+                                ? "—"
+                                : `${activeDownloadProgress.achievedRps.toFixed(2)} req/s`}
+                            </strong>
+                          </span>
+                          <span>
+                            Setpoint / objetivo
+                            <strong>
+                              {activeDownloadProgress.effectiveRps ===
+                                undefined ||
+                              activeDownloadProgress.targetRps === undefined
+                                ? "—"
+                                : `${activeDownloadProgress.effectiveRps.toFixed(1)}/${activeDownloadProgress.targetRps.toFixed(0)} req/s`}
+                            </strong>
+                          </span>
+                          <span>
+                            Resolución total
+                            <strong>
+                              {activeDownloadProgress.resolvedPerSecond ===
+                              undefined
+                                ? "—"
+                                : `${activeDownloadProgress.resolvedPerSecond.toFixed(2)} tiles/s`}
+                            </strong>
+                          </span>
+                          <span>
+                            Transferencia
+                            <strong>
+                              {activeDownloadProgress.bytesPerSecond ===
+                              undefined
+                                ? "—"
+                                : `${formatBytes(activeDownloadProgress.bytesPerSecond)}/s`}
+                            </strong>
+                          </span>
+                          <span>
+                            ETA de red
+                            <strong>
+                              {formatEta(activeDownloadProgress.etaSeconds)}
+                            </strong>
+                          </span>
+                          <span>
+                            Tiles de red
+                            <strong>
+                              {activeDownloadProgress.networkProcessed ===
+                              undefined
+                                ? "—"
+                                : activeDownloadProgress.networkRequested ===
+                                      undefined ||
+                                    activeDownloadProgress.networkRequested ===
+                                      null
+                                  ? activeDownloadProgress.networkProcessed.toLocaleString(
+                                      "es-GT",
+                                    )
+                                  : `${activeDownloadProgress.networkProcessed.toLocaleString("es-GT")}/${activeDownloadProgress.networkRequested.toLocaleString("es-GT")}`}
+                            </strong>
+                          </span>
+                          <span>
+                            Descargado
+                            <strong>
+                              {formatBytes(activeDownloadProgress.downloadedBytes)}
+                            </strong>
+                          </span>
+                          <span>
+                            Intentos HTTP
+                            <strong>
+                              {activeDownloadProgress.requestAttempts ===
+                              undefined
+                                ? "—"
+                                : activeDownloadProgress.requestAttempts.toLocaleString(
+                                    "es-GT",
+                                  )}
+                            </strong>
+                          </span>
+                        </div>
+                      ) : null}
+                      {downloadCooldownSeconds > 0 ? (
+                        <p className="region-download-warning" role="status">
+                          <AlertTriangle size={14} />
+                          Pausa indicada por el servidor ·{" "}
+                          {formatEta(downloadCooldownSeconds)}
+                        </p>
+                      ) : null}
                       {(regionStatus?.failedCount ?? 0) > 0 ? (
                         <p className="region-download-warning" role="alert">
                           <AlertTriangle size={14} />
@@ -5514,7 +5643,7 @@ export function MapViewer() {
                         </p>
                       ) : null}
                       <label className="region-download-rate">
-                        <span>Ritmo seguro</span>
+                        <span>Perfil adaptativo</span>
                         <select
                           value={requestsPerSecond}
                           disabled={
@@ -5526,10 +5655,10 @@ export function MapViewer() {
                             setRequestsPerSecond(Number(event.target.value))
                           }
                         >
-                          <option value="0.25">0.25 req/s</option>
-                          <option value="0.5">0.5 req/s</option>
-                          <option value="1">1 req/s</option>
-                          <option value="2">2 req/s</option>
+                          <option value="0.5">Cauteloso · 0.5 req/s</option>
+                          <option value="2">Normal · 2 req/s</option>
+                          <option value="8">Rápido · 8 req/s</option>
+                          <option value="16">Turbo · 16 req/s</option>
                         </select>
                       </label>
                       {matchingRegionDownloadRunning ? (
@@ -6526,6 +6655,20 @@ function formatBytes(value: number | null) {
   return `${new Intl.NumberFormat("es-GT", {
     maximumFractionDigits: normalized < 10 && unitIndex > 0 ? 2 : 1,
   }).format(normalized)} ${units[unitIndex]}`;
+}
+
+function formatEta(value: number | null | undefined) {
+  if (value === undefined) return "—";
+  if (value === null) return "Calculando…";
+  if (!Number.isFinite(value)) return "—";
+  const seconds = Math.max(0, Math.round(value));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h`;
 }
 
 function formatSignedBytes(value: number | null) {

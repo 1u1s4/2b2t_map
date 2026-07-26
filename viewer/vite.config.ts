@@ -1,9 +1,15 @@
 import { fileURLToPath } from "node:url";
 import vinext from "vinext";
 import { defineConfig, loadEnv } from "vite";
+import {
+  resolveLocalAtlasDevelopmentPaths,
+} from "./build/local-atlas-development";
 import { localAtlas } from "./build/local-atlas-vite-plugin";
 
 const CONFIG_DIRECTORY = fileURLToPath(new URL(".", import.meta.url));
+const REPOSITORY_TILE_ROOT = fileURLToPath(
+  new URL("../2b2t_tiles", import.meta.url),
+);
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
@@ -13,7 +19,7 @@ const localBindingConfig = {
   compatibility_flags: ["nodejs_compat"],
 };
 
-export default defineConfig(async ({ mode }) => {
+export default defineConfig(async ({ command, mode }) => {
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
   // settings; application environment belongs in ignored `.env*` files.
   process.env.WRANGLER_WRITE_LOGS ??= "false";
@@ -27,8 +33,15 @@ export default defineConfig(async ({ mode }) => {
     CONFIG_DIRECTORY,
     "OBSIDIAN_ATLAS_",
   );
-  const tileRoot = atlasEnvironment.OBSIDIAN_ATLAS_TILE_ROOT;
-  const backingRoot = atlasEnvironment.OBSIDIAN_ATLAS_BACKING_ROOT;
+  const { tileRoot, backingRoot } =
+    resolveLocalAtlasDevelopmentPaths({
+      command,
+      configuredTileRoot:
+        atlasEnvironment.OBSIDIAN_ATLAS_TILE_ROOT,
+      configuredBackingRoot:
+        atlasEnvironment.OBSIDIAN_ATLAS_BACKING_ROOT,
+      repositoryTileRoot: REPOSITORY_TILE_ROOT,
+    });
   const pythonBin = atlasEnvironment.OBSIDIAN_ATLAS_PYTHON;
   const requirementText =
     atlasEnvironment.OBSIDIAN_ATLAS_OVERWORLD_REQUIREMENT_BYTES;
@@ -59,6 +72,7 @@ export default defineConfig(async ({ mode }) => {
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
         config: localBindingConfig,
+        inspectorPort: isCodexSeatbeltSandbox ? false : undefined,
       }),
     ],
   };

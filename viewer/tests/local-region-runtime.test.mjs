@@ -130,7 +130,7 @@ test("a completed regional job contains every base cell in its bounds", () => {
 });
 
 test("browser runtime preserves bounded regional job progress", () => {
-  const runtime = parseLocalAtlasRuntime({
+  const payload = {
     localOnly: true,
     mutationToken: "12345678-1234-4234-9234-123456789abc",
     capacity: {
@@ -154,7 +154,7 @@ test("browser runtime preserves bounded regional job progress", () => {
         zMaxExclusive: bounds.maxZExclusive,
         lod: 0,
         layers: ["base", "overlay", "newchunks"],
-        requestsPerSecond: 1,
+        requestsPerSecond: 16,
       },
       startedAt: "2026-07-25T12:00:00.000Z",
       finishedAt: null,
@@ -171,9 +171,24 @@ test("browser runtime preserves bounded regional job progress", () => {
         downloadedBytes: 8_192,
         percent: 25,
         status: "running",
+        requestAttempts: 256,
+        elapsedSeconds: 32,
+        tilesPerSecond: 96,
+        bytesPerSecond: 256_000,
+        etaSeconds: 96,
+        effectiveRps: 8,
+        targetRps: 16,
+        cooldownSeconds: 8,
+        cooldownUntil: "2026-07-25T12:00:40.000Z",
+        networkRequested: 1_024,
+        networkProcessed: 256,
+        resolvedPerSecond: 96,
+        networkTilesPerSecond: 8,
+        achievedRps: 8,
       },
     },
-  });
+  };
+  const runtime = parseLocalAtlasRuntime(payload);
 
   assert.deepEqual(runtime?.job?.progress, {
     requested: 12_288,
@@ -186,5 +201,56 @@ test("browser runtime preserves bounded regional job progress", () => {
     downloadedBytes: 8_192,
     percent: 25,
     status: "running",
+    requestAttempts: 256,
+    elapsedSeconds: 32,
+    tilesPerSecond: 96,
+    bytesPerSecond: 256_000,
+    etaSeconds: 96,
+    effectiveRps: 8,
+    targetRps: 16,
+    cooldownSeconds: 8,
+    cooldownUntil: "2026-07-25T12:00:40.000Z",
+    networkRequested: 1_024,
+    networkProcessed: 256,
+    resolvedPerSecond: 96,
+    networkTilesPerSecond: 8,
+    achievedRps: 8,
   });
+  assert.equal(
+    runtime?.job?.progress?.tilesPerSecond,
+    runtime?.job?.progress?.resolvedPerSecond,
+  );
+  assert.ok(
+    (runtime?.job?.progress?.resolvedPerSecond ?? 0) >
+      (runtime?.job?.progress?.networkTilesPerSecond ?? 0),
+  );
+
+  for (const invalidProgress of [
+    { targetRps: 8 },
+    { targetRps: 17 },
+    { effectiveRps: 16.01 },
+    { cooldownSeconds: 901 },
+    { cooldownUntil: "not-a-timestamp" },
+    { networkRequested: 12_289 },
+    { networkProcessed: 1_025 },
+    { tilesPerSecond: 95 },
+    { networkTilesPerSecond: 8.01 },
+    { resolvedPerSecond: 7 },
+    { achievedRps: 7 },
+  ]) {
+    assert.equal(
+      parseLocalAtlasRuntime({
+        ...payload,
+        job: {
+          ...payload.job,
+          progress: {
+            ...payload.job.progress,
+            ...invalidProgress,
+          },
+        },
+      }),
+      null,
+      JSON.stringify(invalidProgress),
+    );
+  }
 });

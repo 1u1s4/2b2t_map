@@ -26,6 +26,7 @@ from typing import Any
 
 import requests
 from PIL import Image, UnidentifiedImageError
+from requests.adapters import HTTPAdapter
 
 
 __all__ = (
@@ -49,11 +50,16 @@ MAX_LOD = 10
 DIMENSIONS = {"overworld": 0, "nether": 1, "end": 2}
 LAYERS = ("base", "overlay", "newchunks")
 USER_AGENT = (
-    "obsidian-atlas-regional-downloader/3.0 "
-    "(bounded Overworld tile access; conservative rate; https://github.com/)"
+    "obsidian-atlas-regional-downloader/4.0 "
+    "(bounded Overworld access; adaptive rate; respects Retry-After)"
 )
 
 RETRYABLE_STATUSES = {408, 425, 429}
+MAX_RETRY_AFTER_SECONDS = 15 * 60
+TRANSIENT_SLOWDOWN_THRESHOLD = 4
+TRANSIENT_SLOWDOWN_FACTOR = 0.8
+
+FileIdentity = tuple[int, int, int, int, int]
 
 
 def utc_now() -> str:
@@ -82,14 +88,35 @@ def is_retryable_http_status(status: int) -> bool:
     return status in RETRYABLE_STATUSES or 500 <= status <= 599
 
 
+def file_identity(path: Path) -> FileIdentity:
+    stat = path.stat()
+    return (
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        stat.st_dev,
+        stat.st_ino,
+    )
+
+
+def sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def parse_retry_after(value: str | None, now: float | None = None) -> float | None:
     if not value:
         return None
     value = value.strip()
     try:
-        return max(0.0, float(value))
+        delay = float(value)
     except ValueError:
         pass
+    else:
+        return delay if math.isfinite(delay) and delay >= 0 else None
     try:
         parsed = email.utils.parsedate_to_datetime(value)
         if parsed.tzinfo is None:
@@ -99,7 +126,8 @@ def parse_retry_after(value: str | None, now: float | None = None) -> float | No
             if now is not None
             else dt.datetime.now(dt.timezone.utc)
         )
-        return max(0.0, (parsed - current).total_seconds())
+        delay = max(0.0, (parsed - current).total_seconds())
+        return delay if math.isfinite(delay) else None
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -214,11 +242,7 @@ def validate_webp(path: Path, *, calculate_hash: bool = True) -> Validation:
             image.load()
         digest: str | None = None
         if calculate_hash:
-            hasher = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    hasher.update(chunk)
-            digest = hasher.hexdigest()
+            digest = sha256_file(path)
         return Validation(True, size_bytes=size, sha256=digest)
     except (OSError, UnidentifiedImageError, ValueError) as exc:
         return Validation(False, error=f"{type(exc).__name__}: {exc}")
@@ -233,6 +257,9 @@ class DownloadTask:
     # to reuse durable 404s without issuing the same request on every resume.
     catalog_status: str | None = None
     catalog_http_code: int | None = None
+    catalog_size_bytes: int | None = None
+    catalog_sha256: str | None = None
+    catalog_file_identity: FileIdentity | None = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -258,6 +285,10 @@ class TileDatabase:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute("PRAGMA busy_timeout=30000")
+        self._verified_local_files: dict[
+            int,
+            tuple[FileIdentity, str],
+        ] = {}
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -303,6 +334,7 @@ class TileDatabase:
         self.connection.commit()
 
     def close(self) -> None:
+        self._verified_local_files.clear()
         self.connection.commit()
         self.connection.close()
 
@@ -366,7 +398,7 @@ class TileDatabase:
         )
         row = self.connection.execute(
             """
-            SELECT id, status, http_code FROM tiles
+            SELECT id, status, http_code, size_bytes, sha256 FROM tiles
             WHERE layer=? AND lod=? AND dimension=? AND tile_x=? AND tile_z=?
             """,
             (
@@ -405,8 +437,20 @@ class TileDatabase:
             output_root,
             selected=selected,
         )
+        row_id = int(row["id"])
+        catalog_sha256 = (
+            str(row["sha256"])
+            if row["sha256"] is not None
+            else None
+        )
+        verified = self._verified_local_files.pop(row_id, None)
+        verified_identity = (
+            verified[0]
+            if verified is not None and verified[1] == catalog_sha256
+            else None
+        )
         return DownloadTask(
-            row_id=int(row["id"]),
+            row_id=row_id,
             spec=spec,
             selected=selected,
             catalog_status=str(row["status"]),
@@ -415,7 +459,121 @@ class TileDatabase:
                 if row["http_code"] is not None
                 else None
             ),
+            catalog_size_bytes=(
+                int(row["size_bytes"])
+                if row["size_bytes"] is not None
+                else None
+            ),
+            catalog_sha256=catalog_sha256,
+            catalog_file_identity=verified_identity,
         )
+
+    def known_complete_file_validation(
+        self,
+        spec: TileSpec,
+        output_root: Path,
+    ) -> Validation | None:
+        """Verify a catalogued complete file without decoding it.
+
+        A successful verification is cached only for this database instance.
+        The subsequent task can reuse it if the file identity is still exact,
+        avoiding a second full-file hash during the same run.
+
+        ``None`` means there is no applicable complete catalog row. A false
+        validation means a row exists but the local bytes no longer match it;
+        callers must not then accept the file merely because it decodes.
+        """
+
+        path = spec.path(output_root)
+        try:
+            identity_before = file_identity(path)
+        except OSError:
+            return None
+        row = self.connection.execute(
+            """
+            SELECT id, size_bytes, sha256
+            FROM tiles
+            WHERE layer=? AND lod=? AND dimension=? AND tile_x=? AND tile_z=?
+              AND status='complete'
+            """,
+            (
+                spec.layer,
+                spec.lod,
+                spec.dimension,
+                spec.tile_x,
+                spec.tile_z,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        row_id = int(row["id"])
+        self._verified_local_files.pop(row_id, None)
+        if row["size_bytes"] is None:
+            return Validation(False, error="catálogo completo sin tamaño")
+        if int(row["size_bytes"]) != identity_before[0]:
+            return Validation(
+                False,
+                size_bytes=identity_before[0],
+                error="tamaño local no coincide con el catálogo",
+            )
+        if (
+            not isinstance(row["sha256"], str)
+            or len(row["sha256"]) != 64
+        ):
+            return Validation(
+                False,
+                size_bytes=identity_before[0],
+                error="catálogo completo sin SHA-256 válido",
+            )
+        expected_hash = str(row["sha256"])
+        try:
+            int(expected_hash, 16)
+            digest = sha256_file(path)
+            identity_after = file_identity(path)
+        except (OSError, ValueError) as exc:
+            return Validation(
+                False,
+                size_bytes=identity_before[0],
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        if identity_after != identity_before:
+            return Validation(
+                False,
+                size_bytes=identity_after[0],
+                sha256=digest,
+                error="el archivo cambió durante la verificación",
+            )
+        if digest != expected_hash:
+            return Validation(
+                False,
+                size_bytes=identity_after[0],
+                sha256=digest,
+                error="SHA-256 local no coincide con el catálogo",
+            )
+        self._verified_local_files[row_id] = (
+            identity_after,
+            digest,
+        )
+        return Validation(
+            True,
+            size_bytes=identity_after[0],
+            sha256=digest,
+        )
+
+    def known_complete_file_size(
+        self,
+        spec: TileSpec,
+        output_root: Path,
+    ) -> int | None:
+        """Compatibility wrapper returning the securely verified size."""
+
+        validation = self.known_complete_file_validation(
+            spec,
+            output_root,
+        )
+        if validation is None or not validation.valid:
+            return None
+        return validation.size_bytes
 
     def average_complete_tile_bytes(
         self,
@@ -491,6 +649,7 @@ class TileDatabase:
         *,
         min_lod: int,
         selected_lods: set[int],
+        commit: bool = True,
     ) -> None:
         downloaded_at = utc_now() if result.status == "complete" else None
         self.connection.execute(
@@ -524,19 +683,56 @@ class TileDatabase:
                 "UPDATE tiles SET children_seeded=1, updated_at=? WHERE id=?",
                 (utc_now(), result.task.row_id),
             )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
 
 
 
 class AdaptiveRateLimiter:
-    """Token spacing shared by every worker, with protection-aware slowdown."""
+    """Global request spacing with cooldown and conservative rate recovery."""
 
-    def __init__(self, requests_per_second: float, stop_event: threading.Event):
-        if not math.isfinite(requests_per_second) or requests_per_second <= 0:
+    def __init__(
+        self,
+        requests_per_second: float,
+        stop_event: threading.Event,
+        *,
+        initial_rate: float | None = None,
+        recovery_successes: int = 32,
+    ):
+        if (
+            isinstance(requests_per_second, bool)
+            or not isinstance(requests_per_second, (int, float))
+            or not math.isfinite(requests_per_second)
+            or requests_per_second <= 0
+        ):
             raise ValueError("--requests-per-second debe ser finito y > 0")
-        self.initial_rate = requests_per_second
-        self._rate = requests_per_second
+        starting_rate = (
+            requests_per_second if initial_rate is None else initial_rate
+        )
+        if (
+            isinstance(starting_rate, bool)
+            or not isinstance(starting_rate, (int, float))
+            or not math.isfinite(starting_rate)
+            or starting_rate <= 0
+            or starting_rate > requests_per_second
+        ):
+            raise ValueError(
+                "initial_rate debe ser finito, > 0 y no superar el límite"
+            )
+        if (
+            isinstance(recovery_successes, bool)
+            or not isinstance(recovery_successes, int)
+            or recovery_successes <= 0
+        ):
+            raise ValueError("recovery_successes debe ser un entero positivo")
+        self.initial_rate = starting_rate
+        self._target_rate = requests_per_second
+        self._rate = starting_rate
+        self._minimum_rate = min(0.05, requests_per_second)
+        self._recovery_successes = recovery_successes
+        self._clean_successes = 0
         self._next_request = 0.0
+        self._cooldown_until = 0.0
         self._lock = threading.Lock()
         self.stop_event = stop_event
 
@@ -545,11 +741,25 @@ class AdaptiveRateLimiter:
         with self._lock:
             return self._rate
 
+    @property
+    def target_rate(self) -> float:
+        with self._lock:
+            return self._target_rate
+
+    @property
+    def cooldown_remaining(self) -> float:
+        with self._lock:
+            return max(0.0, self._cooldown_until - time.monotonic())
+
     def acquire(self) -> bool:
         while not self.stop_event.is_set():
             with self._lock:
                 now = time.monotonic()
-                wait = max(0.0, self._next_request - now)
+                wait = max(
+                    0.0,
+                    self._next_request - now,
+                    self._cooldown_until - now,
+                )
                 if wait <= 0:
                     self._next_request = max(now, self._next_request) + (
                         1.0 / self._rate
@@ -559,10 +769,70 @@ class AdaptiveRateLimiter:
                 return False
         return False
 
-    def slow_down(self, factor: float = 0.5) -> float:
+    def slow_down(
+        self,
+        factor: float = 0.5,
+        cooldown: float = 0,
+    ) -> float:
+        if (
+            isinstance(factor, bool)
+            or not isinstance(factor, (int, float))
+            or not math.isfinite(factor)
+            or factor <= 0
+            or factor > 1
+        ):
+            raise ValueError("factor debe ser finito y estar entre 0 y 1")
+        if (
+            isinstance(cooldown, bool)
+            or not isinstance(cooldown, (int, float))
+            or not math.isfinite(cooldown)
+            or cooldown < 0
+        ):
+            raise ValueError("cooldown debe ser finito y no negativo")
         with self._lock:
-            self._rate = max(0.05, self._rate * factor)
+            self._rate = max(self._minimum_rate, self._rate * factor)
+            self._rate = min(self._rate, self._target_rate)
+            self._clean_successes = 0
+            if cooldown:
+                self._cooldown_until = max(
+                    self._cooldown_until,
+                    time.monotonic() + cooldown,
+                )
             return self._rate
+
+    def record_success(self) -> float:
+        """Recover one small step after enough clean server responses."""
+
+        with self._lock:
+            if (
+                self._rate >= self._target_rate
+                or time.monotonic() < self._cooldown_until
+            ):
+                return self._rate
+            self._clean_successes += 1
+            if self._clean_successes < self._recovery_successes:
+                return self._rate
+            self._clean_successes = 0
+            self._rate = min(self._target_rate, self._rate * 1.25)
+            return self._rate
+
+    def defer(self, seconds: float) -> float:
+        """Apply a global cooldown observed by every worker."""
+
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds)
+            or seconds < 0
+        ):
+            raise ValueError("seconds debe ser finito y no negativo")
+        with self._lock:
+            self._clean_successes = 0
+            self._cooldown_until = max(
+                self._cooldown_until,
+                time.monotonic() + seconds,
+            )
+            return max(0.0, self._cooldown_until - time.monotonic())
 
 
 class TileFetcher:
@@ -572,7 +842,7 @@ class TileFetcher:
         *,
         limiter: AdaptiveRateLimiter,
         stop_event: threading.Event,
-        timeout: float,
+        timeout: float | tuple[float, float],
         retries: int,
         max_tile_bytes: int,
         logger: logging.Logger,
@@ -580,19 +850,46 @@ class TileFetcher:
         self.output_root = output_root
         self.limiter = limiter
         self.stop_event = stop_event
+        timeout_values = timeout if isinstance(timeout, tuple) else (timeout,)
+        if (
+            len(timeout_values) not in (1, 2)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+                for value in timeout_values
+            )
+        ):
+            raise ValueError("timeout debe contener valores finitos y positivos")
         self.timeout = timeout
         self.retries = retries
         self.max_tile_bytes = max_tile_bytes
         self.logger = logger
         self.local = threading.local()
+        self.sessions_lock = threading.Lock()
+        self.sessions: set[requests.Session] = set()
+        self.closed = False
         self.protection_lock = threading.Lock()
         self.consecutive_403 = 0
         self.consecutive_429 = 0
+        self.consecutive_transient_failures = 0
         self.protection_reason: str | None = None
 
     def _session(self) -> requests.Session:
         session = getattr(self.local, "session", None)
-        if session is None:
+        if session is not None:
+            with self.sessions_lock:
+                if self.closed:
+                    raise requests.RequestException(
+                        "el cliente HTTP ya fue cerrado"
+                    )
+            return session
+        with self.sessions_lock:
+            if self.closed:
+                raise requests.RequestException(
+                    "el cliente HTTP ya fue cerrado"
+                )
             session = requests.Session()
             session.headers.update(
                 {
@@ -601,11 +898,35 @@ class TileFetcher:
                     "Accept": "image/webp,image/*;q=0.8,*/*;q=0.1",
                 }
             )
+            for scheme in ("http://", "https://"):
+                session.mount(
+                    scheme,
+                    HTTPAdapter(
+                        pool_connections=1,
+                        pool_maxsize=1,
+                        max_retries=0,
+                        pool_block=True,
+                    ),
+                )
             self.local.session = session
+            self.sessions.add(session)
         return session
+
+    def close(self) -> None:
+        """Close every per-thread session created by this fetcher."""
+
+        with self.sessions_lock:
+            if self.closed:
+                return
+            self.closed = True
+            sessions = tuple(self.sessions)
+            self.sessions.clear()
+        for session in sessions:
+            session.close()
 
     def _protection_response(self, status: int) -> None:
         with self.protection_lock:
+            self.consecutive_transient_failures = 0
             if status == 403:
                 self.consecutive_403 += 1
                 self.consecutive_429 = 0
@@ -635,10 +956,117 @@ class TileFetcher:
                     )
                     self.stop_event.set()
 
-    def _non_protection_response(self) -> None:
+    def _non_protection_response(self, *, successful: bool = False) -> None:
         with self.protection_lock:
             self.consecutive_403 = 0
             self.consecutive_429 = 0
+            self.consecutive_transient_failures = 0
+        if successful:
+            self.limiter.record_success()
+
+    def _transient_failure_response(self, detail: str) -> None:
+        """Apply moderate AIMD slowdown after repeated transient failures."""
+
+        new_rate: float | None = None
+        with self.protection_lock:
+            self.consecutive_403 = 0
+            self.consecutive_429 = 0
+            self.consecutive_transient_failures += 1
+            if (
+                self.consecutive_transient_failures
+                >= TRANSIENT_SLOWDOWN_THRESHOLD
+            ):
+                self.consecutive_transient_failures = 0
+                new_rate = self.limiter.slow_down(
+                    TRANSIENT_SLOWDOWN_FACTOR,
+                )
+        if new_rate is not None:
+            self.logger.warning(
+                "%s repetido: velocidad reducida moderadamente a %.3f "
+                "solicitudes/s",
+                detail,
+                new_rate,
+            )
+
+    @staticmethod
+    def _error_excerpt(response: requests.Response) -> str:
+        excerpt = bytearray()
+        try:
+            for chunk in response.iter_content(chunk_size=160):
+                if not chunk:
+                    continue
+                remaining = 160 - len(excerpt)
+                excerpt.extend(chunk[:remaining])
+                if len(excerpt) >= 160:
+                    break
+        except (OSError, TypeError, ValueError, requests.RequestException):
+            return ""
+        return bytes(excerpt).decode("utf-8", errors="replace").replace(
+            "\n",
+            " ",
+        )
+
+    @staticmethod
+    def _validate_existing(task: DownloadTask, path: Path) -> Validation:
+        """Use a trusted catalog hash before falling back to full decoding."""
+
+        expected_size = task.catalog_size_bytes
+        expected_hash = task.catalog_sha256
+        if (
+            task.catalog_status == "complete"
+            and expected_size is not None
+            and expected_hash is not None
+            and len(expected_hash) == 64
+        ):
+            try:
+                current_identity = file_identity(path)
+                size = current_identity[0]
+                if size != expected_size:
+                    return Validation(
+                        False,
+                        size_bytes=size,
+                        error=(
+                            f"tamaño local {size} != catálogo "
+                            f"{expected_size}"
+                        ),
+                    )
+                if current_identity == task.catalog_file_identity:
+                    return Validation(
+                        True,
+                        size_bytes=size,
+                        sha256=expected_hash,
+                    )
+                digest = sha256_file(path)
+                if digest != expected_hash:
+                    return Validation(
+                        False,
+                        size_bytes=size,
+                        sha256=digest,
+                        error="SHA-256 local no coincide con el catálogo",
+                    )
+                return Validation(
+                    True,
+                    size_bytes=size,
+                    sha256=digest,
+                )
+            except OSError as exc:
+                return Validation(
+                    False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+        return validate_webp(path)
+
+    def _wait(self, seconds: float) -> bool:
+        """Wait in bounded slices so stop signals and huge headers stay safe."""
+
+        deadline = time.monotonic() + seconds
+        while not self.stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self.stop_event.wait(min(remaining, 1.0)):
+                return True
+        return True
 
     def fetch(self, task: DownloadTask) -> DownloadResult:
         started = time.monotonic()
@@ -646,7 +1074,7 @@ class TileFetcher:
         destination = spec.path(self.output_root)
 
         if task.selected and destination.exists():
-            validation = validate_webp(destination)
+            validation = self._validate_existing(task, destination)
             if validation.valid:
                 return DownloadResult(
                     task,
@@ -696,6 +1124,7 @@ class TileFetcher:
             if not self.limiter.acquire():
                 break
             attempts += 1
+            response: requests.Response | None = None
             try:
                 response = self._session().request(
                     method,
@@ -707,7 +1136,7 @@ class TileFetcher:
                 last_status = response.status_code
 
                 if response.status_code == 404:
-                    self._non_protection_response()
+                    self._non_protection_response(successful=True)
                     response.close()
                     return DownloadResult(
                         task,
@@ -728,6 +1157,7 @@ class TileFetcher:
                     result.elapsed = time.monotonic() - started
                     result.downloaded_bytes = downloaded_bytes
                     if result.status not in ("corrupt", "failed"):
+                        self.limiter.record_success()
                         return result
                     last_error = result.error
                     if attempt >= self.retries or self.stop_event.is_set():
@@ -735,23 +1165,46 @@ class TileFetcher:
                     delay = min(
                         60.0, (2 ** (attempt - 1)) + random.random()
                     )
-                    if self.stop_event.wait(delay):
+                    if self._wait(delay):
                         return result
                     continue
 
-                if response.status_code in (403, 429):
-                    self._protection_response(response.status_code)
-                else:
-                    self._non_protection_response()
-
-                body_excerpt = ""
-                try:
-                    body_excerpt = response.text[:160].replace("\n", " ")
-                except requests.RequestException:
-                    pass
                 retry_after = parse_retry_after(
                     response.headers.get("Retry-After")
                 )
+                retryable_response = (
+                    response.status_code in (403, 429)
+                    or is_retryable_http_status(response.status_code)
+                )
+                retry_after_too_long = (
+                    retryable_response
+                    and retry_after is not None
+                    and retry_after > MAX_RETRY_AFTER_SECONDS
+                )
+                if retry_after_too_long:
+                    with self.protection_lock:
+                        self.protection_reason = (
+                            f"HTTP {response.status_code} pidió esperar "
+                            f"{retry_after:.0f}s; descarga detenida y lista "
+                            "para reanudarse más tarde"
+                        )
+                    self.stop_event.set()
+                if (
+                    retryable_response
+                    and retry_after is not None
+                    and not retry_after_too_long
+                ):
+                    self.limiter.defer(retry_after)
+                if response.status_code in (403, 429):
+                    self._protection_response(response.status_code)
+                elif is_retryable_http_status(response.status_code):
+                    self._transient_failure_response(
+                        f"HTTP {response.status_code}",
+                    )
+                else:
+                    self._non_protection_response()
+
+                body_excerpt = self._error_excerpt(response)
                 response.close()
                 last_error = (
                     f"HTTP {last_status}"
@@ -763,20 +1216,23 @@ class TileFetcher:
                     and last_status != 403
                 ):
                     break
-                if self.stop_event.is_set():
+                if self.stop_event.is_set() or attempt >= self.retries:
                     break
                 delay = (
                     retry_after
                     if retry_after is not None
                     else min(60.0, (2 ** (attempt - 1)) + random.random())
                 )
-                if self.stop_event.wait(delay):
+                if self._wait(delay):
                     break
             except requests.RequestException as exc:
+                if response is not None:
+                    response.close()
+                self._transient_failure_response(type(exc).__name__)
                 last_error = f"{type(exc).__name__}: {exc}"
                 if attempt < self.retries:
                     delay = min(60.0, (2 ** (attempt - 1)) + random.random())
-                    if self.stop_event.wait(delay):
+                    if self._wait(delay):
                         break
 
         status = "protection" if last_status in (403, 429) else "failed"
@@ -809,8 +1265,10 @@ class TileFetcher:
         try:
             with os.fdopen(descriptor, "wb") as handle:
                 for chunk in response.iter_content(chunk_size=128 * 1024):
-                    if self.stop_event.is_set() and self.protection_reason:
-                        raise InterruptedError(self.protection_reason)
+                    if self.stop_event.is_set():
+                        raise InterruptedError(
+                            self.protection_reason or "descarga detenida"
+                        )
                     if not chunk:
                         continue
                     size += len(chunk)
@@ -821,6 +1279,10 @@ class TileFetcher:
                         )
                     handle.write(chunk)
                     digest.update(chunk)
+                if self.stop_event.is_set():
+                    raise InterruptedError(
+                        self.protection_reason or "descarga detenida"
+                    )
                 handle.flush()
                 os.fsync(handle.fileno())
             response.close()

@@ -51,7 +51,10 @@ from tile_download_core import (
 DEFAULT_OUTPUT_ROOT = Path("2b2t_tiles")
 DEFAULT_LAYERS = ("base", "overlay")
 DEFAULT_WORKERS = 4
-DEFAULT_REQUESTS_PER_SECOND = 2.0
+DEFAULT_REQUESTS_PER_SECOND = 8.0
+DEFAULT_INITIAL_REQUESTS_PER_SECOND = 4.0
+MAX_WORKERS = 8
+MAX_REQUESTS_PER_SECOND = 16.0
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_RETRIES = 5
 DEFAULT_MAX_TILE_BYTES = 10 * 1024 * 1024
@@ -61,6 +64,8 @@ DEFAULT_ESTIMATED_TILE_BYTES = 1 * 1024 * 1024
 DEFAULT_STORAGE_MARGIN = 1.20
 DEFAULT_RUNTIME_DISK_RESERVE_BYTES = 256 * 1024 * 1024
 DEFAULT_DISK_CHECK_INTERVAL = 32
+DEFAULT_DATABASE_COMMIT_INTERVAL = 32
+DEFAULT_DATABASE_COMMIT_SECONDS = 1.0
 REGION_DOWNLOAD_LOCK_NAME = ".region-download.lock"
 
 
@@ -169,6 +174,17 @@ class RegionDownloadSummary:
     processed: int = 0
     reused_absent: int = 0
     stop_reason: str | None = None
+    request_attempts: int = 0
+    elapsed_seconds: float = 0.0
+    tiles_per_second: float = 0.0
+    bytes_per_second: float = 0.0
+    effective_rps: float = 0.0
+    target_rps: float = 0.0
+    network_requested: int | None = None
+    network_processed: int = 0
+    resolved_per_second: float = 0.0
+    network_tiles_per_second: float = 0.0
+    achieved_rps: float = 0.0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -197,6 +213,19 @@ class RegionDownloadProgress:
     interrupted: bool
     status: str
     stop_reason: str | None = None
+    request_attempts: int = 0
+    elapsed_seconds: float = 0.0
+    tiles_per_second: float = 0.0
+    bytes_per_second: float = 0.0
+    eta_seconds: float | None = None
+    effective_rps: float = 0.0
+    target_rps: float = 0.0
+    cooldown_seconds: float = 0.0
+    network_requested: int | None = None
+    network_processed: int = 0
+    resolved_per_second: float = 0.0
+    network_tiles_per_second: float = 0.0
+    achieved_rps: float = 0.0
 
     @property
     def percent(self) -> float:
@@ -221,6 +250,26 @@ class RegionDownloadProgress:
             "interrupted": self.interrupted,
             "percent": round(self.percent, 4),
             "stopReason": self.stop_reason,
+            "requestAttempts": self.request_attempts,
+            "elapsedSeconds": round(self.elapsed_seconds, 3),
+            "tilesPerSecond": round(self.tiles_per_second, 3),
+            "bytesPerSecond": round(self.bytes_per_second, 3),
+            "etaSeconds": (
+                round(self.eta_seconds, 3)
+                if self.eta_seconds is not None
+                else None
+            ),
+            "effectiveRps": round(self.effective_rps, 3),
+            "targetRps": round(self.target_rps, 3),
+            "cooldownSeconds": round(self.cooldown_seconds, 3),
+            "networkRequested": self.network_requested,
+            "networkProcessed": self.network_processed,
+            "resolvedPerSecond": round(self.resolved_per_second, 3),
+            "networkTilesPerSecond": round(
+                self.network_tiles_per_second,
+                3,
+            ),
+            "achievedRps": round(self.achieved_rps, 3),
         }
 
 
@@ -268,7 +317,13 @@ class JsonlProgressReporter:
 def parse_layers(value: str) -> tuple[str, ...]:
     """Parse a comma-separated layer list while preserving its order."""
 
-    layers = tuple(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
+    layers = tuple(
+        dict.fromkeys(
+            part.strip()
+            for part in value.split(",")
+            if part.strip()
+        )
+    )
     if not layers:
         raise argparse.ArgumentTypeError("provide at least one layer")
     invalid = tuple(layer for layer in layers if layer not in LAYERS)
@@ -451,6 +506,15 @@ def estimate_region_storage(
     existing_complete = 0
     observed_bytes = 0
     for spec in inventory:
+        catalog_validation = database.known_complete_file_validation(
+            spec,
+            output_root,
+        )
+        if catalog_validation is not None:
+            if catalog_validation.valid:
+                existing_complete += 1
+                observed_bytes += catalog_validation.size_bytes
+            continue
         validation = validate_webp(
             spec.path(output_root),
             calculate_hash=False,
@@ -540,11 +604,14 @@ def download_region_tasks(
     stop_event: threading.Event,
     logger: logging.Logger,
     total_tasks: int | None = None,
+    total_network_tasks: int | None = None,
     max_pending_tasks: int | None = None,
     progress: Callable[[RegionDownloadProgress], None] | None = None,
     disk_check_path: Path | None = None,
     minimum_free_bytes: int = 0,
     disk_check_interval: int = DEFAULT_DISK_CHECK_INTERVAL,
+    database_commit_interval: int = DEFAULT_DATABASE_COMMIT_INTERVAL,
+    database_commit_seconds: float = DEFAULT_DATABASE_COMMIT_SECONDS,
 ) -> RegionDownloadSummary:
     """Fetch a lazy task stream with a fixed-size executor window."""
 
@@ -557,6 +624,14 @@ def download_region_tasks(
             pass
     if total_tasks is not None and total_tasks < 0:
         raise ValueError("total_tasks must not be negative")
+    if total_network_tasks is not None and total_network_tasks < 0:
+        raise ValueError("total_network_tasks must not be negative")
+    if (
+        total_tasks is not None
+        and total_network_tasks is not None
+        and total_network_tasks > total_tasks
+    ):
+        raise ValueError("total_network_tasks must not exceed total_tasks")
     pending_limit = (
         max_pending_tasks
         if max_pending_tasks is not None
@@ -569,6 +644,13 @@ def download_region_tasks(
         raise ValueError("minimum_free_bytes must not be negative")
     if disk_check_interval <= 0:
         raise ValueError("disk_check_interval must be positive")
+    if database_commit_interval <= 0:
+        raise ValueError("database_commit_interval must be positive")
+    if (
+        not math.isfinite(database_commit_seconds)
+        or database_commit_seconds <= 0
+    ):
+        raise ValueError("database_commit_seconds must be finite and positive")
 
     complete = 0
     absent = 0
@@ -576,15 +658,73 @@ def download_region_tasks(
     reused = 0
     reused_absent = 0
     downloaded_bytes = 0
+    request_attempts = 0
+    network_processed = 0
     processed = 0
     consumed = 0
     interrupted = False
     stop_reason: str | None = None
     last_disk_check_processed = -disk_check_interval
+    started_at = time.monotonic()
+    last_database_commit_at = started_at
+    uncommitted_results = 0
+    last_human_progress_at = started_at
+
+    def limiter_metric(name: str) -> float:
+        limiter = getattr(fetcher, "limiter", None)
+        value = getattr(limiter, name, 0.0)
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def current_metrics() -> tuple[
+        float,
+        float,
+        float,
+        float,
+        float,
+        float | None,
+    ]:
+        elapsed = max(0.0, time.monotonic() - started_at)
+        resolved_rate = processed / elapsed if elapsed > 0 else 0.0
+        network_tiles_rate = (
+            network_processed / elapsed
+            if elapsed > 0
+            else 0.0
+        )
+        byte_rate = downloaded_bytes / elapsed if elapsed > 0 else 0.0
+        achieved_rate = request_attempts / elapsed if elapsed > 0 else 0.0
+        remaining = (
+            max(0, total_network_tasks - network_processed)
+            if total_network_tasks is not None
+            else 0
+        )
+        eta = (
+            remaining / network_tiles_rate
+            if remaining and network_tiles_rate > 0
+            else None
+        )
+        return (
+            elapsed,
+            resolved_rate,
+            network_tiles_rate,
+            byte_rate,
+            achieved_rate,
+            eta,
+        )
 
     def emit(event: str, status: str) -> None:
         if progress is None:
             return
+        (
+            elapsed,
+            resolved_rate,
+            network_tiles_rate,
+            byte_rate,
+            achieved_rate,
+            eta,
+        ) = current_metrics()
         progress(
             RegionDownloadProgress(
                 event=event,
@@ -599,7 +739,50 @@ def download_region_tasks(
                 interrupted=interrupted,
                 status=status,
                 stop_reason=stop_reason,
+                request_attempts=request_attempts,
+                elapsed_seconds=elapsed,
+                # Protocol v1 compatibility: this legacy field remains the
+                # rate of all resolved tasks, including local reuse.
+                tiles_per_second=resolved_rate,
+                bytes_per_second=byte_rate,
+                eta_seconds=eta,
+                effective_rps=limiter_metric("rate"),
+                target_rps=limiter_metric("target_rate"),
+                cooldown_seconds=limiter_metric("cooldown_remaining"),
+                network_requested=total_network_tasks,
+                network_processed=network_processed,
+                resolved_per_second=resolved_rate,
+                network_tiles_per_second=network_tiles_rate,
+                achieved_rps=achieved_rate,
             )
+        )
+
+    def flush_database(*, force: bool = False) -> None:
+        nonlocal last_database_commit_at
+        nonlocal uncommitted_results
+
+        if uncommitted_results <= 0:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and uncommitted_results < database_commit_interval
+            and now - last_database_commit_at < database_commit_seconds
+        ):
+            return
+        connection = getattr(database, "connection", None)
+        if connection is not None:
+            connection.commit()
+        uncommitted_results = 0
+        last_database_commit_at = now
+
+    def database_commit_wait_timeout() -> float | None:
+        if uncommitted_results <= 0:
+            return None
+        return max(
+            0.0,
+            database_commit_seconds
+            - (time.monotonic() - last_database_commit_at),
         )
 
     def check_disk_space(*, force: bool = False) -> bool:
@@ -633,9 +816,13 @@ def download_region_tasks(
         nonlocal complete
         nonlocal downloaded_bytes
         nonlocal failed
+        nonlocal last_human_progress_at
+        nonlocal network_processed
         nonlocal processed
+        nonlocal request_attempts
         nonlocal reused
         nonlocal reused_absent
+        nonlocal uncommitted_results
 
         catalog_absent = (
             result.status == "absent"
@@ -649,15 +836,21 @@ def download_region_tasks(
                 output_root,
                 min_lod=lod,
                 selected_lods={lod},
+                commit=False,
             )
+            uncommitted_results += 1
+            flush_database()
         processed += 1
         downloaded_bytes += result.downloaded_bytes
+        request_attempts += result.attempts
+        if result.attempts > 0:
+            network_processed += 1
         if result.status == "complete":
             complete += 1
             if result.attempts == 0:
                 reused += 1
             action = "reutilizado" if result.attempts == 0 else "descargado"
-            logger.info(
+            logger.debug(
                 "%s %s (%d bytes)",
                 action,
                 result.task.spec.url,
@@ -667,12 +860,12 @@ def download_region_tasks(
             absent += 1
             if result.attempts == 0:
                 reused_absent += 1
-                logger.info(
+                logger.debug(
                     "404 reutilizado del catálogo: %s",
                     result.task.spec.url,
                 )
             else:
-                logger.info("no publicado (404): %s", result.task.spec.url)
+                logger.debug("no publicado (404): %s", result.task.spec.url)
         else:
             failed += 1
             logger.error(
@@ -681,6 +874,31 @@ def download_region_tasks(
                 result.task.spec.url,
                 result.error or "sin detalle",
             )
+        now = time.monotonic()
+        if now - last_human_progress_at >= 2.0:
+            (
+                _elapsed,
+                resolved_rate,
+                network_tiles_rate,
+                byte_rate,
+                achieved_rate,
+                eta,
+            ) = current_metrics()
+            logger.info(
+                "Progreso %s%s · %.2f resueltos/s · %.2f tiles red/s · "
+                "%.2f MiB/s · %.2f req/s reales · %.2f/%.2f "
+                "req/s adaptativas%s",
+                f"{processed:,}",
+                f"/{total_tasks:,}" if total_tasks is not None else "",
+                resolved_rate,
+                network_tiles_rate,
+                byte_rate / (1024 * 1024),
+                achieved_rate,
+                limiter_metric("rate"),
+                limiter_metric("target_rate"),
+                f" · ETA {eta:.0f}s" if eta is not None else "",
+            )
+            last_human_progress_at = now
         emit("progress", "running")
 
     def cached_absent_result(task: DownloadTask) -> DownloadResult | None:
@@ -746,8 +964,12 @@ def download_region_tasks(
                 continue
             done, _ = concurrent.futures.wait(
                 tuple(pending),
+                timeout=database_commit_wait_timeout(),
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
+            if not done:
+                flush_database()
+                continue
             for future in done:
                 task = pending.pop(future)
                 if future.cancelled():
@@ -776,7 +998,9 @@ def download_region_tasks(
             interrupted = True
             for future in pending:
                 future.cancel()
+        flush_database(force=True)
         executor.shutdown(wait=True, cancel_futures=True)
+        flush_database(force=True)
 
     requested = total_tasks if total_tasks is not None else consumed
     if interrupted and stop_reason is None:
@@ -791,6 +1015,14 @@ def download_region_tasks(
         else "complete"
     )
     emit("summary", terminal_status)
+    (
+        elapsed,
+        resolved_rate,
+        network_tiles_rate,
+        byte_rate,
+        achieved_rate,
+        _eta,
+    ) = current_metrics()
     return RegionDownloadSummary(
         requested=requested,
         complete=complete,
@@ -802,6 +1034,17 @@ def download_region_tasks(
         processed=processed,
         reused_absent=reused_absent,
         stop_reason=stop_reason,
+        request_attempts=request_attempts,
+        elapsed_seconds=elapsed,
+        tiles_per_second=resolved_rate,
+        bytes_per_second=byte_rate,
+        effective_rps=limiter_metric("rate"),
+        target_rps=limiter_metric("target_rate"),
+        network_requested=total_network_tasks,
+        network_processed=network_processed,
+        resolved_per_second=resolved_rate,
+        network_tiles_per_second=network_tiles_rate,
+        achieved_rps=achieved_rate,
     )
 
 
@@ -848,11 +1091,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUTPUT_ROOT,
         help="Tile/database output root (default: ./2b2t_tiles).",
     )
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Concurrent workers (default: {DEFAULT_WORKERS}, max: {MAX_WORKERS}).",
+    )
     parser.add_argument(
         "--requests-per-second",
         type=float,
         default=DEFAULT_REQUESTS_PER_SECOND,
+        help=(
+            "Global target rate with automatic slowdown/recovery "
+            f"(default: {DEFAULT_REQUESTS_PER_SECOND:g}, "
+            f"max: {MAX_REQUESTS_PER_SECOND:g})."
+        ),
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
@@ -909,8 +1162,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.workers <= 0:
-        parser.error("--workers must be positive")
+    if args.workers <= 0 or args.workers > MAX_WORKERS:
+        parser.error(f"--workers must be from 1 to {MAX_WORKERS}")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.retries <= 0:
@@ -922,8 +1175,12 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     if (
         not math.isfinite(args.requests_per_second)
         or args.requests_per_second <= 0
+        or args.requests_per_second > MAX_REQUESTS_PER_SECOND
     ):
-        parser.error("--requests-per-second must be finite and positive")
+        parser.error(
+            "--requests-per-second must be finite and between "
+            f"0 and {MAX_REQUESTS_PER_SECOND:g}"
+        )
     if args.scale <= 0:
         parser.error("--scale must be positive")
     if args.grid_step <= 0:
@@ -970,6 +1227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
 
     database: TileDatabase | None = None
+    fetcher: TileFetcher | None = None
     previous_handlers: dict[int, object] = {}
 
     def stop_handler(signum: int, _frame: object) -> None:
@@ -1011,7 +1269,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         stop_event = threading.Event()
-        limiter = AdaptiveRateLimiter(args.requests_per_second, stop_event)
+        limiter = AdaptiveRateLimiter(
+            args.requests_per_second,
+            stop_event,
+            initial_rate=min(
+                args.requests_per_second,
+                DEFAULT_INITIAL_REQUESTS_PER_SECOND,
+            ),
+            recovery_successes=16,
+        )
         fetcher = TileFetcher(
             output_root,
             limiter=limiter,
@@ -1034,6 +1300,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "lod": args.lod,
                 "bounds": dataclasses.asdict(block_range),
                 "tiles": inventory_count,
+                "workers": args.workers,
+                "target_requests_per_second": args.requests_per_second,
+                "initial_requests_per_second": limiter.rate,
             },
         )
         logger.info(
@@ -1061,6 +1330,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stop_event=stop_event,
             logger=logger,
             total_tasks=inventory_count,
+            total_network_tasks=storage.missing,
             progress=progress_reporter,
             disk_check_path=output_root,
             minimum_free_bytes=runtime_reserve,
@@ -1073,7 +1343,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"({summary.reused} reutilizados), "
             f"{summary.absent} ausentes "
             f"({summary.reused_absent} reutilizados), "
-            f"{summary.failed} fallidos.",
+            f"{summary.failed} fallidos · "
+            f"{summary.resolved_per_second:.2f} resueltos/s · "
+            f"{summary.network_tiles_per_second:.2f} tiles red/s · "
+            f"{summary.bytes_per_second / (1024 * 1024):.2f} MiB/s · "
+            f"{summary.achieved_rps:.2f} req/s reales · "
+            f"{summary.effective_rps:.2f}/{summary.target_rps:.2f} "
+            "req/s adaptativas.",
             file=human_output,
         )
         if summary.interrupted:
@@ -1117,10 +1393,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 signal.signal(signum, handler)
         finally:
             try:
-                if database is not None:
-                    database.close()
+                if fetcher is not None:
+                    fetcher.close()
             finally:
-                download_lock.release()
+                try:
+                    if database is not None:
+                        database.close()
+                finally:
+                    download_lock.release()
 
 
 if __name__ == "__main__":

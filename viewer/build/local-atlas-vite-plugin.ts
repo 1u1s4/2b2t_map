@@ -36,6 +36,9 @@ const MAX_REQUEST_BODY_BYTES = 32_768;
 const MAX_TILE_BYTES = 16 * 1024 * 1024;
 const MAX_REGION_CELLS = 1_048_576;
 const MAX_REGION_TILES = MAX_REGION_CELLS * 3;
+const MAX_REGION_REQUESTS_PER_SECOND = 16;
+const MAX_REGION_COOLDOWN_SECONDS = 15 * 60;
+const RATE_METRIC_TOLERANCE = 0.001;
 const DEFAULT_ESTIMATED_TILE_BYTES = 512 * 1024;
 const MIN_ESTIMATED_TILE_BYTES = 64 * 1024;
 const MAX_ESTIMATED_TILE_BYTES = 2 * 1024 * 1024;
@@ -501,6 +504,20 @@ interface LocalJobProgress {
   readonly downloadedBytes: number;
   readonly percent: number;
   readonly status: "running" | "complete" | "error" | "interrupted";
+  readonly requestAttempts?: number;
+  readonly elapsedSeconds?: number;
+  readonly tilesPerSecond?: number;
+  readonly bytesPerSecond?: number;
+  readonly etaSeconds?: number | null;
+  readonly effectiveRps?: number;
+  readonly targetRps?: number;
+  readonly cooldownSeconds?: number;
+  readonly cooldownUntil?: string | null;
+  readonly networkRequested?: number | null;
+  readonly networkProcessed?: number;
+  readonly resolvedPerSecond?: number;
+  readonly networkTilesPerSecond?: number;
+  readonly achievedRps?: number;
 }
 
 interface LocalJob {
@@ -814,10 +831,10 @@ export function parseRegionDownloadRequest(
     typeof requestsPerSecond !== "number" ||
     !Number.isFinite(requestsPerSecond) ||
     requestsPerSecond < 0.25 ||
-    requestsPerSecond > 2
+    requestsPerSecond > MAX_REGION_REQUESTS_PER_SECOND
   ) {
     throw new TypeError(
-      "El ritmo debe estar entre 0.25 y 2 solicitudes por segundo",
+      `El ritmo debe estar entre 0.25 y ${MAX_REGION_REQUESTS_PER_SECOND} solicitudes por segundo`,
     );
   }
 
@@ -1495,6 +1512,19 @@ async function readCapacity(
 
 function publicJob(job: LocalJob | null) {
   if (!job) return null;
+  const cooldownUntilMs = job.progress.cooldownUntil
+    ? Date.parse(job.progress.cooldownUntil)
+    : null;
+  const progress =
+    cooldownUntilMs === null
+      ? job.progress
+      : {
+          ...job.progress,
+          cooldownSeconds: Math.max(
+            0,
+            (cooldownUntilMs - Date.now()) / 1_000,
+          ),
+        };
   return {
     id: job.id,
     status: job.status,
@@ -1503,13 +1533,14 @@ function publicJob(job: LocalJob | null) {
     finishedAt: job.finishedAt,
     exitCode: job.exitCode,
     message: job.message,
-    progress: job.progress,
+    progress,
   };
 }
 
 function parseJobProgressLine(
   line: string,
   expectedRequested: number,
+  expectedTargetRps: number,
 ): LocalJobProgress | null {
   let value: unknown;
   try {
@@ -1544,6 +1575,92 @@ function parseJobProgressLine(
   ) {
     return null;
   }
+  const unboundedFiniteMetrics = [
+    "elapsedSeconds",
+    "tilesPerSecond",
+    "bytesPerSecond",
+  ] as const;
+  const effectiveRps = value.effectiveRps;
+  const targetRps = value.targetRps;
+  const cooldownSeconds = value.cooldownSeconds;
+  const networkRequested = value.networkRequested;
+  const networkProcessed = value.networkProcessed;
+  const resolvedPerSecond = value.resolvedPerSecond;
+  const networkTilesPerSecond = value.networkTilesPerSecond;
+  const achievedRps = value.achievedRps;
+  if (
+    (value.requestAttempts !== undefined &&
+      !isNonNegativeSafeInteger(value.requestAttempts)) ||
+    unboundedFiniteMetrics.some((key) => {
+      const metric = value[key];
+      return (
+        metric !== undefined &&
+        (typeof metric !== "number" ||
+          !Number.isFinite(metric) ||
+          metric < 0)
+      );
+    }) ||
+    (targetRps !== undefined &&
+      (typeof targetRps !== "number" ||
+        !Number.isFinite(targetRps) ||
+        targetRps < 0.25 ||
+        targetRps > MAX_REGION_REQUESTS_PER_SECOND ||
+        Math.abs(targetRps - expectedTargetRps) >
+          RATE_METRIC_TOLERANCE)) ||
+    (effectiveRps !== undefined &&
+      (typeof effectiveRps !== "number" ||
+        !Number.isFinite(effectiveRps) ||
+        effectiveRps < 0 ||
+        effectiveRps > MAX_REGION_REQUESTS_PER_SECOND ||
+        effectiveRps >
+          (targetRps ?? expectedTargetRps) + RATE_METRIC_TOLERANCE)) ||
+    (cooldownSeconds !== undefined &&
+      (typeof cooldownSeconds !== "number" ||
+        !Number.isFinite(cooldownSeconds) ||
+        cooldownSeconds < 0 ||
+        cooldownSeconds > MAX_REGION_COOLDOWN_SECONDS)) ||
+    (networkRequested !== undefined &&
+      networkRequested !== null &&
+      (!isNonNegativeSafeInteger(networkRequested) ||
+        networkRequested > expectedRequested)) ||
+    (networkProcessed !== undefined &&
+      (!isNonNegativeSafeInteger(networkProcessed) ||
+        networkProcessed > value.processed ||
+        (typeof networkRequested === "number" &&
+          networkProcessed > networkRequested))) ||
+    [resolvedPerSecond, networkTilesPerSecond, achievedRps].some(
+      (metric) =>
+        metric !== undefined &&
+        (typeof metric !== "number" ||
+          !Number.isFinite(metric) ||
+          metric < 0 ||
+          metric > Number.MAX_SAFE_INTEGER),
+    ) ||
+    (value.tilesPerSecond !== undefined &&
+      resolvedPerSecond !== undefined &&
+      Math.abs(value.tilesPerSecond - resolvedPerSecond) >
+        RATE_METRIC_TOLERANCE) ||
+    (resolvedPerSecond !== undefined &&
+      networkTilesPerSecond !== undefined &&
+      networkTilesPerSecond >
+        resolvedPerSecond + RATE_METRIC_TOLERANCE) ||
+    (achievedRps !== undefined &&
+      networkTilesPerSecond !== undefined &&
+      networkTilesPerSecond > achievedRps + RATE_METRIC_TOLERANCE) ||
+    (value.etaSeconds !== undefined &&
+      value.etaSeconds !== null &&
+      (typeof value.etaSeconds !== "number" ||
+        !Number.isFinite(value.etaSeconds) ||
+        value.etaSeconds < 0))
+  ) {
+    return null;
+  }
+  const cooldownUntil =
+    cooldownSeconds === undefined
+      ? undefined
+      : cooldownSeconds > 0
+        ? new Date(Date.now() + cooldownSeconds * 1_000).toISOString()
+        : null;
   return Object.freeze({
     requested: expectedRequested,
     processed: value.processed,
@@ -1555,6 +1672,46 @@ function parseJobProgressLine(
     downloadedBytes: value.downloadedBytes,
     percent: value.percent,
     status: value.status,
+    ...(value.requestAttempts !== undefined
+      ? { requestAttempts: value.requestAttempts }
+      : {}),
+    ...(value.elapsedSeconds !== undefined
+      ? { elapsedSeconds: value.elapsedSeconds }
+      : {}),
+    ...(value.tilesPerSecond !== undefined
+      ? { tilesPerSecond: value.tilesPerSecond }
+      : {}),
+    ...(value.bytesPerSecond !== undefined
+      ? { bytesPerSecond: value.bytesPerSecond }
+      : {}),
+    ...(value.etaSeconds !== undefined
+      ? { etaSeconds: value.etaSeconds }
+      : {}),
+    ...(value.effectiveRps !== undefined
+      ? { effectiveRps: value.effectiveRps }
+      : {}),
+    ...(value.targetRps !== undefined
+      ? { targetRps: value.targetRps }
+      : {}),
+    ...(value.cooldownSeconds !== undefined
+      ? { cooldownSeconds: value.cooldownSeconds }
+      : {}),
+    ...(cooldownUntil !== undefined ? { cooldownUntil } : {}),
+    ...(value.networkRequested !== undefined
+      ? { networkRequested: value.networkRequested }
+      : {}),
+    ...(value.networkProcessed !== undefined
+      ? { networkProcessed: value.networkProcessed }
+      : {}),
+    ...(value.resolvedPerSecond !== undefined
+      ? { resolvedPerSecond: value.resolvedPerSecond }
+      : {}),
+    ...(value.networkTilesPerSecond !== undefined
+      ? { networkTilesPerSecond: value.networkTilesPerSecond }
+      : {}),
+    ...(value.achievedRps !== undefined
+      ? { achievedRps: value.achievedRps }
+      : {}),
   });
 }
 
@@ -1588,13 +1745,29 @@ function startRegionJob(
       downloadedBytes: 0,
       percent: 0,
       status: "running",
+      requestAttempts: 0,
+      elapsedSeconds: 0,
+      tilesPerSecond: 0,
+      bytesPerSecond: 0,
+      etaSeconds: null,
+      effectiveRps: Math.min(4, request.requestsPerSecond),
+      targetRps: request.requestsPerSecond,
+      cooldownSeconds: 0,
+      cooldownUntil: null,
+      networkRequested: null,
+      networkProcessed: 0,
+      resolvedPerSecond: 0,
+      networkTilesPerSecond: 0,
+      achievedRps: 0,
     },
   };
   const script = resolve(options.projectRoot, "download_region_2b2t.py");
-  const workers = Math.max(
-    1,
-    Math.min(4, Math.ceil(request.requestsPerSecond)),
-  );
+  const workers =
+    request.requestsPerSecond <= 2
+      ? 2
+      : request.requestsPerSecond <= 8
+        ? 4
+        : 8;
   const child = spawn(
     options.pythonBin,
     [
@@ -1648,7 +1821,11 @@ function startRegionJob(
 
   let stdoutBuffer = "";
   const consumeProgressLine = (line: string) => {
-    const progress = parseJobProgressLine(line, tileCount);
+    const progress = parseJobProgressLine(
+      line,
+      tileCount,
+      request.requestsPerSecond,
+    );
     if (
       !progress ||
       progress.processed < job.progress.processed ||
@@ -1657,7 +1834,13 @@ function startRegionJob(
       progress.failed < job.progress.failed ||
       progress.reused < job.progress.reused ||
       progress.reusedAbsent < job.progress.reusedAbsent ||
-      progress.downloadedBytes < job.progress.downloadedBytes
+      progress.downloadedBytes < job.progress.downloadedBytes ||
+      (progress.networkProcessed !== undefined &&
+        job.progress.networkProcessed !== undefined &&
+        progress.networkProcessed < job.progress.networkProcessed) ||
+      (typeof progress.networkRequested === "number" &&
+        typeof job.progress.networkRequested === "number" &&
+        progress.networkRequested !== job.progress.networkRequested)
     ) {
       return;
     }
@@ -1666,7 +1849,7 @@ function startRegionJob(
       job.message =
         progress.processed === 0
           ? "Preparando la descarga regional"
-          : `Descargando región · ${progress.percent.toFixed(1)}%`;
+          : `Descargando región · ${progress.percent.toFixed(1)}% · ${progress.achievedRps?.toFixed(1) ?? "—"} req/s logradas · setpoint ${progress.effectiveRps?.toFixed(1) ?? "—"}/${progress.targetRps?.toFixed(0) ?? "—"}`;
     }
   };
   child.stdout.setEncoding("utf8");
