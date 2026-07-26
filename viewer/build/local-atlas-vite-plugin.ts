@@ -964,18 +964,281 @@ async function readArchiveBytes(tileRoot: string): Promise<number> {
     const value = JSON.parse(
       await readFile(resolve(tileRoot, "progress.json"), "utf8"),
     ) as unknown;
-    if (
-      isRecord(value) &&
-      typeof value.space_used_bytes === "number" &&
-      Number.isSafeInteger(value.space_used_bytes) &&
-      value.space_used_bytes >= 0
-    ) {
-      return value.space_used_bytes;
+    if (isRecord(value)) {
+      for (const field of ["space_used_bytes", "data_downloaded_bytes"]) {
+        const bytes = value[field];
+        if (
+          typeof bytes === "number" &&
+          Number.isSafeInteger(bytes) &&
+          bytes >= 0
+        ) {
+          return bytes;
+        }
+      }
     }
   } catch {
     // A capacity snapshot can still be useful without legacy size metadata.
   }
   return 0;
+}
+
+const GLOBAL_DOWNLOAD_STATUSES = new Set([
+  "running",
+  "complete",
+  "fallback_complete",
+  "stopped",
+  "incomplete",
+  "error",
+]);
+
+function isNonNegativeFiniteNumber(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0
+  );
+}
+
+function readGlobalDownloadScope(value: unknown) {
+  if (!isRecord(value)) return null;
+  const dimensions = value.dimensions;
+  const layers = value.layers;
+  const lods = value.lods;
+  if (
+    !Array.isArray(dimensions) ||
+    dimensions.length === 0 ||
+    !dimensions.every(
+      (dimension) =>
+        dimension === "overworld" ||
+        dimension === "nether" ||
+        dimension === "end",
+    ) ||
+    !Array.isArray(layers) ||
+    layers.length === 0 ||
+    !layers.every(
+      (layer) =>
+        layer === "base" ||
+        layer === "overlay" ||
+        layer === "newchunks",
+    ) ||
+    !Array.isArray(lods) ||
+    lods.length === 0 ||
+    !lods.every(
+      (lod) =>
+        Number.isSafeInteger(lod) &&
+        Number(lod) >= 0 &&
+        Number(lod) <= 10,
+    )
+  ) {
+    return null;
+  }
+  return {
+    dimensions: [...dimensions],
+    layers: [...layers],
+    lods: [...lods].sort((left, right) => Number(left) - Number(right)),
+  };
+}
+
+async function readGlobalDownloadProgress(tileRoot: string) {
+  try {
+    const value = JSON.parse(
+      await readFile(resolve(tileRoot, "progress.json"), "utf8"),
+    ) as unknown;
+    if (
+      !isRecord(value) ||
+      value.phase !== "download" ||
+      typeof value.status !== "string" ||
+      !GLOBAL_DOWNLOAD_STATUSES.has(value.status) ||
+      !isNonNegativeSafeInteger(value.processed_requests) ||
+      !isNonNegativeSafeInteger(value.planned_requests) ||
+      value.processed_requests > value.planned_requests ||
+      !isNonNegativeSafeInteger(value.tiles_completed) ||
+      !isNonNegativeSafeInteger(value.tiles_absent) ||
+      !isNonNegativeSafeInteger(value.tiles_corrupt) ||
+      !isNonNegativeSafeInteger(value.tiles_pending) ||
+      !isNonNegativeFiniteNumber(value.progress_percent) ||
+      value.progress_percent > 100 ||
+      typeof value.fallback !== "boolean" ||
+      typeof value.updated_at !== "string"
+    ) {
+      return null;
+    }
+    const updatedAt = new Date(value.updated_at);
+    if (!Number.isFinite(updatedAt.getTime())) return null;
+    const scope = readGlobalDownloadScope(value.effective_scope);
+    if (!scope) return null;
+
+    const dataBytes = isNonNegativeSafeInteger(value.space_used_bytes)
+      ? value.space_used_bytes
+      : isNonNegativeSafeInteger(value.data_downloaded_bytes)
+        ? value.data_downloaded_bytes
+        : null;
+    const tilesPerSecond = isNonNegativeFiniteNumber(value.tiles_per_second)
+      ? value.tiles_per_second
+      : null;
+    const megabytesPerSecond = isNonNegativeFiniteNumber(
+      value.megabytes_per_second,
+    )
+      ? value.megabytes_per_second
+      : null;
+    const etaSeconds =
+      value.eta_seconds === null
+        ? null
+        : isNonNegativeFiniteNumber(value.eta_seconds)
+          ? value.eta_seconds
+          : null;
+    const failed = isNonNegativeSafeInteger(value.tiles_failed)
+      ? value.tiles_failed
+      : 0;
+
+    return {
+      status: value.status,
+      processedRequests: value.processed_requests,
+      plannedRequests: value.planned_requests,
+      completeTiles: value.tiles_completed,
+      absentTiles: value.tiles_absent,
+      corruptTiles: value.tiles_corrupt,
+      failedTiles: failed,
+      pendingTiles: value.tiles_pending,
+      progressPercent: value.progress_percent,
+      dataBytes,
+      tilesPerSecond,
+      megabytesPerSecond,
+      etaSeconds,
+      updatedAt: updatedAt.toISOString(),
+      fallback: value.fallback,
+      scope,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value > 0
+  );
+}
+
+async function readLiveOverworldRequirementBytes(
+  tileRoot: string,
+): Promise<number | null> {
+  try {
+    const value = JSON.parse(
+      await readFile(resolve(tileRoot, "estimate.json"), "utf8"),
+    ) as unknown;
+    if (!isRecord(value) || !isRecord(value.requested)) return null;
+    const dimensions = value.requested.dimensions;
+    const fullPlan = value.full_plan;
+    if (
+      !Array.isArray(dimensions) ||
+      dimensions.length !== 1 ||
+      dimensions[0] !== "overworld" ||
+      !isRecord(fullPlan) ||
+      fullPlan.fallback !== false ||
+      fullPlan.meets_required_space_headroom !== true ||
+      !Array.isArray(fullPlan.rows) ||
+      fullPlan.rows.length === 0
+    ) {
+      return null;
+    }
+    const requiredBytes = fullPlan.required_with_headroom;
+    const configuredHeadroom = fullPlan.space_headroom_percent;
+    const requiredHeadroom = fullPlan.required_space_headroom_percent;
+    if (
+      !isPositiveSafeInteger(requiredBytes) ||
+      typeof configuredHeadroom !== "number" ||
+      !Number.isFinite(configuredHeadroom) ||
+      typeof requiredHeadroom !== "number" ||
+      !Number.isFinite(requiredHeadroom) ||
+      configuredHeadroom < requiredHeadroom ||
+      requiredHeadroom < 20
+    ) {
+      return null;
+    }
+    return requiredBytes;
+  } catch {
+    return null;
+  }
+}
+
+async function readCachedOverworldRequirementBytes(
+  tileRoot: string,
+): Promise<number | null> {
+  try {
+    const value = JSON.parse(
+      await readFile(
+        resolve(tileRoot, "reports", "overworld-estimate.json"),
+        "utf8",
+      ),
+    ) as unknown;
+    if (
+      !isRecord(value) ||
+      value.mode !== "cached_estimate_only" ||
+      !isRecord(value.requested) ||
+      !isRecord(value.source) ||
+      !isRecord(value.margins) ||
+      !isRecord(value.total) ||
+      value.source.network_requests !== 0 ||
+      value.source.sqlite_query_only !== true
+    ) {
+      return null;
+    }
+    const dimensions = value.requested.dimensions;
+    const layers = value.requested.layers;
+    const lods = value.requested.lods;
+    if (
+      !Array.isArray(dimensions) ||
+      dimensions.length !== 1 ||
+      dimensions[0] !== "overworld" ||
+      !Array.isArray(layers) ||
+      new Set(layers).size !== 3 ||
+      !["base", "overlay", "newchunks"].every((layer) =>
+        layers.includes(layer),
+      ) ||
+      !Array.isArray(lods) ||
+      lods.length !== 11 ||
+      !Array.from({ length: 11 }, (_, lod) => lod).every((lod) =>
+        lods.includes(lod),
+      )
+    ) {
+      return null;
+    }
+    const samplingUncertainty =
+      value.margins.sampling_uncertainty_percent;
+    const spaceHeadroom = value.margins.space_headroom_percent;
+    const requiredBytes =
+      value.total.required_with_space_headroom_bytes;
+    if (
+      typeof samplingUncertainty !== "number" ||
+      !Number.isFinite(samplingUncertainty) ||
+      samplingUncertainty < 25 ||
+      typeof spaceHeadroom !== "number" ||
+      !Number.isFinite(spaceHeadroom) ||
+      spaceHeadroom < 20 ||
+      !isPositiveSafeInteger(requiredBytes)
+    ) {
+      return null;
+    }
+    return requiredBytes;
+  } catch {
+    return null;
+  }
+}
+
+async function readEstimatedOverworldRequirementBytes(
+  tileRoot: string,
+): Promise<number | null> {
+  const requirements = await Promise.all([
+    readLiveOverworldRequirementBytes(tileRoot),
+    readCachedOverworldRequirementBytes(tileRoot),
+  ]);
+  const valid = requirements.filter(
+    (value): value is number => value !== null,
+  );
+  return valid.length > 0 ? Math.max(...valid) : null;
 }
 
 async function optionalFileFingerprint(path: string): Promise<string> {
@@ -1451,8 +1714,14 @@ function estimateRegionDownloadBytes(
 async function readCapacity(
   tileRoot: string | undefined,
   backingRoot: string | undefined,
-  requirementBytes: number,
+  requirementOverrideBytes: number | undefined,
 ) {
+  const requirementBytes =
+    requirementOverrideBytes ??
+    (tileRoot
+      ? await readEstimatedOverworldRequirementBytes(tileRoot)
+      : null) ??
+    DEFAULT_OVERWORLD_REQUIREMENT_BYTES;
   if (!tileRoot) {
     return {
       configured: false,
@@ -2015,12 +2284,12 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   const backingRoot = options.backingRoot?.trim()
     ? resolve(options.backingRoot)
     : undefined;
-  const requirementBytes =
+  const requirementOverrideBytes =
     options.overworldRequirementBytes &&
     Number.isSafeInteger(options.overworldRequirementBytes) &&
     options.overworldRequirementBytes > 0
       ? options.overworldRequirementBytes
-      : DEFAULT_OVERWORLD_REQUIREMENT_BYTES;
+      : undefined;
   const projectRoot = resolve(options.projectRoot ?? "..");
   const defaultVenvPython = resolve(projectRoot, ".venv", "bin", "python");
   const pythonBin =
@@ -2215,8 +2484,12 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     }
 
     if (path === STATUS_ENDPOINT && request.method === "GET") {
-      const [capacity, persistence] = await Promise.all([
-        readCapacity(tileRoot, backingRoot, requirementBytes),
+      const [capacity, persistence, globalDownload] = await Promise.all([
+        readCapacity(
+          tileRoot,
+          backingRoot,
+          requirementOverrideBytes,
+        ),
         workspaceStore
           ? workspaceStore.availability()
           : Promise.resolve({
@@ -2226,12 +2499,16 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
               revision: null,
               updatedAt: null,
             }),
+        tileRoot
+          ? readGlobalDownloadProgress(tileRoot)
+          : Promise.resolve(null),
       ]);
       writeJson(response, 200, {
         localOnly: true,
         mutationToken,
         capacity,
         persistence,
+        globalDownload,
         job: publicJob(state.job),
       });
       return;
@@ -2343,7 +2620,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
         const capacity = await readCapacity(
           tileRoot,
           backingRoot,
-          requirementBytes,
+          requirementOverrideBytes,
         );
         let inventory: LocalRegionStatusInventory;
         try {

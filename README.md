@@ -38,7 +38,8 @@ La versión actual admite únicamente **Overworld**.
 - zoom acotado a un presupuesto seguro de tiles visibles y cámara contenida en
   la región;
 - varias sesiones pausables con progreso persistente y exportable;
-- revisión automática de cada celda al entrar o desplazarse a ella;
+- conteo automático al visitar una celda; la celda actual nueva permanece sin
+  relleno y muestra su marca al abandonarla o al volver a ella;
 - ausencias `404` persistentes y omitidas automáticamente, separadas de las
   celdas revisadas;
 - descarga regional reanudable y adaptativa entre `0.25` y `16 req/s`;
@@ -53,7 +54,9 @@ La versión actual admite únicamente **Overworld**.
 Requisitos:
 
 - macOS con `/Volumes/LuisA` montado;
-- `/Volumes/2b2t Tiles` es opcional: si falta se usa `./2b2t_tiles`;
+- el sparsebundle existente en
+  `/Volumes/LuisA/2b2t_map/2b2t_tiles.sparsebundle` es opcional; el lanzador
+  lo monta en `/Volumes/2b2t Tiles` y, si no existe, usa `./2b2t_tiles`;
 - Python 3.10 o posterior;
 - Node.js `>=22.13.0`;
 - Google Chrome actualizado;
@@ -80,7 +83,15 @@ Inicia el atlas:
 
 Abre [http://localhost:3001](http://localhost:3001). El lanzador mantiene una
 sola sesión local en segundo plano y valida que la biblioteca, LuisA, Python y
-el visor estén disponibles.
+el visor estén disponibles. Montar la biblioteca es parte del arranque; los
+modos `--status` y `--stop` no montan ni desmontan volúmenes.
+
+Para abrir directamente una zona por coordenadas X/Z y conservar un zoom
+inicial explícito:
+
+```bash
+open 'http://localhost:3001/#@-85181,168232,1.0000,0'
+```
 
 ```bash
 ./start_local_atlas_luisa.sh --status
@@ -114,19 +125,49 @@ PYTHON_BIN='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
    después. El progreso exacto incluye WebP guardados, `404`, pendientes,
    faltantes y fallos.
 6. Cuando la región alcance 100%, pulsa **Explorar región**. La primera celda
-   se abre a 512×512 bloques y queda revisada automáticamente.
+   se cuenta como visitada, pero se abre a 512×512 bloques sin relleno mientras
+   siga siendo la celda actual.
 7. Recorre la región con la cruceta norte/sur/este/oeste, las flechas del
-   teclado o un clic. Cada celda visitada queda revisada sin otro botón; un
+   teclado o un clic. La celda nueva se cuenta al entrar; al salir, la anterior
+   muestra su relleno de revisada. Si vuelves a ella conserva su marca. Un
    `404` se omite automáticamente.
 8. Acerca, aleja o arrastra el mapa cuando necesites inspeccionar una
-   estructura: los datos continúan en LOD 0.
+   estructura: los datos continúan en LOD 0 y el zoom manual se conserva
+   exactamente al moverte a otra celda.
 9. **Pausar sesión** la conserva en LuisA; después puedes abrirla desde
    **Workspace durable**. **Guardar ahora** fuerza una escritura inmediata.
 
 La descarga y la revisión siguen siendo conceptos distintos. La primera ocurre
 por región y debe terminar antes de entrar; la segunda se registra
-automáticamente al visitar celdas. Una ausencia `404` no se disfraza de
-revisión: se guarda en su propio bitset y se excluye del total revisable.
+automáticamente al visitar una celda, aunque el relleno de la celda actual se
+retrase para no tapar el mapa. Una ausencia `404` no se disfraza de revisión:
+se guarda en su propio bitset y se excluye del total revisable.
+
+### Recorrido visual
+
+**1. Atlas global.** Muestra los 1,089 sectores del Overworld, el progreso LOD
+0 y los límites X/Z exactos de la selección.
+
+![Atlas global del Overworld](./viewer/public/docs/atlas-global-overworld.png)
+
+**2. Exploración regional.** La cabecera conserva coordenadas, zoom, LOD y
+bloques por píxel; la tarjeta lateral muestra la celda actual y su rango.
+
+![Celda regional con coordenadas y zoom](./viewer/public/docs/exploracion-celda-coordenadas-zoom.png)
+
+**3. Highlights.** Permite marcar puntos o áreas, encontrarlos por nombre,
+ocultarlos y exportarlos o importarlos junto con el workspace.
+
+![Panel de highlights sobre el mapa](./viewer/public/docs/highlights-panel-mapa.png)
+
+### Qué es un tile
+
+Un **tile** es una pieza cuadrada del mapa, como una baldosa. En el máximo
+detalle cada archivo WebP mide 512×512 píxeles y representa 512×512 bloques de
+Minecraft. Las coordenadas X/Z indican dónde encaja esa pieza; al alejarte, los
+LOD superiores resumen áreas cada vez mayores. El visor une automáticamente
+las piezas visibles, por eso puedes desplazarte como si fuera una sola imagen
+sin cargar el mapa completo en memoria.
 
 No necesitas pausar manualmente para cambiar de zona: al elegir otra región,
 la sesión activa se guarda en el workspace y la selección nueva pasa por la
@@ -182,10 +223,18 @@ Respaldo físico: /Volumes/LuisA
 ```
 
 La tarjeta **Capacidad local · LuisA** consulta en tiempo real el espacio de
-ambos volúmenes y toma el menor valor disponible. La referencia predeterminada
-para el Overworld es `1,458,909,433,254` bytes, aproximadamente `1.327 TiB`.
-La comparación es conservadora: no descuenta de esa referencia lo ya presente
-en la biblioteca.
+ambos volúmenes y toma el menor valor disponible. Si existe `estimate.json`,
+usa el `full_plan.required_with_headroom` del último preflight estricto de
+Overworld; así muestra el mismo déficit que el descargador. Sin un preflight
+válido usa la referencia predeterminada de `1,458,909,433,254` bytes,
+aproximadamente `1.327 TiB`. Una variable local explícita conserva prioridad
+sobre ambos valores.
+
+Cuando `progress.json` contiene una descarga global válida, la misma tarjeta
+muestra su alcance LOD, porcentaje, WebP completos, ausencias, pendientes,
+tiles/s, MB/s, datos transferidos y ETA. El runtime proyecta únicamente esas
+métricas; no expone la ruta de salida ni el comando de reanudación al
+navegador.
 
 El resultado puede ser:
 
@@ -195,6 +244,199 @@ El resultado puede ser:
 
 Es un diagnóstico de almacenamiento. No crea trabajos ni recorre el mapa. La
 biblioteca actual, su SQLite y los WebP existentes permanecen en su lugar.
+
+## CLI global reanudable
+
+`download_all_2b2t.py` descubre el árbol publicado, estima cada LOD y solo
+descarga el alcance que cabe con un 20% adicional de espacio. El preflight no
+supone un cuadrado de 1,024,000 bloques: usa la huella irregular verificada de
+66,464 tiles LOD 3 y un máximo conservador de 5,673,192 solicitudes para
+Overworld/base completo. En LuisA, la biblioteca vive en el sparsebundle APFS
+existente:
+
+```bash
+hdiutil attach -nobrowse -owners on \
+  '/Volumes/LuisA/2b2t_map/2b2t_tiles.sparsebundle'
+```
+
+Esto monta `/Volumes/2b2t Tiles`; no crea ni formatea una imagen.
+El lanzador del visor ejecuta ese montaje automáticamente cuando el
+sparsebundle existe. El comando manual solo hace falta para operar el
+descargador global sin iniciar la UI.
+
+El alcance operativo actual es Overworld/base y se recorre desde los LOD más
+alejados y pequeños hacia LOD 0:
+
+```bash
+python download_all_2b2t.py \
+  --all \
+  --dimensions overworld \
+  --layers base \
+  --lods all \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --workers 4 \
+  --requests-per-second 2 \
+  --resume
+```
+
+Para recalcular solicitudes, almacenamiento, tiempo y espacio faltante sin
+iniciar descargas adicionales cuando la prueba 3×3 ya está registrada:
+
+```bash
+python download_all_2b2t.py \
+  --estimate-only \
+  --dimensions overworld \
+  --layers base \
+  --lods all \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --requests-per-second 2 \
+  --resume \
+  --skip-smoke-test
+```
+
+El preflight genera `discovery.json` y `estimate.json`. Cuando falta espacio,
+`estimate.json` conserva dos vistas: `plan`, el tramo seguro que sí se ejecuta,
+y `full_plan`, el desglose completo **del alcance solicitado** con su déficit.
+La ejecución actualiza `progress.json`, `download.log` y `tiles.sqlite3`; el
+resumen final contiene el comando exacto para continuar. Los WebP válidos y
+los `404` confirmados no se solicitan otra vez. `--revalidate` vuelve a
+comprobar los archivos completos antes de reanudar.
+
+Mientras el escritor global está activo se puede generar, sin competir con él,
+el informe detallado de las tres capas y los 11 LOD del Overworld:
+
+```bash
+python download_all_2b2t.py \
+  --cached-estimate-only \
+  --dimensions overworld \
+  --layers base,overlay,newchunks \
+  --lods all \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --workers 8 \
+  --requests-per-second 8
+```
+
+Este modo abre SQLite con `mode=ro` y `query_only=ON`, no usa red ni toma el
+lock de descarga, y no modifica `progress.json`, `estimate.json` ni
+`download.log`. Valida los WebP de las muestras locales y escribe únicamente
+un informe bajo `reports/`, con una fila por combinación solicitada, márgenes,
+déficit y comandos exactos de continuación. El alcance completo actual de
+Overworld conserva el nombre `reports/overworld-estimate.json` y sus 33 filas.
+Los demás subconjuntos usan un nombre determinista que incorpora dimensiones,
+capas y LOD.
+
+Por ejemplo, el informe offline de las 99 combinaciones publicadas se genera
+sin interferir con la descarga activa:
+
+```bash
+python download_all_2b2t.py \
+  --cached-estimate-only \
+  --dimensions overworld,nether,end \
+  --layers base,overlay,newchunks \
+  --lods all \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --workers 8 \
+  --requests-per-second 8
+```
+
+Su salida es
+`reports/cached-estimate-overworld-nether-end__base-overlay-newchunks__lod-all.json`.
+Incluye 99 filas, totales por dimensión, capa y pareja dimensión/capa, además
+de nueve comandos independientes de continuación sujetos a preflight.
+
+El volumen actual permite continuar Overworld/base hasta LOD 1 con todas las
+reservas exigidas, pero no admite aún LOD 0. Cuando haya capacidad adicional,
+este comando intenta exclusivamente el detalle pendiente y se niega a empezar
+si no conserva el 20%:
+
+```bash
+python download_all_2b2t.py \
+  --all \
+  --dimensions overworld \
+  --layers base \
+  --lods 0 \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --workers 8 \
+  --requests-per-second 8 \
+  --resume \
+  --skip-smoke-test \
+  --no-fallback
+```
+
+Después de completar base, se vuelven a estimar en vivo las otras capas de
+Overworld sin iniciar otra transferencia:
+
+```bash
+python download_all_2b2t.py \
+  --estimate-only \
+  --dimensions overworld \
+  --layers overlay,newchunks \
+  --lods all \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --requests-per-second 8 \
+  --resume \
+  --skip-smoke-test
+```
+
+Si ese preflight cabe, los comandos exactos de continuación son:
+
+```bash
+/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 \
+  /Users/luisalvarado/Documents/GitHub/2b2t_map/download_all_2b2t.py \
+  --all --dimensions overworld --layers overlay \
+  --lods 10,9,8,7,6,5,4,3,2,1,0 \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --workers 8 --requests-per-second 8 \
+  --timeout 30 --retries 5 --discovery-samples 25 \
+  --max-tile-bytes 16777216 --space-headroom-percent 20 \
+  --resume --skip-smoke-test --no-fallback
+
+/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 \
+  /Users/luisalvarado/Documents/GitHub/2b2t_map/download_all_2b2t.py \
+  --all --dimensions overworld --layers newchunks \
+  --lods 10,9,8,7,6,5,4,3,2,1,0 \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --workers 8 --requests-per-second 8 \
+  --timeout 30 --retries 5 --discovery-samples 25 \
+  --max-tile-bytes 16777216 --space-headroom-percent 20 \
+  --resume --skip-smoke-test --no-fallback
+```
+
+No ejecutes esos comandos mientras exista otra descarga activa sobre la misma
+biblioteca; el bloqueo compartido los rechazará para proteger SQLite y los
+WebP.
+
+También se puede validar toda la biblioteca independientemente del
+descargador:
+
+```bash
+python verify_download.py \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --workers 8
+```
+
+Sin `--requeue-corrupt`, el verificador abre SQLite mediante URI `mode=ro`,
+activa `PRAGMA query_only=ON` y no ejecuta `UPDATE` ni `COMMIT`; únicamente
+lee la biblioteca y escribe el informe JSON. Por eso puede auditar una
+descarga activa sin alterar su cola.
+
+La reparación es una operación distinta y explícita:
+
+```bash
+python verify_download.py \
+  --out '/Volumes/2b2t Tiles/2b2t_tiles' \
+  --workers 8 \
+  --requeue-corrupt
+```
+
+Ese modo abre SQLite con escritura y obtiene el mismo bloqueo exclusivo que
+los descargadores. Si existe una descarga activa, termina con código 2 antes
+de abrir la base; espera a que la descarga finalice o se detenga normalmente
+antes de reencolar.
+
+El contrato conserva soporte para `overworld,nether,end` y para
+`base,overlay,newchunks`, pero la ejecución y la UI permanecen limitadas a
+Overworld por ahora.
 
 ## Descargar una región desde la interfaz
 
@@ -376,7 +618,7 @@ workspace en otro volumen.
 | `OBSIDIAN_ATLAS_TILE_ROOT` | raíz canónica `2b2t_tiles` |
 | `OBSIDIAN_ATLAS_BACKING_ROOT` | volumen físico usado en la comprobación |
 | `OBSIDIAN_ATLAS_PYTHON` | intérprete para `download_region_2b2t.py` |
-| `OBSIDIAN_ATLAS_OVERWORLD_REQUIREMENT_BYTES` | referencia de capacidad |
+| `OBSIDIAN_ATLAS_OVERWORLD_REQUIREMENT_BYTES` | override explícito del preflight de capacidad |
 
 Ejemplo:
 

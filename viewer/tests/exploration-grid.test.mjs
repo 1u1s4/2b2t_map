@@ -17,6 +17,7 @@ import {
   createExplorationState,
   createMaxDetailExplorationState,
   deserializeExplorationState,
+  explorationCellAppearance,
   isCellReviewed,
   isCellSkipped,
   moveCurrentCardinal,
@@ -414,11 +415,22 @@ test("visiting a cell selects and reviews it exactly once", () => {
 
   assert.equal(firstVisit.currentIndex, 0);
   assert.equal(firstVisit.reviewedCount, 1);
+  assert.equal(firstVisit.currentCellPreviouslyReviewed, false);
+  assert.equal(explorationCellAppearance(firstVisit, 0), "current-new");
   assert.equal(distantVisit.currentIndex, 7);
   assert.equal(distantVisit.reviewedCount, 2);
+  assert.equal(distantVisit.currentCellPreviouslyReviewed, false);
+  assert.equal(explorationCellAppearance(distantVisit, 0), "reviewed");
+  assert.equal(explorationCellAppearance(distantVisit, 7), "current-new");
   assert.equal(isCellReviewed(distantVisit, 7), true);
   assert.equal(repeatedVisit, distantVisit);
   assert.equal(returnVisit.reviewedCount, 2);
+  assert.equal(returnVisit.currentCellPreviouslyReviewed, true);
+  assert.equal(
+    explorationCellAppearance(returnVisit, 0),
+    "current-reviewed",
+  );
+  assert.equal(explorationCellAppearance(returnVisit, 7), "reviewed");
 });
 
 test("regional absences are seeded together and protected from visits", () => {
@@ -451,6 +463,7 @@ test("serialization round-trips region, fixed scale, cursor, and bitset", () => 
 
   assert.deepEqual(restored.region, state.region);
   assert.equal(restored.currentIndex, 7);
+  assert.equal(restored.currentCellPreviouslyReviewed, false);
   assert.equal(restored.reviewedCount, 3);
   assert.equal(restored.skippedCount, 1);
   assert.deepEqual(restored.reviewed, state.reviewed);
@@ -470,6 +483,7 @@ test("deserialization preserves legacy coarser-LOD sessions", () => {
   state = withCurrentCellReviewed(state);
 
   const legacyPayload = JSON.parse(serializeExplorationState(state));
+  delete legacyPayload.currentCellPreviouslyReviewed;
   delete legacyPayload.skippedCount;
   delete legacyPayload.skippedBits;
   const restored = deserializeExplorationState(JSON.stringify(legacyPayload));
@@ -478,6 +492,7 @@ test("deserialization preserves legacy coarser-LOD sessions", () => {
   assert.equal(restored.region.scale, 1 / 8);
   assert.equal(restored.region.tileSpan, 4_096);
   assert.equal(restored.currentIndex, 1);
+  assert.equal(restored.currentCellPreviouslyReviewed, true);
   assert.equal(restored.reviewedCount, 1);
   assert.equal(restored.skippedCount, 0);
   assert.equal(isCellReviewed(restored, 1), true);
@@ -517,6 +532,16 @@ test("deserialization rejects tampering, noncanonical bounds, and unsafe input",
   assert.throws(
     () => deserializeExplorationState(JSON.stringify(overlappingBits)),
     /revisada y sin datos/,
+  );
+
+  const impossibleVisualHistory = structuredClone(payload);
+  impossibleVisualHistory.currentCellPreviouslyReviewed = true;
+  assert.throws(
+    () =>
+      deserializeExplorationState(
+        JSON.stringify(impossibleVisualHistory),
+      ),
+    /historial visual actual no coincide/,
   );
 
   assert.throws(() => deserializeExplorationState("{broken"), /JSON válido/);

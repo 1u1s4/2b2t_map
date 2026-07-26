@@ -52,6 +52,12 @@ import {
   type TileLayer,
 } from "./lib/local-tile-source";
 import {
+  formatMapZoom,
+  resolveAtlasExitView,
+  resolveExplorationFocusView,
+  type ExplorationFocusRequest,
+} from "./lib/exploration-camera";
+import {
   cardinalNeighbor,
   clampCameraToExploration,
   cellForIndex,
@@ -59,10 +65,10 @@ import {
   cellIndexAtWorld,
   createMaxDetailExplorationState,
   deserializeExplorationState,
+  explorationCellAppearance,
   isCellReviewed,
   isCellSkipped,
   MAX_DETAIL_EXPLORATION_LOD,
-  MAX_DETAIL_EXPLORATION_SCALE,
   MAX_EXPLORATION_CELLS,
   minimumSafeExplorationScale,
   moveCurrentCardinal,
@@ -1190,40 +1196,17 @@ export function MapViewer() {
   }, []);
 
   const focusExploration = useCallback(
-    (state: ExplorationState) => {
-      const cell = cellForIndex(state.region, state.currentIndex);
-      const mobile = viewSize.width <= 720;
-      const horizontalInset = mobile ? 96 : 500;
-      const verticalInset = mobile ? 220 : 160;
-      const availableWidth = Math.max(
-        220,
-        viewSize.width - horizontalInset,
-      );
-      const availableHeight = Math.max(
-        220,
-        viewSize.height - verticalInset,
-      );
-      const fitScale = Math.min(
-        availableWidth / state.region.tileSpan,
-        availableHeight / state.region.tileSpan,
-      );
-      const nextScale = clamp(
-        Math.min(state.region.scale, fitScale),
-        minimumSafeExplorationScale(state.region.tileSpan, viewSize),
-        MAX_DETAIL_EXPLORATION_SCALE,
-      );
-      const nextCamera = clampCameraToExploration(
-        {
-          x: (cell.bounds.minX + cell.bounds.maxXExclusive) / 2,
-          z: (cell.bounds.minZ + cell.bounds.maxZExclusive) / 2,
-        },
-        state.region.bounds,
-        state.region.tileSpan,
-        nextScale,
+    (
+      state: ExplorationState,
+      request: ExplorationFocusRequest,
+    ) => {
+      const next = resolveExplorationFocusView(
+        state,
         viewSize,
+        request,
       );
-      setCamera(nextCamera);
-      setScale(nextScale);
+      setCamera(next.camera);
+      setScale(next.scale);
     },
     [viewSize],
   );
@@ -1255,10 +1238,10 @@ export function MapViewer() {
       }
       const next = withVisitedIndex(explorationState, index);
       setExplorationState(next);
-      focusExploration(next);
+      focusExploration(next, { mode: "preserve", scale });
       return true;
     },
-    [explorationState, focusExploration, notify],
+    [explorationState, focusExploration, notify, scale],
   );
 
   const archiveExploration = useCallback((state: ExplorationState) => {
@@ -1336,7 +1319,7 @@ export function MapViewer() {
       setRegionStatusError(null);
       clearTileCache();
       if (plan.reveal) {
-        focusExploration(next);
+        focusExploration(next, { mode: "fit" });
       }
       setDrawer(
         plan.reveal
@@ -1468,6 +1451,10 @@ export function MapViewer() {
       if (!restoredExploration) {
         const location = parseLocation(window.location.hash, []);
         if (location) {
+          atlasReturnViewRef.current = {
+            camera: { x: location.x, z: location.z },
+            scale: location.scale ?? INITIAL_SCALE,
+          };
           const cell = overviewCellAtWorld(location.x, location.z);
           if (cell) setAtlasFocusedCellIndex(cell.index);
         }
@@ -1588,7 +1575,10 @@ export function MapViewer() {
         if (index === null) return;
         const next = withVisitedIndex(explorationState, index);
         setExplorationState(next);
-        focusExploration(next);
+        focusExploration(next, {
+          mode: "preserve",
+          scale: location.scale ?? scale,
+        });
         return;
       }
       setCamera({ x: location.x, z: location.z });
@@ -1596,7 +1586,7 @@ export function MapViewer() {
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, [atlasMode, explorationState, focusExploration]);
+  }, [atlasMode, explorationState, focusExploration, scale]);
 
   useEffect(() => {
     const element = mapRef.current;
@@ -2867,12 +2857,19 @@ export function MapViewer() {
           );
           const current = index === explorationState.currentIndex;
           const reviewed = isCellReviewed(explorationState, index);
+          const appearance = explorationCellAppearance(
+            explorationState,
+            index,
+          );
           context.globalAlpha = 1;
-          context.fillStyle = current
-            ? "rgba(98, 168, 255, 0.20)"
-            : reviewed
+          context.fillStyle =
+            appearance === "current-reviewed"
+              ? "rgba(98, 168, 255, 0.20)"
+              : appearance === "reviewed"
               ? "rgba(38, 217, 199, 0.12)"
-              : "rgba(4, 11, 20, 0.05)";
+                : appearance === "current-new"
+                  ? "rgba(0, 0, 0, 0)"
+                  : "rgba(4, 11, 20, 0.05)";
           context.fillRect(point.x, point.y, cellSize, cellSize);
           context.lineWidth = current ? 3 : reviewed ? 1.5 : 1;
           context.strokeStyle = current
@@ -3272,11 +3269,16 @@ export function MapViewer() {
       setMarkMode(null);
       setCoveragePreview(null);
       setDrawer(nextDrawer);
-      if (previous) {
-        setCamera(previous.camera);
-        setScale(previous.scale);
+      const restored = resolveAtlasExitView(
+        previous,
+        explorationState !== null,
+        { camera: INITIAL_CAMERA, scale: INITIAL_SCALE },
+      );
+      if (restored) {
+        setCamera(restored.camera);
+        setScale(restored.scale);
       } else if (explorationState) {
-        focusExploration(explorationState);
+        focusExploration(explorationState, { mode: "fit" });
       }
     },
     [explorationState, focusExploration],
@@ -3719,7 +3721,7 @@ export function MapViewer() {
           if (index !== null) {
             const next = withVisitedIndex(explorationState, index);
             setExplorationState(next);
-            focusExploration(next);
+            focusExploration(next, { mode: "preserve", scale });
           }
         } else {
           setSelectedHighlightId(null);
@@ -3791,7 +3793,10 @@ export function MapViewer() {
       }
       const next = withVisitedIndex(explorationState, index);
       setExplorationState(next);
-      focusExploration(next);
+      focusExploration(next, {
+        mode: "preserve",
+        scale: result.scale ?? scale,
+      });
       notify(`Celda centrada en ${Math.round(result.x)}, ${Math.round(result.z)}`);
       return;
     }
@@ -3805,9 +3810,11 @@ export function MapViewer() {
       if (!explorationState) return;
       const next = moveCurrentCardinal(explorationState, direction);
       setExplorationState(next);
-      if (next !== explorationState) focusExploration(next);
+      if (next !== explorationState) {
+        focusExploration(next, { mode: "preserve", scale });
+      }
     },
-    [explorationState, focusExploration],
+    [explorationState, focusExploration, scale],
   );
 
   const moveAtlasFocusCardinal = useCallback(
@@ -4423,7 +4430,7 @@ export function MapViewer() {
           </div>
           <div className="coordinate-meta">
             <span>
-              {atlasMode ? "Vista global" : `Zoom ${scale.toFixed(2)}×`}
+              {atlasMode ? "Vista global" : `Zoom ${formatMapZoom(scale)}×`}
             </span>
             <i />
             <span>{atlasMode ? atlasFocusedCell.id : `LOD ${lod}`}</span>
@@ -5392,9 +5399,20 @@ export function MapViewer() {
                   <span>
                     <strong>Almacenamiento y capacidad</strong>
                     <small>
-                      {localRuntime?.capacity.fits === false
-                        ? "LuisA no tiene espacio para la descarga completa"
-                        : "Estado de LuisA y referencia completa"}
+                      {localRuntime?.globalDownload?.status === "running"
+                        ? `Descarga global ${formatProgressPercent(
+                            localRuntime.globalDownload.progressPercent,
+                          )}% · ${
+                            localRuntime.globalDownload.tilesPerSecond === null
+                              ? "midiendo"
+                              : `${localRuntime.globalDownload.tilesPerSecond.toLocaleString(
+                                  "es-GT",
+                                  { maximumFractionDigits: 2 },
+                                )} tiles/s`
+                          }`
+                        : localRuntime?.capacity.fits === false
+                          ? "LuisA no conserva la reserva del plan global"
+                          : "Estado de LuisA y preflight global"}
                     </small>
                   </span>
                 </summary>
@@ -5413,9 +5431,9 @@ export function MapViewer() {
                       <span>CAPACIDAD LOCAL · LUISA</span>
                       <strong>
                         {localRuntime?.capacity.fits === true
-                          ? "Overworld completo: capacidad verificada"
+                          ? "Plan global actual: capacidad verificada"
                           : localRuntime?.capacity.fits === false
-                            ? "Margen insuficiente para la referencia completa"
+                            ? "Margen insuficiente para el plan global"
                             : runtimeChecked
                               ? "Runtime local no configurado"
                               : "Comprobando discos…"}
@@ -5432,7 +5450,7 @@ export function MapViewer() {
                         </strong>
                       </span>
                       <span>
-                        Referencia + reserva
+                        Plan + reserva
                         <strong>
                           {formatBytes(
                             localRuntime.capacity.overworldRequirementBytes,
@@ -5447,9 +5465,157 @@ export function MapViewer() {
                       </span>
                     </div>
                   )}
+                  {localRuntime?.globalDownload ? (
+                    <section
+                      className="global-download-progress-card"
+                      data-status={localRuntime.globalDownload.status}
+                    >
+                      <div className="global-download-progress-heading">
+                        <div>
+                          <span>DESCARGA GLOBAL · OVERWORLD</span>
+                          <strong>
+                            {localRuntime.globalDownload.scope.layers
+                              .map((layer) => layer.toUpperCase())
+                              .join(" + ")}
+                            {" · "}
+                            LOD{" "}
+                            {Math.max(
+                              ...localRuntime.globalDownload.scope.lods,
+                            )}
+                            →
+                            {Math.min(
+                              ...localRuntime.globalDownload.scope.lods,
+                            )}
+                          </strong>
+                        </div>
+                        <strong>
+                          {formatProgressPercent(
+                            localRuntime.globalDownload.progressPercent,
+                          )}
+                          %
+                        </strong>
+                      </div>
+                      <div
+                        className="global-download-progress-track"
+                        role="progressbar"
+                        aria-label="Progreso de la descarga global"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={
+                          localRuntime.globalDownload.progressPercent
+                        }
+                      >
+                        <span
+                          style={{
+                            width: `${clamp(
+                              localRuntime.globalDownload.progressPercent,
+                              0,
+                              100,
+                            )}%`,
+                          }}
+                        />
+                      </div>
+                      <div className="global-download-progress-metrics">
+                        <span>
+                          Procesadas
+                          <strong>
+                            {localRuntime.globalDownload.processedRequests.toLocaleString(
+                              "es-GT",
+                            )}
+                            /
+                            {localRuntime.globalDownload.plannedRequests.toLocaleString(
+                              "es-GT",
+                            )}
+                          </strong>
+                        </span>
+                        <span>
+                          WebP
+                          <strong>
+                            {localRuntime.globalDownload.completeTiles.toLocaleString(
+                              "es-GT",
+                            )}
+                          </strong>
+                        </span>
+                        <span>
+                          Ausentes
+                          <strong>
+                            {localRuntime.globalDownload.absentTiles.toLocaleString(
+                              "es-GT",
+                            )}
+                          </strong>
+                        </span>
+                        <span>
+                          Tiles/s
+                          <strong>
+                            {localRuntime.globalDownload.tilesPerSecond === null
+                              ? "—"
+                              : localRuntime.globalDownload.tilesPerSecond.toLocaleString(
+                                  "es-GT",
+                                  { maximumFractionDigits: 2 },
+                                )}
+                          </strong>
+                        </span>
+                        <span>
+                          MB/s
+                          <strong>
+                            {localRuntime.globalDownload
+                              .megabytesPerSecond === null
+                              ? "—"
+                              : localRuntime.globalDownload.megabytesPerSecond.toLocaleString(
+                                  "es-GT",
+                                  { maximumFractionDigits: 2 },
+                                )}
+                          </strong>
+                        </span>
+                        <span>
+                          ETA
+                          <strong>
+                            {formatEta(
+                              localRuntime.globalDownload.etaSeconds,
+                            )}
+                          </strong>
+                        </span>
+                        <span>
+                          Datos
+                          <strong>
+                            {formatBytes(localRuntime.globalDownload.dataBytes)}
+                          </strong>
+                        </span>
+                        <span>
+                          Pendientes
+                          <strong>
+                            {localRuntime.globalDownload.pendingTiles.toLocaleString(
+                              "es-GT",
+                            )}
+                          </strong>
+                        </span>
+                        <span>
+                          Problemas
+                          <strong>
+                            {(
+                              localRuntime.globalDownload.corruptTiles +
+                              localRuntime.globalDownload.failedTiles
+                            ).toLocaleString("es-GT")}
+                          </strong>
+                        </span>
+                      </div>
+                      <p>
+                        {localRuntime.globalDownload.status === "running"
+                          ? "Descarga reanudable activa en segundo plano."
+                          : localRuntime.globalDownload.status ===
+                              "fallback_complete"
+                            ? "El tramo seguro terminó; el detalle restante espera capacidad."
+                            : "Último estado persistido de la descarga global."}
+                        {localRuntime.globalDownload.fallback
+                          ? " Este es el tramo que cabe con la reserva obligatoria."
+                          : ""}
+                      </p>
+                    </section>
+                  ) : null}
                   <p>
-                    Comprobación conservadora del APFS de tiles y del espacio
-                    disponible en LuisA. No inicia una descarga total.
+                    Usa el preflight global más reciente con su reserva
+                    obligatoria y el menor espacio libre entre el APFS de
+                    tiles y LuisA. No inicia una descarga total.
                   </p>
                 </section>
               </details>
@@ -6534,7 +6700,10 @@ export function MapViewer() {
               return;
             }
             if (currentExplorationCell && explorationState) {
-              focusExploration(explorationState);
+              focusExploration(explorationState, {
+                mode: "preserve",
+                scale,
+              });
             } else {
               setCamera(INITIAL_CAMERA);
               setScale(INITIAL_SCALE);

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from download_lock import RegionDownloadLock, RegionDownloadLockedError
 from tile_core import (
     WebPValidationError,
     atomic_write_json,
@@ -134,6 +135,38 @@ def iter_complete_rows(
         last_id = int(rows[-1]["id"])
 
 
+def open_database(
+    database_path: Path,
+    *,
+    writable: bool,
+) -> sqlite3.Connection:
+    """Open SQLite read-only unless an explicit repair was requested."""
+
+    if writable:
+        connection = sqlite3.connect(database_path, timeout=30)
+    else:
+        database_uri = f"{database_path.resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(
+            database_uri,
+            timeout=30,
+            uri=True,
+        )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=30000")
+    if not writable:
+        connection.execute("PRAGMA query_only=ON")
+        query_only = connection.execute("PRAGMA query_only").fetchone()
+        if query_only is None or int(query_only[0]) != 1:
+            connection.close()
+            raise RuntimeError("SQLite no confirmó el modo query_only")
+        # Keep every paged SELECT on one WAL snapshot. Without an explicit
+        # read transaction, tiles completed by the live downloader between
+        # pages could enter the report even though they were not in the
+        # initial count.
+        connection.execute("BEGIN")
+    return connection
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     output_root = args.out.expanduser().resolve()
@@ -151,113 +184,156 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"No existe SQLite: {database_path}", file=sys.stderr)
         return 2
 
-    connection = sqlite3.connect(database_path, timeout=30)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout=30000")
-    initial = connection.execute(
-        """
-        SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id
-        FROM tiles
-        WHERE status='complete'
-        """
-    ).fetchone()
-    assert initial is not None
-    total_rows = int(initial["count"])
-    max_id = int(initial["max_id"])
-    print(f"Verificando {total_rows:,} tiles completos...")
-
-    valid = 0
-    invalid = 0
-    verified_bytes = 0
-    errors: list[dict[str, object]] = []
-    max_in_flight = max(args.workers, args.workers * FUTURES_PER_WORKER)
-    rows = iter_complete_rows(connection, max_id=max_id)
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=args.workers,
-        thread_name_prefix="verify",
-    ) as executor:
-        futures: set[concurrent.futures.Future[CheckResult]] = set()
-        exhausted = False
-        index = 0
-        while futures or not exhausted:
-            while len(futures) < max_in_flight and not exhausted:
-                try:
-                    row = next(rows)
-                except StopIteration:
-                    exhausted = True
-                    break
-                futures.add(
-                    executor.submit(
-                        check_file,
-                        int(row["id"]),
-                        output_root / str(row["relative_path"]),
-                        (
-                            int(row["size_bytes"])
-                            if row["size_bytes"] is not None
-                            else None
-                        ),
-                        str(row["sha256"]) if row["sha256"] else None,
-                    )
-                )
-            if not futures:
-                continue
-
-            done, futures = concurrent.futures.wait(
-                futures,
-                return_when=concurrent.futures.FIRST_COMPLETED,
+    download_lock: RegionDownloadLock | None = None
+    if args.requeue_corrupt:
+        download_lock = RegionDownloadLock(output_root)
+        try:
+            download_lock.acquire()
+        except RegionDownloadLockedError as exc:
+            print(
+                "No se puede reencolar mientras otra descarga usa la "
+                f"biblioteca: {exc}",
+                file=sys.stderr,
             )
-            for future in done:
-                index += 1
-                result = future.result()
-                if result.valid:
-                    valid += 1
-                    verified_bytes += result.size_bytes
-                    connection.execute(
-                        """
-                        UPDATE tiles SET size_bytes=?, sha256=?,
-                            error_message=NULL, updated_at=datetime('now')
-                        WHERE id=?
-                        """,
-                        (result.size_bytes, result.sha256, result.row_id),
-                    )
-                else:
-                    invalid += 1
-                    errors.append(
-                        {
-                            "row_id": result.row_id,
-                            "path": str(result.path),
-                            "error": result.error,
-                        }
-                    )
-                    if args.requeue_corrupt:
-                        connection.execute(
-                            """
-                            UPDATE tiles SET status='pending', sha256=NULL,
-                                error_message=?, updated_at=datetime('now')
-                            WHERE id=?
-                            """,
-                            (
-                                f"verify_download.py: {result.error}",
-                                result.row_id,
-                            ),
-                        )
-                if index % 1000 == 0:
-                    connection.commit()
-                    print(
-                        f"\r{index:,}/{total_rows:,} "
-                        f"válidos={valid:,} inválidos={invalid:,}",
-                        end="",
-                        flush=True,
-                    )
-    connection.commit()
+            return 2
 
-    status_counts = {
-        str(row["status"]): int(row["count"])
-        for row in connection.execute(
-            "SELECT status, COUNT(*) AS count FROM tiles GROUP BY status"
+    try:
+        connection = open_database(
+            database_path,
+            writable=args.requeue_corrupt,
         )
-    }
-    connection.close()
+        try:
+            initial = connection.execute(
+                """
+                SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id
+                FROM tiles
+                WHERE status='complete'
+                """
+            ).fetchone()
+            assert initial is not None
+            total_rows = int(initial["count"])
+            max_id = int(initial["max_id"])
+            print(f"Verificando {total_rows:,} tiles completos...")
+
+            valid = 0
+            invalid = 0
+            verified_bytes = 0
+            errors: list[dict[str, object]] = []
+            max_in_flight = max(
+                args.workers,
+                args.workers * FUTURES_PER_WORKER,
+            )
+            rows = iter_complete_rows(connection, max_id=max_id)
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=args.workers,
+                thread_name_prefix="verify",
+            ) as executor:
+                futures: set[
+                    concurrent.futures.Future[CheckResult]
+                ] = set()
+                exhausted = False
+                index = 0
+                while futures or not exhausted:
+                    while len(futures) < max_in_flight and not exhausted:
+                        try:
+                            row = next(rows)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        futures.add(
+                            executor.submit(
+                                check_file,
+                                int(row["id"]),
+                                output_root / str(row["relative_path"]),
+                                (
+                                    int(row["size_bytes"])
+                                    if row["size_bytes"] is not None
+                                    else None
+                                ),
+                                (
+                                    str(row["sha256"])
+                                    if row["sha256"]
+                                    else None
+                                ),
+                            )
+                        )
+                    if not futures:
+                        continue
+
+                    done, futures = concurrent.futures.wait(
+                        futures,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        index += 1
+                        result = future.result()
+                        if result.valid:
+                            valid += 1
+                            verified_bytes += result.size_bytes
+                            if args.requeue_corrupt:
+                                connection.execute(
+                                    """
+                                    UPDATE tiles SET size_bytes=?, sha256=?,
+                                        error_message=NULL,
+                                        updated_at=datetime('now')
+                                    WHERE id=?
+                                    """,
+                                    (
+                                        result.size_bytes,
+                                        result.sha256,
+                                        result.row_id,
+                                    ),
+                                )
+                        else:
+                            invalid += 1
+                            errors.append(
+                                {
+                                    "row_id": result.row_id,
+                                    "path": str(result.path),
+                                    "error": result.error,
+                                }
+                            )
+                            if args.requeue_corrupt:
+                                connection.execute(
+                                    """
+                                    UPDATE tiles SET status='pending',
+                                        sha256=NULL, error_message=?,
+                                        updated_at=datetime('now')
+                                    WHERE id=?
+                                    """,
+                                    (
+                                        "verify_download.py: "
+                                        f"{result.error}",
+                                        result.row_id,
+                                    ),
+                                )
+                        if index % 1000 == 0:
+                            if args.requeue_corrupt:
+                                connection.commit()
+                            print(
+                                f"\r{index:,}/{total_rows:,} "
+                                f"válidos={valid:,} inválidos={invalid:,}",
+                                end="",
+                                flush=True,
+                            )
+            if args.requeue_corrupt:
+                connection.commit()
+
+            status_counts = {
+                str(row["status"]): int(row["count"])
+                for row in connection.execute(
+                    """
+                    SELECT status, COUNT(*) AS count
+                    FROM tiles
+                    GROUP BY status
+                    """
+                )
+            }
+        finally:
+            connection.close()
+    finally:
+        if download_lock is not None:
+            download_lock.release()
     report = {
         "database": str(database_path),
         "output": str(output_root),

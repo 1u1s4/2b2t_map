@@ -897,6 +897,108 @@ canvas:focus-visible {
   line-height: 1.5;
 }
 
+.global-download-progress-card {
+  margin-top: 11px;
+  padding: 10px;
+  border: 1px solid rgba(38, 217, 199, 0.24);
+  border-radius: 11px;
+  background:
+    linear-gradient(145deg, rgba(38, 217, 199, 0.07), transparent 62%),
+    rgba(4, 15, 24, 0.72);
+}
+
+.global-download-progress-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.global-download-progress-heading span,
+.global-download-progress-heading strong {
+  display: block;
+}
+
+.global-download-progress-heading span {
+  color: var(--mint);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 7px;
+  letter-spacing: 0.08em;
+}
+
+.global-download-progress-heading div > strong {
+  margin-top: 3px;
+  color: var(--text);
+  font-size: 9px;
+}
+
+.global-download-progress-heading > strong {
+  color: var(--mint);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.global-download-progress-track {
+  display: block;
+  height: 6px;
+  margin-top: 9px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.075);
+}
+
+.global-download-progress-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--blue), var(--mint));
+  box-shadow: 0 0 12px rgba(38, 217, 199, 0.3);
+  transition: width 260ms ease;
+}
+
+.global-download-progress-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 9px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--line);
+}
+
+.global-download-progress-metrics > span {
+  min-width: 0;
+  padding: 7px;
+  color: var(--quiet);
+  background: rgba(7, 17, 31, 0.94);
+  font-size: 7px;
+}
+
+.global-download-progress-metrics strong {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-download-progress-card > p {
+  margin: 8px 0 0;
+  color: var(--quiet);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.global-download-progress-card[data-status="error"],
+.global-download-progress-card[data-status="incomplete"] {
+  border-color: rgba(255, 109, 122, 0.35);
+}
+
 .region-actions,
 .exploration-transfer {
   display: flex;

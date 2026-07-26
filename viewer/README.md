@@ -23,8 +23,11 @@ Después abre [http://localhost:3001](http://localhost:3001).
 ```
 
 El lanzador requiere `/Volumes/LuisA`, `screen`, Python y las dependencias de
-este directorio. Prefiere `/Volumes/2b2t Tiles/2b2t_tiles`, pero si ese volumen
-no está montado usa automáticamente `../2b2t_tiles`. La primera instalación es:
+este directorio. Si existe
+`/Volumes/LuisA/2b2t_map/2b2t_tiles.sparsebundle`, lo monta de forma segura en
+`/Volumes/2b2t Tiles` y usa su biblioteca. Solo cuando el sparsebundle no
+existe recurre automáticamente a `../2b2t_tiles`. `--status` y `--stop` no
+montan ni desmontan el volumen. La primera instalación es:
 
 ```bash
 cd viewer
@@ -71,7 +74,9 @@ Variables aceptadas:
 
 Si `OBSIDIAN_ATLAS_PYTHON` no se define, el runtime intenta
 `../.venv/bin/python` y luego `python3`. La referencia predeterminada es
-`1,458,909,433,254` bytes.
+`1,458,909,433,254` bytes. Cuando `estimate.json` contiene un preflight
+estricto de Overworld, la tarjeta usa en su lugar
+`full_plan.required_with_headroom`; una variable explícita conserva prioridad.
 
 No uses un hostname público. El launcher canónico y los ejemplos limitan el
 servidor a `localhost`.
@@ -87,7 +92,9 @@ servidor a `localhost`.
    Si falta algo, elige el ritmo y pulsa **Descargar región completa**.
 6. Espera a que el estado exacto llegue a 100%, o detén y reanuda el trabajo
    más tarde. Solo entonces se habilita **Explorar región**.
-7. La sesión abre su primera celda y la marca como revisada automáticamente.
+7. La sesión cuenta su primera celda como visitada, pero no le aplica relleno
+   mientras siga siendo la celda actual. La marca se vuelve visible al salir o
+   al regresar a ella.
 
 Desde **Explorar** también puedes usar **Elegir región en el Atlas**. Dibujar
 una región, usar la vista o introducir coordenadas permanece disponible como
@@ -141,10 +148,13 @@ La cruceta visible y las flechas del teclado mueven exactamente una celda:
 La tarjeta muestra porcentaje, revisadas, total revisable, celdas sin datos,
 fila, columna y límites X/Z de la celda actual. La cruceta sigue disponible
 aunque el usuario acerque o desplace visualmente el mapa; al cambiar de celda,
-la cámara vuelve a encajarla sin modificar su LOD de datos.
+la cámara la recentra conservando exactamente el zoom manual y sin modificar
+su LOD de datos.
 
-Entrar a una celda mediante inicio, cruceta, teclado, clic o búsqueda la marca
-automáticamente como revisada. Volver a visitarla no incrementa el contador.
+Al cambiar mediante inicio, cruceta, teclado, clic o búsqueda, la celda nueva
+se cuenta automáticamente al entrar. Mientras sea una visita nueva y continúe
+siendo la actual no recibe relleno; la celda abandonada muestra su marca, y
+volver a una ya revisada conserva esa marca sin incrementar el contador.
 Si `base` fue confirmado como `404` durante la descarga completa, queda en un
 bitset **Sin datos**, se excluye del denominador y nunca se cuenta como
 revisada.
@@ -226,7 +236,12 @@ composición de imágenes y cuadrículas de coordenadas.
 - bytes registrados en la biblioteca;
 - referencia del Overworld;
 - margen y resultado de la comparación;
+- progreso global sanitizado desde `progress.json`, cuando existe;
 - trabajo regional actual.
+
+El progreso global incluye alcance, porcentaje, contadores, tiles/s, MB/s,
+bytes y ETA. No proyecta rutas locales, errores internos ni comandos de
+reanudación al navegador.
 
 `GET /api/local-atlas/coverage?layer=base&lod=0..3` consulta SQLite en modo
 solo lectura. La consulta se limita a las bandas publicadas: tiles ajenos a la

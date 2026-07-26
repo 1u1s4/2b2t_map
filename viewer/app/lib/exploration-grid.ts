@@ -169,6 +169,13 @@ export interface ExplorationState {
   /** Row-major cell index. */
   readonly currentIndex: number;
   /**
+   * Whether the current cell had already been reviewed before it became the
+   * current selection. A first visit can therefore count toward progress
+   * without obscuring the map; returning to that cell restores its reviewed
+   * fill.
+   */
+  readonly currentCellPreviouslyReviewed: boolean;
+  /**
    * Bit N represents row-major cell N. Callers must treat this byte array as
    * immutable; state-changing helpers return a defensive copy.
    */
@@ -190,6 +197,8 @@ type SerializedExplorationState = {
     readonly scale: number;
   };
   readonly currentIndex: number;
+  /** Optional so earlier version-1 exports remain readable. */
+  readonly currentCellPreviouslyReviewed?: boolean;
   readonly reviewedCount: number;
   readonly reviewedBits: string;
   /** Optional only so version-1 exports from earlier builds remain readable. */
@@ -596,6 +605,7 @@ export function createExplorationState(
   return Object.freeze({
     region,
     currentIndex: 0,
+    currentCellPreviouslyReviewed: false,
     reviewed: new Uint8Array(cellBitsetByteLength(region.cellCount)),
     reviewedCount: 0,
     skipped: new Uint8Array(cellBitsetByteLength(region.cellCount)),
@@ -641,6 +651,27 @@ export function isCellSkipped(
   return (state.skipped[location.byte] & location.mask) !== 0;
 }
 
+export type ExplorationCellAppearance =
+  | "current-new"
+  | "current-reviewed"
+  | "reviewed"
+  | "pending";
+
+export function explorationCellAppearance(
+  state: ExplorationState,
+  index: number,
+): ExplorationCellAppearance {
+  assertExplorationState(state);
+  assertCellIndex(state.region, index);
+  const reviewed = isCellReviewed(state, index);
+  if (index === state.currentIndex) {
+    return reviewed && state.currentCellPreviouslyReviewed
+      ? "current-reviewed"
+      : "current-new";
+  }
+  return reviewed ? "reviewed" : "pending";
+}
+
 export function withCellReviewed(
   state: ExplorationState,
   index: number,
@@ -665,6 +696,10 @@ export function withCellReviewed(
   }
   return Object.freeze({
     ...state,
+    currentCellPreviouslyReviewed:
+      !reviewed && index === state.currentIndex
+        ? false
+        : state.currentCellPreviouslyReviewed,
     reviewed: nextBits,
     reviewedCount: state.reviewedCount + (reviewed ? 1 : -1),
     skipped: nextSkipped,
@@ -704,6 +739,10 @@ export function withCellSkipped(
   }
   return Object.freeze({
     ...state,
+    currentCellPreviouslyReviewed:
+      skipped && index === state.currentIndex
+        ? false
+        : state.currentCellPreviouslyReviewed,
     reviewed: nextReviewed,
     reviewedCount:
       state.reviewedCount - (skipped && currentlyReviewed ? 1 : 0),
@@ -733,6 +772,8 @@ export function withCellsSkipped(
   const nextReviewed = state.reviewed.slice();
   let skippedCount = state.skippedCount;
   let reviewedCount = state.reviewedCount;
+  let currentCellPreviouslyReviewed =
+    state.currentCellPreviouslyReviewed;
   let changed = false;
 
   for (const index of indexes) {
@@ -746,11 +787,15 @@ export function withCellsSkipped(
       nextReviewed[location.byte] &= ~location.mask;
       reviewedCount -= 1;
     }
+    if (index === state.currentIndex) {
+      currentCellPreviouslyReviewed = false;
+    }
   }
 
   return changed
     ? Object.freeze({
         ...state,
+        currentCellPreviouslyReviewed,
         reviewed: nextReviewed,
         reviewedCount,
         skipped: nextSkipped,
@@ -765,9 +810,12 @@ export function withCurrentIndex(
 ): ExplorationState {
   assertExplorationState(state);
   assertCellIndex(state.region, index);
-  return index === state.currentIndex
-    ? state
-    : Object.freeze({ ...state, currentIndex: index });
+  if (index === state.currentIndex) return state;
+  return Object.freeze({
+    ...state,
+    currentIndex: index,
+    currentCellPreviouslyReviewed: isCellReviewed(state, index),
+  });
 }
 
 /**
@@ -857,6 +905,24 @@ function assertExplorationState(state: ExplorationState): void {
   assertCellIndex(region, state.currentIndex);
   assertCanonicalCellBits(region, state.reviewed, "revisado");
   assertCanonicalCellBits(region, state.skipped, "sin datos");
+  if (typeof state.currentCellPreviouslyReviewed !== "boolean") {
+    fail(
+      "El historial visual de la celda actual no es válido",
+      "INVALID_STATE",
+    );
+  }
+  const currentLocation = bitLocation(state.currentIndex);
+  const currentReviewed =
+    (state.reviewed[currentLocation.byte] & currentLocation.mask) !== 0;
+  if (
+    state.currentCellPreviouslyReviewed &&
+    !currentReviewed
+  ) {
+    fail(
+      "La celda actual no puede ser previa si todavía no está revisada",
+      "INVALID_STATE",
+    );
+  }
   if (
     !Number.isSafeInteger(state.reviewedCount) ||
     state.reviewedCount < 0 ||
@@ -954,6 +1020,8 @@ export function serializeExplorationState(state: ExplorationState): string {
       scale: state.region.scale,
     },
     currentIndex: state.currentIndex,
+    currentCellPreviouslyReviewed:
+      state.currentCellPreviouslyReviewed,
     reviewedCount: state.reviewedCount,
     reviewedBits: encodeBase64Url(state.reviewed),
     skippedCount: state.skippedCount,
@@ -1020,6 +1088,8 @@ export function deserializeExplorationState(
     fail("Los límites exportados no están alineados a tiles", "INVALID_SERIALIZATION");
   }
   const currentIndex = value.currentIndex;
+  const serializedCurrentCellPreviouslyReviewed =
+    value.currentCellPreviouslyReviewed;
   const serializedReviewedCount = value.reviewedCount;
   const hasSkippedState =
     value.skippedCount !== undefined || value.skippedBits !== undefined;
@@ -1029,6 +1099,8 @@ export function deserializeExplorationState(
     !Number.isSafeInteger(currentIndex) ||
     currentIndex < 0 ||
     currentIndex >= region.cellCount ||
+    (serializedCurrentCellPreviouslyReviewed !== undefined &&
+      typeof serializedCurrentCellPreviouslyReviewed !== "boolean") ||
     typeof serializedReviewedCount !== "number" ||
     !Number.isSafeInteger(serializedReviewedCount) ||
     serializedReviewedCount < 0 ||
@@ -1081,10 +1153,22 @@ export function deserializeExplorationState(
       );
     }
   }
+  const currentLocation = bitLocation(currentIndex);
+  const currentReviewed =
+    (reviewed[currentLocation.byte] & currentLocation.mask) !== 0;
+  const currentCellPreviouslyReviewed =
+    serializedCurrentCellPreviouslyReviewed ?? currentReviewed;
+  if (currentCellPreviouslyReviewed && !currentReviewed) {
+    fail(
+      "El historial visual actual no coincide con el bitset",
+      "INVALID_SERIALIZATION",
+    );
+  }
 
   return Object.freeze({
     region,
     currentIndex,
+    currentCellPreviouslyReviewed,
     reviewed,
     reviewedCount,
     skipped,

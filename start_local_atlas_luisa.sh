@@ -3,7 +3,9 @@ set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 viewer_dir="${project_dir}/viewer"
-external_tile_root="/Volumes/2b2t Tiles/2b2t_tiles"
+external_volume="/Volumes/2b2t Tiles"
+external_tile_root="${external_volume}/2b2t_tiles"
+sparsebundle_path="/Volumes/LuisA/2b2t_map/2b2t_tiles.sparsebundle"
 repository_tile_root="${project_dir}/2b2t_tiles"
 tile_root="${OBSIDIAN_ATLAS_TILE_ROOT:-${external_tile_root}}"
 backing_root="/Volumes/LuisA"
@@ -36,9 +38,10 @@ Uso:
   ./start_local_atlas_luisa.sh --stop
 
 Inicia el atlas local en una sesión screen supervisada y limitada a localhost.
-Usa la biblioteca externa si está montada; si no, emplea la copia verificada
-2b2t_tiles del repositorio. El workspace siempre se guarda en LuisA. El modo
-interno --serve-loop y sus auxiliares no deben ejecutarse directamente.
+Monta y usa la biblioteca externa cuando existe su sparsebundle; si no existe,
+emplea la copia verificada 2b2t_tiles del repositorio. El workspace siempre se
+guarda en LuisA. El modo interno --serve-loop y sus auxiliares no deben
+ejecutarse directamente.
 EOF
 }
 
@@ -139,8 +142,46 @@ validate_commands() {
   fi
 }
 
+external_volume_is_mounted() {
+  /sbin/mount |
+    /usr/bin/grep -F " on ${external_volume} (" >/dev/null
+}
+
+ensure_external_tile_volume() {
+  if [[ -n "${OBSIDIAN_ATLAS_TILE_ROOT:-}" ]]; then
+    return 0
+  fi
+
+  if ! external_volume_is_mounted; then
+    if [[ ! -e "${sparsebundle_path}" ]]; then
+      return 0
+    fi
+    if ! /usr/bin/hdiutil attach \
+      -nobrowse \
+      -noautoopen \
+      -mountpoint "${external_volume}" \
+      "${sparsebundle_path}" </dev/null; then
+      if ! external_volume_is_mounted; then
+        echo "No se pudo montar la biblioteca: ${sparsebundle_path}" >&2
+        return 1
+      fi
+    fi
+  fi
+
+  if ! external_volume_is_mounted; then
+    echo "El volumen externo no quedó montado en ${external_volume}." >&2
+    return 1
+  fi
+  if [[ ! -d "${external_tile_root}" ]]; then
+    echo "El volumen no contiene la biblioteca: ${external_tile_root}" >&2
+    return 1
+  fi
+  tile_root="${external_tile_root}"
+}
+
 validate_environment() {
   validate_commands
+  ensure_external_tile_volume
   if [[ ! -d "${tile_root}" || ! -r "${tile_root}" ||
     ! -w "${tile_root}" ]]; then
     echo "La biblioteca local no está disponible: ${tile_root}" >&2

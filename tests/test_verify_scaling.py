@@ -78,6 +78,182 @@ class RowPagingTests(unittest.TestCase):
             self.assertTrue(all("LIMIT 5" in query for query in paged_selects))
 
 
+class DatabaseModeTests(unittest.TestCase):
+    def test_read_only_connection_enforces_query_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "tiles.sqlite3"
+            create_database(database, 1)
+
+            connection = verifier.open_database(database, writable=False)
+            try:
+                self.assertEqual(
+                    int(connection.execute("PRAGMA query_only").fetchone()[0]),
+                    1,
+                )
+                self.assertTrue(connection.in_transaction)
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute(
+                        "UPDATE tiles SET status='pending' WHERE id=1"
+                    )
+            finally:
+                connection.close()
+
+    def test_default_main_uses_uri_read_only_without_updates_or_commits(
+        self,
+    ) -> None:
+        class TrackingConnection:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                object.__setattr__(self, "_connection", connection)
+                object.__setattr__(self, "commit_calls", 0)
+                object.__setattr__(self, "statements", [])
+
+            def __getattr__(self, name: str):
+                return getattr(self._connection, name)
+
+            def __setattr__(self, name: str, value: object) -> None:
+                if name in {"_connection", "commit_calls", "statements"}:
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(self._connection, name, value)
+
+            def execute(self, statement: str, *args):
+                self.statements.append(statement)
+                return self._connection.execute(statement, *args)
+
+            def commit(self) -> None:
+                self.commit_calls += 1
+                self._connection.commit()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "tiles.sqlite3"
+            report = root / "report.json"
+            create_database(database, 1)
+            real_connect = sqlite3.connect
+            connect_calls: list[
+                tuple[object, tuple[object, ...], dict[str, object]]
+            ] = []
+            connections: list[TrackingConnection] = []
+
+            def tracking_connect(
+                database_arg: object,
+                *args: object,
+                **kwargs: object,
+            ) -> TrackingConnection:
+                connect_calls.append((database_arg, args, kwargs))
+                tracked = TrackingConnection(
+                    real_connect(database_arg, *args, **kwargs)
+                )
+                connections.append(tracked)
+                return tracked
+
+            def fake_check(
+                row_id: int,
+                path: Path,
+                _expected_size: int | None,
+                _expected_hash: str | None,
+            ) -> verifier.CheckResult:
+                return verifier.CheckResult(
+                    row_id,
+                    path,
+                    True,
+                    size_bytes=99,
+                    sha256="b" * 64,
+                )
+
+            with (
+                verifier.RegionDownloadLock(root),
+                mock.patch.object(
+                    verifier.sqlite3,
+                    "connect",
+                    side_effect=tracking_connect,
+                ),
+                mock.patch.object(
+                    verifier,
+                    "check_file",
+                    side_effect=fake_check,
+                ),
+            ):
+                exit_code = verifier.main(
+                    [
+                        "--out",
+                        str(root),
+                        "--database",
+                        str(database),
+                        "--report",
+                        str(report),
+                        "--workers",
+                        "1",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(connect_calls), 1)
+            database_arg, positional, keywords = connect_calls[0]
+            self.assertEqual(positional, ())
+            self.assertIsInstance(database_arg, str)
+            self.assertIn("mode=ro", str(database_arg))
+            self.assertTrue(keywords["uri"])
+            self.assertEqual(connections[0].commit_calls, 0)
+            statements = [
+                statement.strip().upper()
+                for statement in connections[0].statements
+            ]
+            self.assertIn("PRAGMA QUERY_ONLY=ON", statements)
+            self.assertFalse(
+                any(statement.startswith("UPDATE") for statement in statements)
+            )
+
+            connection = sqlite3.connect(database)
+            try:
+                size_bytes, sha256, status = connection.execute(
+                    """
+                    SELECT size_bytes, sha256, status
+                    FROM tiles
+                    WHERE id=1
+                    """
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(
+                (size_bytes, sha256, status),
+                (1, "0" * 64, "complete"),
+            )
+            self.assertEqual(
+                json.loads(report.read_text(encoding="utf-8"))["valid"],
+                1,
+            )
+
+    def test_requeue_refuses_active_shared_lock_before_opening_database(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "tiles.sqlite3"
+            report = root / "report.json"
+            create_database(database, 1)
+
+            with (
+                verifier.RegionDownloadLock(root),
+                mock.patch.object(verifier, "open_database") as open_database,
+            ):
+                exit_code = verifier.main(
+                    [
+                        "--out",
+                        str(root),
+                        "--database",
+                        str(database),
+                        "--report",
+                        str(report),
+                        "--requeue-corrupt",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 2)
+            open_database.assert_not_called()
+            self.assertFalse(report.exists())
+
+
 class BoundedConcurrencyTests(unittest.TestCase):
     def test_main_bounds_futures_to_small_worker_multiple(self) -> None:
         real_executor = concurrent.futures.ThreadPoolExecutor
@@ -202,10 +378,17 @@ class BoundedConcurrencyTests(unittest.TestCase):
                     sha256="b" * 64,
                 )
 
-            with mock.patch.object(
-                verifier,
-                "check_file",
-                side_effect=fake_check,
+            with (
+                mock.patch.object(
+                    verifier,
+                    "check_file",
+                    side_effect=fake_check,
+                ),
+                mock.patch.object(
+                    verifier,
+                    "open_database",
+                    wraps=verifier.open_database,
+                ) as open_database,
             ):
                 exit_code = verifier.main(
                     [
@@ -223,21 +406,42 @@ class BoundedConcurrencyTests(unittest.TestCase):
 
             connection = sqlite3.connect(database)
             try:
-                statuses = dict(
-                    connection.execute(
-                        "SELECT id, status FROM tiles ORDER BY id"
+                records = {
+                    int(row_id): (
+                        str(status),
+                        int(size_bytes),
+                        str(sha256) if sha256 is not None else None,
                     )
-                )
+                    for row_id, status, size_bytes, sha256 in connection.execute(
+                        """
+                        SELECT id, status, size_bytes, sha256
+                        FROM tiles
+                        ORDER BY id
+                        """
+                    )
+                }
             finally:
                 connection.close()
             payload = json.loads(report.read_text(encoding="utf-8"))
 
             self.assertEqual(exit_code, 1)
-            self.assertEqual(statuses, {1: "complete", 2: "pending"})
+            open_database.assert_called_once_with(
+                database.resolve(),
+                writable=True,
+            )
+            self.assertEqual(
+                records,
+                {
+                    1: ("complete", 1, "b" * 64),
+                    2: ("pending", 1, None),
+                },
+            )
             self.assertEqual(payload["checked"], 2)
             self.assertEqual(payload["valid"], 1)
             self.assertEqual(payload["invalid"], 1)
             self.assertEqual(payload["requeued"], 1)
+            with verifier.RegionDownloadLock(root):
+                pass
 
 
 if __name__ == "__main__":

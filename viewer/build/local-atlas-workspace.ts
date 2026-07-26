@@ -62,6 +62,7 @@ export interface SerializedExplorationWorkspaceState {
     readonly scale: number;
   };
   readonly currentIndex: number;
+  readonly currentCellPreviouslyReviewed: boolean;
   readonly reviewedCount: number;
   readonly reviewedBits: string;
   readonly skippedCount: number;

@@ -107,6 +107,37 @@ export interface LocalAtlasRegionStatus {
   }[];
 }
 
+export type LocalGlobalDownloadStatus =
+  | "running"
+  | "complete"
+  | "fallback_complete"
+  | "stopped"
+  | "incomplete"
+  | "error";
+
+export interface LocalGlobalDownloadProgress {
+  readonly status: LocalGlobalDownloadStatus;
+  readonly processedRequests: number;
+  readonly plannedRequests: number;
+  readonly completeTiles: number;
+  readonly absentTiles: number;
+  readonly corruptTiles: number;
+  readonly failedTiles: number;
+  readonly pendingTiles: number;
+  readonly progressPercent: number;
+  readonly dataBytes: number | null;
+  readonly tilesPerSecond: number | null;
+  readonly megabytesPerSecond: number | null;
+  readonly etaSeconds: number | null;
+  readonly updatedAt: string;
+  readonly fallback: boolean;
+  readonly scope: {
+    readonly dimensions: readonly ("overworld" | "nether" | "end")[];
+    readonly layers: readonly ("base" | "overlay" | "newchunks")[];
+    readonly lods: readonly number[];
+  };
+}
+
 export interface LocalAtlasRuntime {
   readonly localOnly: true;
   readonly mutationToken: string;
@@ -118,6 +149,7 @@ export interface LocalAtlasRuntime {
     readonly revision: number | null;
     readonly updatedAt: string | null;
   };
+  readonly globalDownload: LocalGlobalDownloadProgress | null;
   readonly job: LocalRegionJob | null;
 }
 
@@ -189,6 +221,7 @@ export interface LocalAtlasWorkspaceExploration {
       readonly scale: number;
     };
     readonly currentIndex: number;
+    readonly currentCellPreviouslyReviewed: boolean;
     readonly reviewedCount: number;
     readonly reviewedBits: string;
     readonly skippedCount: number;
@@ -249,6 +282,15 @@ const JOB_STATUSES = new Set<LocalJobStatus>([
   "stopping",
   "complete",
   "stopped",
+  "error",
+]);
+
+const GLOBAL_DOWNLOAD_STATUSES = new Set<LocalGlobalDownloadStatus>([
+  "running",
+  "complete",
+  "fallback_complete",
+  "stopped",
+  "incomplete",
   "error",
 ]);
 
@@ -615,6 +657,97 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
   };
 }
 
+function readGlobalDownload(
+  value: unknown,
+): LocalGlobalDownloadProgress | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value) || !isRecord(value.scope)) return undefined;
+  const dimensions = value.scope.dimensions;
+  const layers = value.scope.layers;
+  const lods = value.scope.lods;
+  if (
+    typeof value.status !== "string" ||
+    !GLOBAL_DOWNLOAD_STATUSES.has(value.status as LocalGlobalDownloadStatus) ||
+    !nonNegativeSafeInteger(value.processedRequests) ||
+    !nonNegativeSafeInteger(value.plannedRequests) ||
+    value.processedRequests > value.plannedRequests ||
+    !nonNegativeSafeInteger(value.completeTiles) ||
+    !nonNegativeSafeInteger(value.absentTiles) ||
+    !nonNegativeSafeInteger(value.corruptTiles) ||
+    !nonNegativeSafeInteger(value.failedTiles) ||
+    !nonNegativeSafeInteger(value.pendingTiles) ||
+    typeof value.progressPercent !== "number" ||
+    !Number.isFinite(value.progressPercent) ||
+    value.progressPercent < 0 ||
+    value.progressPercent > 100 ||
+    !(value.dataBytes === null || nonNegativeSafeInteger(value.dataBytes)) ||
+    !nullableNumber(value.tilesPerSecond) ||
+    (value.tilesPerSecond !== null && value.tilesPerSecond < 0) ||
+    !nullableNumber(value.megabytesPerSecond) ||
+    (value.megabytesPerSecond !== null &&
+      value.megabytesPerSecond < 0) ||
+    !nullableNumber(value.etaSeconds) ||
+    (value.etaSeconds !== null && value.etaSeconds < 0) ||
+    !canonicalTimestamp(value.updatedAt) ||
+    typeof value.fallback !== "boolean" ||
+    !Array.isArray(dimensions) ||
+    dimensions.length === 0 ||
+    dimensions.length > 3 ||
+    !dimensions.every(
+      (dimension) =>
+        dimension === "overworld" ||
+        dimension === "nether" ||
+        dimension === "end",
+    ) ||
+    new Set(dimensions).size !== dimensions.length ||
+    !Array.isArray(layers) ||
+    layers.length === 0 ||
+    layers.length > 3 ||
+    !layers.every(
+      (layer) =>
+        layer === "base" ||
+        layer === "overlay" ||
+        layer === "newchunks",
+    ) ||
+    new Set(layers).size !== layers.length ||
+    !Array.isArray(lods) ||
+    lods.length === 0 ||
+    lods.length > 11 ||
+    !lods.every(
+      (lod) =>
+        Number.isSafeInteger(lod) &&
+        Number(lod) >= 0 &&
+        Number(lod) <= 10,
+    ) ||
+    new Set(lods).size !== lods.length
+  ) {
+    return undefined;
+  }
+  return {
+    status: value.status as LocalGlobalDownloadStatus,
+    processedRequests: value.processedRequests,
+    plannedRequests: value.plannedRequests,
+    completeTiles: value.completeTiles,
+    absentTiles: value.absentTiles,
+    corruptTiles: value.corruptTiles,
+    failedTiles: value.failedTiles,
+    pendingTiles: value.pendingTiles,
+    progressPercent: value.progressPercent,
+    dataBytes: value.dataBytes,
+    tilesPerSecond: value.tilesPerSecond,
+    megabytesPerSecond: value.megabytesPerSecond,
+    etaSeconds: value.etaSeconds,
+    updatedAt: value.updatedAt,
+    fallback: value.fallback,
+    scope: {
+      dimensions:
+        dimensions as LocalGlobalDownloadProgress["scope"]["dimensions"],
+      layers: layers as LocalGlobalDownloadProgress["scope"]["layers"],
+      lods: lods as readonly number[],
+    },
+  };
+}
+
 export function parseLocalAtlasRuntime(
   value: unknown,
 ): LocalAtlasRuntime | null {
@@ -629,9 +762,11 @@ export function parseLocalAtlasRuntime(
   }
   const capacity = value.capacity;
   const job = readJob(value.job);
+  const globalDownload = readGlobalDownload(value.globalDownload);
   const persistence = value.persistence;
   if (
     job === undefined ||
+    globalDownload === undefined ||
     typeof capacity.configured !== "boolean" ||
     typeof capacity.volume !== "string" ||
     !nullableNumber(capacity.totalBytes) ||
@@ -691,6 +826,7 @@ export function parseLocalAtlasRuntime(
             revision: null,
             updatedAt: null,
           },
+    globalDownload,
     job,
   };
 }
