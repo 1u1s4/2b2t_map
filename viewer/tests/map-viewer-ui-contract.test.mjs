@@ -10,6 +10,13 @@ const styles = await readFile(
   new URL("../app/globals.css", import.meta.url),
   "utf8",
 );
+const highlightRouteWorkerSource = await readFile(
+  new URL(
+    "../app/lib/highlight-route.worker.ts",
+    import.meta.url,
+  ),
+  "utf8",
+);
 
 test("canvas exposes an accessible right-click highlight menu", () => {
   assert.match(viewerSource, /onContextMenu=\{handleContextMenu\}/);
@@ -81,6 +88,148 @@ test("exploration header hides by default and reveals by proximity or focus", ()
     /\.atlas-shell\.is-exploring \.topbar:focus-within > \*/,
   );
   assert.match(styles, /\.topbar-touch-toggle/);
+});
+
+test("exploration magnifier uses a passive circular tile render and the L shortcut", () => {
+  assert.match(
+    viewerSource,
+    /\(event\.key === "l" \|\| event\.key === "L"\)[\s\S]*?!event\.altKey[\s\S]*?!event\.ctrlKey[\s\S]*?!event\.metaKey[\s\S]*?!event\.shiftKey[\s\S]*?isExploring[\s\S]*?setMagnifierEnabled/,
+  );
+  assert.match(
+    viewerSource,
+    /const interactiveTarget[\s\S]*?if \(interactiveTarget\)[\s\S]*?return;[\s\S]*?event\.key === "l"/,
+  );
+  assert.match(viewerSource, /aria-keyshortcuts="L"/);
+  assert.match(viewerSource, /aria-pressed=\{magnifierEnabled\}/);
+  assert.match(viewerSource, /id="map-magnifier-help"/);
+  assert.match(
+    viewerSource,
+    /className="map-magnifier"[\s\S]*?ref=\{magnifierCanvasRef\}/,
+  );
+  assert.match(
+    viewerSource,
+    /const drawMapTile[\s\S]*?context\.drawImage\([\s\S]*?record\.bitmap/,
+  );
+  assert.match(
+    viewerSource,
+    /const destinationSize = tileSpan \* magnifierRenderScale[\s\S]*?drawMapTile\(context, key, destination, destinationSize\)/,
+  );
+  assert.match(
+    viewerSource,
+    /MAGNIFIER_MAX_RENDER_SCALE = MAX_SCALE \* MAGNIFIER_SCALE_FACTOR[\s\S]*?Math\.min\(\s*MAGNIFIER_MAX_RENDER_SCALE/,
+  );
+  assert.match(
+    viewerSource,
+    /scheduleMagnifierPosition[\s\S]*?requestAnimationFrame[\s\S]*?lensX: clamp\([\s\S]*?lensY: clamp\(/,
+  );
+  assert.match(
+    viewerSource,
+    /canvas\.width !== backingSize[\s\S]*?canvas\.width = backingSize/,
+  );
+  assert.match(
+    viewerSource,
+    /visibleWorldBounds[\s\S]*?drawHighlightRouteSegments\([\s\S]*?visibleWorldBounds[\s\S]*?renderMargin/,
+  );
+  assert.match(
+    viewerSource,
+    /left: magnifierPosition\.lensX[\s\S]*?top: magnifierPosition\.lensY/,
+  );
+  assert.match(
+    styles,
+    /\.map-magnifier\s*\{[\s\S]*?border-radius:\s*50%[\s\S]*?pointer-events:\s*none/,
+  );
+  assert.match(
+    viewerSource,
+    /event\.key === "m" \|\| event\.key === "M"[\s\S]*?beginMarkMode\("pin"\)/,
+  );
+  assert.match(
+    viewerSource,
+    /<Shortcut keys="L" label="Activar o desactivar lupa" \/>/,
+  );
+});
+
+test("sparse layers never stretch an ancestor tile over missing detail", () => {
+  const rendererStart = viewerSource.indexOf("const drawMapTile");
+  const rendererEnd = viewerSource.indexOf(
+    "useEffect(() => {",
+    rendererStart,
+  );
+  const renderer = viewerSource.slice(rendererStart, rendererEnd);
+
+  assert.ok(rendererStart >= 0 && rendererEnd > rendererStart);
+  assert.match(
+    viewerSource,
+    /allowsAncestorTileFallback,[\s\S]*?from "\.\/lib\/local-tile-source"/,
+  );
+  assert.match(
+    renderer,
+    /if \(!allowsAncestorTileFallback\(key\.layer\)\) \{\s*return null;\s*\}[\s\S]*?for \([\s\S]*?fallbackLod/,
+  );
+  assert.match(
+    renderer,
+    /fallbackLod <= MAX_TILE_LOD[\s\S]*?resolveAncestorTileCrop\(key, fallbackLod\)/,
+  );
+  assert.match(
+    viewerSource,
+    /className="fallback-badge glass-card"[\s\S]*?role="status"[\s\S]*?aria-live="polite"/,
+  );
+});
+
+test("highlight analysis is non-blocking with a selectable start and labeled exports", () => {
+  assert.match(
+    highlightRouteWorkerSource,
+    /planHighlightRoute\(request\.points,\s*request\.bounds,[\s\S]*?startHighlightId: request\.startHighlightId/,
+  );
+  assert.doesNotMatch(viewerSource, /planHighlightRoute\(/);
+  assert.match(
+    viewerSource,
+    /new Worker\([\s\S]*?highlight-route\.worker\.ts[\s\S]*?worker\.terminate\(\)/,
+  );
+  assert.match(
+    viewerSource,
+    /if \(highlightRouteRequestMatchesCurrent\) return;[\s\S]*?new Worker\(/,
+  );
+  assert.match(
+    viewerSource,
+    /scopedHighlights\.map\(\(\{ id, x, z \}\) => \(\{ id, x, z \}\)\)/,
+  );
+  assert.match(
+    viewerSource,
+    /Calculando en segundo plano…[\s\S]*?Puedes seguir usando el mapa/,
+  );
+  assert.match(
+    viewerSource,
+    /Filtrar por nombre, ID o coordenadas[\s\S]*?id="highlight-route-start"[\s\S]*?value=\{validHighlightRouteStartId \?\? ""\}[\s\S]*?<option value="">[\s\S]*?Automático · esquina superior izquierda[\s\S]*?highlightRouteStartOptions\.map/,
+  );
+  assert.doesNotMatch(viewerSource, /__auto__/);
+  assert.match(
+    viewerSource,
+    /MAX_HIGHLIGHT_ROUTE_START_OPTIONS = 200[\s\S]*?options\.length >= MAX_HIGHLIGHT_ROUTE_START_OPTIONS/,
+  );
+  assert.match(
+    viewerSource,
+    /coordinateCounts[\s\S]*?coordinateCount > 1[\s\S]*?offsetDistance/,
+  );
+  assert.match(
+    viewerSource,
+    /drawHighlightRouteSegments\([\s\S]*?drawHighlightRouteMarkers\(/,
+  );
+  assert.match(
+    viewerSource,
+    /highlight-route-card[\s\S]*?Calcular y superponer ruta/,
+  );
+  assert.match(
+    viewerSource,
+    /createHighlightRouteExport\(highlightRoute\)[\s\S]*?obsidian-atlas-ruta-highlights\.json/,
+  );
+  assert.match(
+    viewerSource,
+    /toBlob\([\s\S]*?obsidian-atlas-ruta-vista\.png/,
+  );
+  assert.match(
+    styles,
+    /\.highlight-route-list\s*\{[\s\S]*?max-height:[\s\S]*?overflow:\s*auto/,
+  );
 });
 
 test("floating side and lower-right panels use the compact layout", () => {

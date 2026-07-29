@@ -39,6 +39,7 @@ La versión actual admite únicamente **Overworld**.
 - una celda de 512×512 bloques por tile LOD 0;
 - navegación cardinal con cruceta y flechas del teclado;
 - zoom y desplazamiento visuales sin cambiar el LOD de datos;
+- lupa circular de detalle activada con `L` durante la exploración;
 - zoom acotado a un presupuesto seguro de tiles visibles y cámara contenida en
   la región;
 - una única sesión de exploración, persistente, pausable y exportable;
@@ -49,6 +50,8 @@ La versión actual admite únicamente **Overworld**.
 - descarga regional reanudable y adaptativa entre `0.25` y `16 req/s`;
 - capas `base`, `overlay` y `newchunks`;
 - puntos y áreas con nombre, color y notas privadas;
+- ruta etiquetada entre highlights con origen automático o elegido y exportación
+  JSON/PNG;
 - lectura exclusiva de la biblioteca local;
 - tarjeta de espacio disponible en LuisA, sin metas ni trabajos globales;
 - composición opcional de una región como PNG o WebP desde el CLI.
@@ -137,7 +140,9 @@ PYTHON_BIN='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
    `404` se omite automáticamente.
 8. Acerca, aleja o arrastra el mapa cuando necesites inspeccionar una
    estructura: los datos continúan en LOD 0 y el zoom manual se conserva
-   exactamente al moverte a otra celda.
+   exactamente al moverte a otra celda. Presiona `L` para activar una lupa
+   circular de aumento 5× que sigue el puntero y se mantiene dentro de la
+   ventana al acercarse a un borde.
 9. **Pausar sesión** la conserva en LuisA; después puedes abrirla desde
    **Guardado local · LuisA**. **Guardar ahora** fuerza una escritura inmediata.
 
@@ -160,7 +165,8 @@ bloques por píxel; la tarjeta lateral muestra la celda actual y su rango.
 ![Celda regional con coordenadas y zoom](./viewer/public/docs/exploracion-celda-coordenadas-zoom.png)
 
 **3. Highlights.** Permite marcar puntos o áreas, encontrarlos por nombre,
-ocultarlos y exportarlos o importarlos junto con el workspace.
+ocultarlos, calcular un recorrido etiquetado entre todos los de la región y
+exportar tanto sus datos como la vista actual.
 
 ![Panel de highlights sobre el mapa](./viewer/public/docs/highlights-panel-mapa.png)
 
@@ -391,6 +397,9 @@ La ubicación del tile en el mundo, en cambio, usa piso matemático. El visor y
 el CLI aplican cada regla en su lugar correspondiente.
 
 El visor consulta primero la biblioteca regional y después el panorama LOD 10.
+Solo la capa continua `base` puede usar un ancestro como respaldo visual.
+Una ausencia confirmada en `overlay` o `newchunks` significa transparencia:
+nunca se amplía un píxel agregado sobre una celda detallada.
 Chrome también puede abrir una carpeta `2b2t_tiles` con permiso de solo lectura
 desde **Explorar → Biblioteca local**. `/api/tile` nunca obtiene imágenes
 remotas: también ignora el parámetro heredado `online=1`. Solo el trabajo
@@ -435,6 +444,15 @@ límites, contadores y codificación antes de reemplazar la sesión canónica.
 Los highlights pueden ser puntos o áreas con nombre, nota, color y visibilidad.
 Su exportación crea
 `obsidian-atlas-highlights.json`.
+
+El panel **Ruta inteligente** resuelve un TSP euclidiano abierto: para pocos
+puntos usa Held–Karp exacto y para conjuntos grandes combina vecino más cercano
+con mejora 2-opt. El inicio predeterminado es el highlight más cercano a
+`minX/minZ`, pero puede buscarse y elegirse cualquier highlight como inicio.
+El planificador corre en segundo plano y puede cancelarse sin bloquear el mapa. El mapa
+superpone segmentos y etiquetas `A…Z`, `a…z`, `A1…`. **JSON** crea
+`obsidian-atlas-ruta-highlights.json` con puntos, distancias y orden completo;
+**PNG vista** captura el canvas visible con la ruta superpuesta.
 
 ## Variables locales
 

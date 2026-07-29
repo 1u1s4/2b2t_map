@@ -117,7 +117,11 @@ celda = 512 × 512 bloques
 ```
 
 Rueda, pellizco, doble clic, `+`, `-` y arrastre cambian la vista sin sustituir
-los tiles LOD 0 por otra resolución.
+los tiles LOD 0 por otra resolución. Durante **Explorar**, `L` activa una lupa
+circular que vuelve a renderizar el detalle original con gran aumento y sigue
+el puntero sin interferir con clics ni arrastre. El lente conserva su aumento
+5× incluso en el zoom máximo y se recoloca junto a los bordes para no quedar
+recortado.
 
 ## Atlas global
 
@@ -299,6 +303,11 @@ remoto: incluso el parámetro heredado `online=1` se ignora y una ausencia local
 responde `404` sin contactar la red. Solo la descarga regional explícita
 contacta la fuente y escribe el resultado antes de habilitar la sesión.
 
+El fallback a un ancestro LOD se reserva para `base`, que es espacialmente
+continua. En las capas dispersas `overlay` y `newchunks`, un `404` significa
+transparencia; el visor no amplía un píxel del panorama LOD 10 sobre una celda
+LOD 0.
+
 Chrome puede abrir `2b2t_tiles` mediante File System Access con permiso de solo
 lectura. El navegador calcula la ruta visible; no escanea ni sube la carpeta.
 
@@ -329,6 +338,18 @@ sin ramas por pestaña; si queda obsoleta, se descarta y prevalece el documento
 de LuisA. Los workspaces multisesión antiguos se consolidan una vez y se
 archivan completos en `ObsidianAtlas/backups/` antes de podarlos.
 
+**Ruta inteligente** conecta todos los highlights de la región mediante un TSP
+euclidiano abierto. El inicio puede dejarse en automático —el punto más cercano
+a `minX/minZ`, la esquina superior izquierda— o fijarse en cualquier highlight.
+Hasta 14 puntos se resuelven exactamente con Held–Karp; conjuntos mayores usan
+vecino más cercano y mejora 2-opt acotada. El cálculo corre en un worker
+cancelable para mantener el mapa interactivo; el buscador del punto inicial
+limita las opciones montadas sin impedir elegir cualquiera. El canvas muestra líneas y puntos
+`A…Z`, luego `a…z` y, al agotarlos, `A1…z1`, `A2…`; el panel descarga el orden
+completo como
+`obsidian-atlas-ruta-highlights.json` o la vista visible como
+`obsidian-atlas-ruta-vista.png`.
+
 ## Atajos
 
 | Acción | Entrada |
@@ -341,6 +362,7 @@ archivan completos en `ObsidianAtlas/backups/` antes de podarlos.
 | Ir a coordenadas/highlight | `G` |
 | Abrir highlights | `H` |
 | Marcar un punto | `M` |
+| Activar o desactivar la lupa en Explorar | `L` |
 | Dibujar un área | `R` |
 | Cancelar herramienta o cerrar panel | `Esc` |
 

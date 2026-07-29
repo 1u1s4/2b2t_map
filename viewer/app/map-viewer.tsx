@@ -32,6 +32,7 @@ import {
   Navigation,
   Plus,
   RotateCcw,
+  Route,
   Search,
   ScanSearch,
   Sparkles,
@@ -42,12 +43,15 @@ import {
   X,
 } from "lucide-react";
 import {
+  allowsAncestorTileFallback,
   blocksPerPixelAtLod,
   blocksPerTileAtLod,
   createLocalTileSource,
   getFileSystemAccessSupport,
   LocalTileSource,
+  MAX_TILE_LOD,
   pickTileArchiveDirectory,
+  resolveAncestorTileCrop,
   type TileKey,
   type TileLayer,
 } from "./lib/local-tile-source";
@@ -68,6 +72,16 @@ import {
   normalizeHighlightName,
   pointIsInsideBounds,
 } from "./lib/highlights";
+import {
+  createHighlightRouteExport,
+  type HighlightRoutePlan,
+  type HighlightRoutePoint,
+  type HighlightRouteOverlay,
+} from "./lib/highlight-route";
+import type {
+  HighlightRouteWorkerRequest,
+  HighlightRouteWorkerResponse,
+} from "./lib/highlight-route-worker-protocol";
 import {
   cardinalNeighbor,
   clampCameraToExploration,
@@ -167,9 +181,16 @@ const MIN_SCALE = 1 / 1_500;
 const ATLAS_MIN_SCALE = 1 / 10_000;
 const MAX_SCALE = 8;
 const HIGHLIGHT_COMPACT_SCALE = 1 / 32;
+const MAGNIFIER_SIZE = 240;
+const MAGNIFIER_SCALE_FACTOR = 5;
+const MAGNIFIER_MIN_RENDER_SCALE = 1;
+const MAGNIFIER_MAX_RENDER_SCALE = MAX_SCALE * MAGNIFIER_SCALE_FACTOR;
+const MAGNIFIER_EDGE_GAP = 10;
 const REGIONAL_REQUESTS_PER_SECOND = 16;
 const MAX_WORKSPACE_EXPLORATIONS = 1;
 const MAX_WORKSPACE_HIGHLIGHTS = 10_000;
+const MAX_VISIBLE_ROUTE_STOPS = 500;
+const MAX_HIGHLIGHT_ROUTE_START_OPTIONS = 200;
 const EXPLORATION_CELL_VISUALS = {
   "current-new": {
     fill: "rgba(0, 0, 0, 0)",
@@ -259,6 +280,32 @@ type Highlight = {
   createdAt: string;
 };
 
+type HighlightRouteComputation =
+  | { readonly status: "idle" }
+  | {
+      readonly status: "calculating";
+      readonly requestId: number;
+      readonly geometryJson: string;
+      readonly regionBoundsKey: string;
+      readonly requestedStartHighlightId: string | null;
+    }
+  | {
+      readonly status: "ready";
+      readonly requestId: number;
+      readonly geometryJson: string;
+      readonly regionBoundsKey: string;
+      readonly requestedStartHighlightId: string | null;
+      readonly plan: HighlightRoutePlan<HighlightRoutePoint>;
+    }
+  | {
+      readonly status: "error";
+      readonly requestId: number;
+      readonly geometryJson: string;
+      readonly regionBoundsKey: string;
+      readonly requestedStartHighlightId: string | null;
+      readonly message: string;
+    };
+
 type TileRecord = {
   status: "loading" | "loaded" | "missing" | "error";
   bitmap?: ImageBitmap;
@@ -299,6 +346,14 @@ type ActivePointer = {
   clientY: number;
   screenX: number;
   screenY: number;
+};
+
+type MagnifierPosition = {
+  readonly x: number;
+  readonly y: number;
+  readonly lensX: number;
+  readonly lensY: number;
+  readonly visible: boolean;
 };
 
 type QuickHighlightMenu = {
@@ -582,6 +637,157 @@ function highlightLabel(index: number, type: Highlight["type"]) {
   return `${type === "pin" ? "Punto" : "Área"} ${String(index + 1).padStart(2, "0")}`;
 }
 
+function drawHighlightRouteSegments(
+  context: CanvasRenderingContext2D,
+  overlay: HighlightRouteOverlay,
+  atWorld: (worldX: number, worldZ: number) => {
+    readonly x: number;
+    readonly y: number;
+  },
+  visibleBounds?: Readonly<{
+    minX: number;
+    minZ: number;
+    maxX: number;
+    maxZ: number;
+  }>,
+) {
+  if (overlay.segments.length === 0) return;
+  context.save();
+  context.beginPath();
+  let hasVisibleSegment = false;
+  for (const segment of overlay.segments) {
+    if (
+      visibleBounds &&
+      (Math.max(segment.fromX, segment.toX) < visibleBounds.minX ||
+        Math.min(segment.fromX, segment.toX) > visibleBounds.maxX ||
+        Math.max(segment.fromZ, segment.toZ) < visibleBounds.minZ ||
+        Math.min(segment.fromZ, segment.toZ) > visibleBounds.maxZ)
+    ) {
+      continue;
+    }
+    const start = atWorld(segment.fromX, segment.fromZ);
+    const end = atWorld(segment.toX, segment.toZ);
+    context.moveTo(start.x, start.y);
+    context.lineTo(end.x, end.y);
+    hasVisibleSegment = true;
+  }
+  if (!hasVisibleSegment) {
+    context.restore();
+    return;
+  }
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  context.strokeStyle = "rgba(3, 9, 17, 0.9)";
+  context.lineWidth = 7;
+  context.stroke();
+  context.strokeStyle = "rgba(98, 168, 255, 0.92)";
+  context.lineWidth = 2.5;
+  context.setLineDash([9, 6]);
+  context.stroke();
+  context.restore();
+}
+
+function drawHighlightRouteMarkers(
+  context: CanvasRenderingContext2D,
+  overlay: HighlightRouteOverlay,
+  atWorld: (worldX: number, worldZ: number) => {
+    readonly x: number;
+    readonly y: number;
+  },
+  viewport: Readonly<{ width: number; height: number }>,
+  visibleBounds?: Readonly<{
+    minX: number;
+    minZ: number;
+    maxX: number;
+    maxZ: number;
+  }>,
+) {
+  const coordinateCounts = new Map<string, number>();
+  for (const marker of overlay.markers) {
+    const key = `${marker.x}:${marker.z}`;
+    coordinateCounts.set(key, (coordinateCounts.get(key) ?? 0) + 1);
+  }
+  const coordinateIndices = new Map<string, number>();
+  context.save();
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.font = "700 10px var(--font-geist-mono), monospace";
+  for (const marker of overlay.markers) {
+    if (
+      visibleBounds &&
+      (marker.x < visibleBounds.minX ||
+        marker.x > visibleBounds.maxX ||
+        marker.z < visibleBounds.minZ ||
+        marker.z > visibleBounds.maxZ)
+    ) {
+      continue;
+    }
+    const coordinateKey = `${marker.x}:${marker.z}`;
+    const coordinateCount = coordinateCounts.get(coordinateKey) ?? 1;
+    const coordinateIndex =
+      coordinateIndices.get(coordinateKey) ?? 0;
+    coordinateIndices.set(coordinateKey, coordinateIndex + 1);
+    const sourcePoint = atWorld(marker.x, marker.z);
+    const ring = Math.floor(coordinateIndex / 8);
+    const firstIndexInRing = ring * 8;
+    const ringCount = Math.min(
+      8,
+      coordinateCount - firstIndexInRing,
+    );
+    const angle =
+      -Math.PI / 2 +
+      ((coordinateIndex - firstIndexInRing) / ringCount) *
+        Math.PI *
+        2;
+    const offsetDistance =
+      coordinateCount > 1 ? 20 + ring * 34 : 0;
+    const point = {
+      x: sourcePoint.x + Math.cos(angle) * offsetDistance,
+      y: sourcePoint.y + Math.sin(angle) * offsetDistance,
+    };
+    const radius =
+      marker.label.length >= 4
+        ? 17
+        : marker.label.length === 3
+          ? 15
+          : 12;
+    if (
+      point.x < -radius ||
+      point.y < -radius ||
+      point.x > viewport.width + radius ||
+      point.y > viewport.height + radius
+    ) {
+      continue;
+    }
+    if (offsetDistance > 0) {
+      context.beginPath();
+      context.moveTo(sourcePoint.x, sourcePoint.y);
+      context.lineTo(point.x, point.y);
+      context.strokeStyle = "rgba(255, 255, 255, 0.48)";
+      context.lineWidth = 1;
+      context.setLineDash([2, 3]);
+      context.stroke();
+      context.setLineDash([]);
+    }
+    context.beginPath();
+    context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+    context.fillStyle =
+      marker.order === 1
+        ? "rgba(38, 217, 199, 0.98)"
+        : "rgba(30, 89, 153, 0.98)";
+    context.shadowColor = "rgba(0, 0, 0, 0.72)";
+    context.shadowBlur = 9;
+    context.fill();
+    context.shadowBlur = 0;
+    context.strokeStyle = "rgba(255, 255, 255, 0.96)";
+    context.lineWidth = marker.order === 1 ? 2.5 : 1.5;
+    context.stroke();
+    context.fillStyle = marker.order === 1 ? "#031413" : "#ffffff";
+    context.fillText(marker.label, point.x, point.y + 0.5);
+  }
+  context.restore();
+}
+
 function isSafeMapCoordinate(value: unknown): value is number {
   return (
     typeof value === "number" &&
@@ -757,6 +963,10 @@ async function copyText(text: string) {
 
 export function MapViewer() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const magnifierCanvasRef = useRef<HTMLCanvasElement>(null);
+  const magnifierFrameRef = useRef<number | null>(null);
+  const pendingMagnifierPositionRef =
+    useRef<MagnifierPosition | null>(null);
   const mapRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const importRef = useRef<HTMLInputElement>(null);
@@ -935,9 +1145,73 @@ export function MapViewer() {
   );
   const [toast, setToast] = useState<string | null>(null);
   const [topbarRevealed, setTopbarRevealed] = useState(false);
+  const [magnifierEnabled, setMagnifierEnabled] = useState(false);
+  const [magnifierPosition, setMagnifierPosition] =
+    useState<MagnifierPosition>({
+    x: INITIAL_VIEW_SIZE.width / 2,
+    y: INITIAL_VIEW_SIZE.height / 2,
+    lensX: INITIAL_VIEW_SIZE.width / 2,
+    lensY: INITIAL_VIEW_SIZE.height / 2,
+    visible: false,
+  });
+  const [highlightRouteEnabled, setHighlightRouteEnabled] = useState(false);
+  const [highlightRouteStartId, setHighlightRouteStartId] = useState<
+    string | null
+  >(null);
+  const [highlightRouteStartSearch, setHighlightRouteStartSearch] =
+    useState("");
+  const [highlightRouteComputation, setHighlightRouteComputation] =
+    useState<HighlightRouteComputation>({ status: "idle" });
+  const [highlightRouteRetry, setHighlightRouteRetry] = useState(0);
+  const highlightRouteRequestIdRef = useRef(0);
+  const scheduleMagnifierPosition = useCallback(
+    (position: MagnifierPosition) => {
+      pendingMagnifierPositionRef.current = position;
+      if (magnifierFrameRef.current !== null) return;
+      magnifierFrameRef.current = window.requestAnimationFrame(() => {
+        magnifierFrameRef.current = null;
+        const pending = pendingMagnifierPositionRef.current;
+        pendingMagnifierPositionRef.current = null;
+        if (!pending) return;
+        setMagnifierPosition((current) =>
+          current.x === pending.x &&
+          current.y === pending.y &&
+          current.lensX === pending.lensX &&
+          current.lensY === pending.lensY &&
+          current.visible === pending.visible
+            ? current
+            : pending,
+        );
+      });
+    },
+    [],
+  );
+  const hideMagnifier = useCallback(() => {
+    pendingMagnifierPositionRef.current = null;
+    if (magnifierFrameRef.current !== null) {
+      window.cancelAnimationFrame(magnifierFrameRef.current);
+      magnifierFrameRef.current = null;
+    }
+    setMagnifierPosition((current) =>
+      current.visible ? { ...current, visible: false } : current,
+    );
+  }, []);
+  useEffect(
+    () => () => {
+      if (magnifierFrameRef.current !== null) {
+        window.cancelAnimationFrame(magnifierFrameRef.current);
+      }
+    },
+    [],
+  );
 
   const atlasMode = drawer === "atlas";
   const isExploring = explorationState !== null && !atlasMode;
+  const magnifierRenderScale = Math.min(
+    MAGNIFIER_MAX_RENDER_SCALE,
+    Math.max(MAGNIFIER_MIN_RENDER_SCALE, scale * MAGNIFIER_SCALE_FACTOR),
+  );
+  const magnifierZoomFactor = magnifierRenderScale / scale;
   const localCoverageState: "loading" | "ready" | "stale" | "error" =
     localCoverageError
       ? localCoverage !== null
@@ -967,6 +1241,223 @@ export function MapViewer() {
           ),
     [activeExplorationRegion, atlasMode, highlights],
   );
+  const validHighlightRouteStartId =
+    highlightRouteStartId &&
+    scopedHighlights.some(
+      (highlight) => highlight.id === highlightRouteStartId,
+    )
+      ? highlightRouteStartId
+      : null;
+  const highlightRouteStartOptions = useMemo(() => {
+    const query = highlightRouteStartSearch.trim().toLocaleLowerCase();
+    const options: Highlight[] = [];
+    for (const highlight of scopedHighlights) {
+      const matches =
+        query.length === 0 ||
+        `${highlight.title}\n${highlight.id}\n${Math.round(highlight.x)},${Math.round(highlight.z)}`
+          .toLocaleLowerCase()
+          .includes(query);
+      if (matches) options.push(highlight);
+      if (options.length >= MAX_HIGHLIGHT_ROUTE_START_OPTIONS) break;
+    }
+    if (
+      validHighlightRouteStartId &&
+      !options.some(
+        (highlight) => highlight.id === validHighlightRouteStartId,
+      )
+    ) {
+      const selected = scopedHighlights.find(
+        (highlight) => highlight.id === validHighlightRouteStartId,
+      );
+      if (selected) options.unshift(selected);
+    }
+    return options;
+  }, [
+    highlightRouteStartSearch,
+    scopedHighlights,
+    validHighlightRouteStartId,
+  ]);
+  const highlightRouteGeometryJson = useMemo(
+    () =>
+      JSON.stringify(
+        scopedHighlights.map(({ id, x, z }) => ({ id, x, z })),
+      ),
+    [scopedHighlights],
+  );
+  const highlightRouteRegionBoundsKey = activeExplorationRegion
+    ? boundsKey(activeExplorationRegion.bounds)
+    : "";
+  const highlightRouteMinX =
+    activeExplorationRegion?.bounds.minX ?? null;
+  const highlightRouteMinZ =
+    activeExplorationRegion?.bounds.minZ ?? null;
+  const highlightRouteMaxXExclusive =
+    activeExplorationRegion?.bounds.maxXExclusive ?? null;
+  const highlightRouteMaxZExclusive =
+    activeExplorationRegion?.bounds.maxZExclusive ?? null;
+  const highlightRouteComputationMatchesCurrent =
+    highlightRouteComputation.status !== "idle" &&
+    highlightRouteComputation.geometryJson ===
+      highlightRouteGeometryJson &&
+    highlightRouteComputation.regionBoundsKey ===
+      highlightRouteRegionBoundsKey &&
+    highlightRouteComputation.requestedStartHighlightId ===
+      validHighlightRouteStartId;
+  const highlightRouteRequestMatchesCurrent =
+    highlightRouteComputationMatchesCurrent &&
+    highlightRouteComputation.status === "ready";
+  const highlightRouteIsCalculating =
+    highlightRouteEnabled &&
+    (!highlightRouteComputationMatchesCurrent ||
+      highlightRouteComputation.status === "calculating" ||
+      highlightRouteComputation.status === "idle");
+  const highlightRouteError =
+    highlightRouteEnabled &&
+    highlightRouteComputationMatchesCurrent &&
+    highlightRouteComputation.status === "error"
+      ? highlightRouteComputation.message
+      : null;
+  const highlightRoute = useMemo(
+    (): HighlightRoutePlan<Highlight> | null => {
+      if (
+        !highlightRouteEnabled ||
+        !highlightRouteRequestMatchesCurrent ||
+        highlightRouteComputation.status !== "ready"
+      ) {
+        return null;
+      }
+      const highlightsById = new Map(
+        scopedHighlights.map((highlight) => [highlight.id, highlight]),
+      );
+      const stops = highlightRouteComputation.plan.stops.map((stop) => {
+        const highlight = highlightsById.get(stop.highlight.id);
+        return highlight ? { ...stop, highlight } : null;
+      });
+      if (stops.some((stop) => stop === null)) return null;
+      return {
+        ...highlightRouteComputation.plan,
+        stops: stops as NonNullable<(typeof stops)[number]>[],
+      };
+    },
+    [
+      highlightRouteEnabled,
+      highlightRouteComputation,
+      highlightRouteRequestMatchesCurrent,
+      scopedHighlights,
+    ],
+  );
+  useEffect(() => {
+    if (
+      !highlightRouteEnabled ||
+      atlasMode ||
+      highlightRouteMinX === null ||
+      highlightRouteMinZ === null ||
+      highlightRouteMaxXExclusive === null ||
+      highlightRouteMaxZExclusive === null ||
+      highlightRouteGeometryJson === "[]"
+    ) {
+      return;
+    }
+    if (highlightRouteRequestMatchesCurrent) return;
+
+    const requestId = highlightRouteRequestIdRef.current + 1;
+    highlightRouteRequestIdRef.current = requestId;
+    const computationIdentity = {
+      requestId,
+      geometryJson: highlightRouteGeometryJson,
+      regionBoundsKey: highlightRouteRegionBoundsKey,
+      requestedStartHighlightId: validHighlightRouteStartId,
+    };
+    setHighlightRouteComputation({
+      status: "calculating",
+      ...computationIdentity,
+    });
+
+    let worker: Worker;
+    try {
+      worker = new Worker(
+        new URL("./lib/highlight-route.worker.ts", import.meta.url),
+        { type: "module", name: "obsidian-atlas-highlight-route" },
+      );
+    } catch {
+      setHighlightRouteComputation({
+        status: "error",
+        ...computationIdentity,
+        message:
+          "Este navegador no pudo iniciar el cálculo en segundo plano.",
+      });
+      return;
+    }
+
+    let active = true;
+    const fail = (message: string) => {
+      if (!active) return;
+      active = false;
+      worker.terminate();
+      setHighlightRouteComputation({
+        status: "error",
+        ...computationIdentity,
+        message,
+      });
+    };
+    worker.onmessage = (
+      event: MessageEvent<HighlightRouteWorkerResponse>,
+    ) => {
+      const response = event.data;
+      if (!active || response.requestId !== requestId) return;
+      if (!response.ok) {
+        fail(response.error);
+        return;
+      }
+      active = false;
+      worker.terminate();
+      setHighlightRouteComputation({
+        status: "ready",
+        ...computationIdentity,
+        plan: response.plan,
+      });
+    };
+    worker.onerror = (event) => {
+      event.preventDefault();
+      fail("El cálculo de la ruta falló en segundo plano.");
+    };
+
+    const request: HighlightRouteWorkerRequest = {
+      requestId,
+      points: JSON.parse(
+        highlightRouteGeometryJson,
+      ) as HighlightRoutePoint[],
+      bounds: {
+        minX: highlightRouteMinX,
+        minZ: highlightRouteMinZ,
+        maxXExclusive: highlightRouteMaxXExclusive,
+        maxZExclusive: highlightRouteMaxZExclusive,
+      },
+      startHighlightId: validHighlightRouteStartId,
+    };
+    try {
+      worker.postMessage(request);
+    } catch {
+      fail("No se pudieron enviar los highlights al planificador.");
+    }
+
+    return () => {
+      active = false;
+      worker.terminate();
+    };
+  }, [
+    atlasMode,
+    highlightRouteEnabled,
+    highlightRouteGeometryJson,
+    highlightRouteMaxXExclusive,
+    highlightRouteMaxZExclusive,
+    highlightRouteMinX,
+    highlightRouteMinZ,
+    highlightRouteRegionBoundsKey,
+    highlightRouteRequestMatchesCurrent,
+    highlightRouteRetry,
+    validHighlightRouteStartId,
+  ]);
   const renderedHighlights = atlasMode ? highlights : scopedHighlights;
   const selectedHighlight = scopedHighlights.find(
     (highlight) => highlight.id === selectedHighlightId,
@@ -2477,6 +2968,92 @@ export function MapViewer() {
     [camera, scale, viewSize],
   );
 
+  const drawMapTile = useCallback(
+    (
+      context: CanvasRenderingContext2D,
+      key: TileKey,
+      destination: { readonly x: number; readonly y: number },
+      destinationSize: number,
+    ): number | null => {
+      ensureTile(key);
+      const record = tileCacheRef.current.get(tileCacheKey(key));
+      if (record?.status === "loaded" && record.bitmap) {
+        try {
+          context.drawImage(
+            record.bitmap,
+            destination.x,
+            destination.y,
+            destinationSize + 0.5,
+            destinationSize + 0.5,
+          );
+          return null;
+        } catch {
+          record.bitmap.close();
+          tileCacheRef.current.delete(tileCacheKey(key));
+          ensureTile(key);
+        }
+      }
+
+      if (!allowsAncestorTileFallback(key.layer)) {
+        return null;
+      }
+
+      let mayRequestAncestor =
+        record?.status === "missing" || record?.status === "error";
+      let requestedAncestor = false;
+      for (
+        let fallbackLod = key.lod + 1;
+        fallbackLod <= MAX_TILE_LOD;
+        fallbackLod += 1
+      ) {
+        const crop = resolveAncestorTileCrop(key, fallbackLod);
+        const parentKey: TileKey = {
+          ...key,
+          lod: fallbackLod,
+          tileX: crop.tileX,
+          tileZ: crop.tileZ,
+        };
+        const parent = tileCacheRef.current.get(tileCacheKey(parentKey));
+        if (parent?.status !== "loaded" || !parent.bitmap) {
+          if (!parent && mayRequestAncestor && !requestedAncestor) {
+            ensureTile(parentKey);
+            requestedAncestor = true;
+            mayRequestAncestor = false;
+          } else if (
+            parent?.status === "missing" ||
+            parent?.status === "error"
+          ) {
+            mayRequestAncestor = true;
+          } else if (parent?.status === "loading") {
+            mayRequestAncestor = false;
+          }
+          continue;
+        }
+        try {
+          context.drawImage(
+            parent.bitmap,
+            crop.sourceX,
+            crop.sourceZ,
+            crop.sourceSize,
+            crop.sourceSize,
+            destination.x,
+            destination.y,
+            destinationSize + 0.5,
+            destinationSize + 0.5,
+          );
+        } catch {
+          parent.bitmap.close();
+          tileCacheRef.current.delete(tileCacheKey(parentKey));
+          ensureTile(parentKey);
+          continue;
+        }
+        return fallbackLod;
+      }
+      return null;
+    },
+    [ensureTile],
+  );
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -2518,87 +3095,21 @@ export function MapViewer() {
             tileX,
             tileZ,
           };
-          ensureTile(key);
-          const record = tileCacheRef.current.get(tileCacheKey(key));
           const worldOriginX = tileX * tileSpan;
           const worldOriginZ = tileZ * tileSpan;
           const destination = screenAtWorld(worldOriginX, worldOriginZ);
           const destinationSize = tileSpan * scale;
-
-          if (record?.status === "loaded" && record.bitmap) {
-            try {
-              context.drawImage(
-                record.bitmap,
-                destination.x,
-                destination.y,
-                destinationSize + 0.5,
-                destinationSize + 0.5,
-              );
-              continue;
-            } catch {
-              record.bitmap.close();
-              tileCacheRef.current.delete(tileCacheKey(key));
-              ensureTile(key);
-            }
-          }
-
-          let mayRequestAncestor =
-            record?.status === "missing" || record?.status === "error";
-          let requestedAncestor = false;
-          for (let fallbackLod = lod + 1; fallbackLod <= 10; fallbackLod += 1) {
-            const lodDelta = fallbackLod - lod;
-            const subdivision = 2 ** lodDelta;
-            const parentTileX = Math.floor(tileX / subdivision);
-            const parentTileZ = Math.floor(tileZ / subdivision);
-            const parentKey: TileKey = {
-              ...key,
-              lod: fallbackLod,
-              tileX: parentTileX,
-              tileZ: parentTileZ,
-            };
-            const parent = tileCacheRef.current.get(tileCacheKey(parentKey));
-            if (parent?.status !== "loaded" || !parent.bitmap) {
-              if (!parent && mayRequestAncestor && !requestedAncestor) {
-                ensureTile(parentKey);
-                requestedAncestor = true;
-                mayRequestAncestor = false;
-              } else if (
-                parent?.status === "missing" ||
-                parent?.status === "error"
-              ) {
-                mayRequestAncestor = true;
-              } else if (parent?.status === "loading") {
-                mayRequestAncestor = false;
-              }
-              continue;
-            }
-
-            const childX = tileX - parentTileX * subdivision;
-            const childZ = tileZ - parentTileZ * subdivision;
-            const sourceSize = 512 / subdivision;
-            try {
-              context.drawImage(
-                parent.bitmap,
-                childX * sourceSize,
-                childZ * sourceSize,
-                sourceSize,
-                sourceSize,
-                destination.x,
-                destination.y,
-                destinationSize + 0.5,
-                destinationSize + 0.5,
-              );
-            } catch {
-              parent.bitmap.close();
-              tileCacheRef.current.delete(tileCacheKey(parentKey));
-              ensureTile(parentKey);
-              continue;
-            }
+          const fallbackLod = drawMapTile(
+            context,
+            key,
+            destination,
+            destinationSize,
+          );
+          if (fallbackLod !== null) {
             deepestFallbackLod =
               deepestFallbackLod === null
                 ? fallbackLod
                 : Math.max(deepestFallbackLod, fallbackLod);
-            break;
           }
         }
       }
@@ -2882,6 +3393,14 @@ export function MapViewer() {
       context.textBaseline = "alphabetic";
     }
 
+    if (highlightRoute) {
+      drawHighlightRouteSegments(
+        context,
+        highlightRoute.overlay,
+        screenAtWorld,
+      );
+    }
+
     for (const highlight of renderedHighlights) {
       if (!highlight.visible) continue;
       const selected = !atlasMode && highlight.id === selectedHighlightId;
@@ -2983,6 +3502,15 @@ export function MapViewer() {
       context.fillText(highlight.title, labelPoint.x + 21, labelPoint.y + 2);
     }
 
+    if (highlightRoute) {
+      drawHighlightRouteMarkers(
+        context,
+        highlightRoute.overlay,
+        screenAtWorld,
+        viewSize,
+      );
+    }
+
     if (areaPreview) {
       const start = screenAtWorld(
         Math.min(areaPreview.x1, areaPreview.x2),
@@ -3023,9 +3551,10 @@ export function MapViewer() {
     atlasStatusFilter,
     camera,
     compactHighlights,
-    ensureTile,
+    drawMapTile,
     explorationState,
     gridStep,
+    highlightRoute,
     renderedHighlights,
     layers,
     lod,
@@ -3037,6 +3566,262 @@ export function MapViewer() {
     showGrid,
     visibleCoverageSelection,
     viewSize,
+  ]);
+
+  useEffect(() => {
+    if (
+      !isExploring ||
+      !explorationState ||
+      !magnifierEnabled ||
+      !magnifierPosition.visible
+    ) {
+      return;
+    }
+    const canvas = magnifierCanvasRef.current;
+    if (!canvas) return;
+    const ratio = Math.min(2, window.devicePixelRatio || 1);
+    const backingSize = Math.round(MAGNIFIER_SIZE * ratio);
+    if (
+      canvas.width !== backingSize ||
+      canvas.height !== backingSize
+    ) {
+      canvas.width = backingSize;
+      canvas.height = backingSize;
+    }
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.globalAlpha = 1;
+    context.shadowBlur = 0;
+    context.setLineDash([]);
+    context.clearRect(0, 0, MAGNIFIER_SIZE, MAGNIFIER_SIZE);
+    context.fillStyle = "#07111d";
+    context.fillRect(0, 0, MAGNIFIER_SIZE, MAGNIFIER_SIZE);
+    context.imageSmoothingEnabled = false;
+
+    const center = worldAtScreen(
+      magnifierPosition.x,
+      magnifierPosition.y,
+    );
+    const halfWorldSize = MAGNIFIER_SIZE / (2 * magnifierRenderScale);
+    const minX = center.x - halfWorldSize;
+    const maxX = center.x + halfWorldSize;
+    const minZ = center.z - halfWorldSize;
+    const maxZ = center.z + halfWorldSize;
+    const visibleWorldBounds = { minX, minZ, maxX, maxZ };
+    const tileSpan = blocksPerTileAtLod(lod);
+    const minTileX = Math.floor(minX / tileSpan) - 1;
+    const maxTileX = Math.floor(maxX / tileSpan) + 1;
+    const minTileZ = Math.floor(minZ / tileSpan) - 1;
+    const maxTileZ = Math.floor(maxZ / tileSpan) + 1;
+    const lensAtWorld = (worldX: number, worldZ: number) => ({
+      x:
+        MAGNIFIER_SIZE / 2 +
+        (worldX - center.x) * magnifierRenderScale,
+      y:
+        MAGNIFIER_SIZE / 2 +
+        (worldZ - center.z) * magnifierRenderScale,
+    });
+
+    for (const layer of layers) {
+      if (!layer.visible || layer.opacity <= 0) continue;
+      context.globalAlpha = layer.opacity;
+      for (let tileZ = minTileZ; tileZ <= maxTileZ; tileZ += 1) {
+        for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
+          const key: TileKey = {
+            layer: layer.id,
+            lod,
+            dimension: "overworld",
+            tileX,
+            tileZ,
+          };
+          const destination = lensAtWorld(
+            tileX * tileSpan,
+            tileZ * tileSpan,
+          );
+          const destinationSize = tileSpan * magnifierRenderScale;
+          drawMapTile(context, key, destination, destinationSize);
+        }
+      }
+    }
+    context.globalAlpha = 1;
+
+    const region = explorationState.region;
+    const firstTileX = Math.max(
+      region.minTileX,
+      Math.floor(minX / region.tileSpan),
+    );
+    const lastTileXExclusive = Math.min(
+      region.maxTileXExclusive,
+      Math.floor(maxX / region.tileSpan) + 1,
+    );
+    const firstTileZ = Math.max(
+      region.minTileZ,
+      Math.floor(minZ / region.tileSpan),
+    );
+    const lastTileZExclusive = Math.min(
+      region.maxTileZExclusive,
+      Math.floor(maxZ / region.tileSpan) + 1,
+    );
+    const cellSize = region.tileSpan * magnifierRenderScale;
+    context.font = "10px var(--font-geist-mono), monospace";
+    context.textBaseline = "top";
+    for (
+      let tileZ = firstTileZ;
+      tileZ < lastTileZExclusive;
+      tileZ += 1
+    ) {
+      for (
+        let tileX = firstTileX;
+        tileX < lastTileXExclusive;
+        tileX += 1
+      ) {
+        const index = cellIndexAtTile(region, tileX, tileZ);
+        if (index === null) continue;
+        const point = lensAtWorld(
+          tileX * region.tileSpan,
+          tileZ * region.tileSpan,
+        );
+        const current = index === explorationState.currentIndex;
+        const reviewed = isCellReviewed(explorationState, index);
+        const appearance = explorationCellAppearance(
+          explorationState,
+          index,
+        );
+        const visual = EXPLORATION_CELL_VISUALS[appearance];
+        context.fillStyle = visual.fill;
+        context.fillRect(point.x, point.y, cellSize, cellSize);
+        context.save();
+        context.lineWidth = current ? 3 : reviewed ? 1.5 : 1;
+        context.strokeStyle = visual.stroke;
+        context.setLineDash(current || reviewed ? [] : [7, 6]);
+        if (visual.glow) {
+          context.shadowColor = visual.glow;
+          context.shadowBlur = 16;
+        }
+        context.strokeRect(
+          point.x + 0.5,
+          point.y + 0.5,
+          cellSize - 1,
+          cellSize - 1,
+        );
+        context.restore();
+        if (cellSize >= 94) {
+          const cell = cellForIndex(region, index);
+          context.fillStyle = visual.label;
+          context.fillText(
+            `F${cell.row + 1} · C${cell.column + 1}`,
+            point.x + 9,
+            point.y + 9,
+          );
+        }
+      }
+    }
+    context.textBaseline = "alphabetic";
+
+    if (highlightRoute) {
+      drawHighlightRouteSegments(
+        context,
+        highlightRoute.overlay,
+        lensAtWorld,
+        visibleWorldBounds,
+      );
+    }
+
+    for (const highlight of renderedHighlights) {
+      if (!highlight.visible) continue;
+      const renderMargin = 24 / magnifierRenderScale;
+      if (highlight.type === "area" && highlight.bounds) {
+        if (
+          Math.max(highlight.bounds.x1, highlight.bounds.x2) <
+            minX - renderMargin ||
+          Math.min(highlight.bounds.x1, highlight.bounds.x2) >
+            maxX + renderMargin ||
+          Math.max(highlight.bounds.z1, highlight.bounds.z2) <
+            minZ - renderMargin ||
+          Math.min(highlight.bounds.z1, highlight.bounds.z2) >
+            maxZ + renderMargin
+        ) {
+          continue;
+        }
+      } else if (
+        highlight.x < minX - renderMargin ||
+        highlight.x > maxX + renderMargin ||
+        highlight.z < minZ - renderMargin ||
+        highlight.z > maxZ + renderMargin
+      ) {
+        continue;
+      }
+      const selected = highlight.id === selectedHighlightId;
+      context.strokeStyle = highlight.color;
+      context.fillStyle = highlight.color;
+      context.lineWidth = selected ? 3 : 2;
+      context.shadowColor = "rgba(0,0,0,.5)";
+      context.shadowBlur = 8;
+      if (highlight.type === "area" && highlight.bounds) {
+        const start = lensAtWorld(
+          Math.min(highlight.bounds.x1, highlight.bounds.x2),
+          Math.min(highlight.bounds.z1, highlight.bounds.z2),
+        );
+        const end = lensAtWorld(
+          Math.max(highlight.bounds.x1, highlight.bounds.x2),
+          Math.max(highlight.bounds.z1, highlight.bounds.z2),
+        );
+        context.globalAlpha = 0.17;
+        context.fillRect(start.x, start.y, end.x - start.x, end.y - start.y);
+        context.globalAlpha = 0.95;
+        context.setLineDash(selected ? [] : [7, 5]);
+        context.strokeRect(
+          start.x,
+          start.y,
+          end.x - start.x,
+          end.y - start.y,
+        );
+        context.setLineDash([]);
+      } else {
+        const point = lensAtWorld(highlight.x, highlight.z);
+        if (
+          point.x < -24 ||
+          point.y < -24 ||
+          point.x > MAGNIFIER_SIZE + 24 ||
+          point.y > MAGNIFIER_SIZE + 24
+        ) {
+          continue;
+        }
+        context.globalAlpha = 1;
+        context.beginPath();
+        context.arc(point.x, point.y, selected ? 10 : 8, 0, Math.PI * 2);
+        context.fill();
+        context.strokeStyle = "#ffffff";
+        context.lineWidth = 2;
+        context.stroke();
+      }
+    }
+    if (highlightRoute) {
+      drawHighlightRouteMarkers(
+        context,
+        highlightRoute.overlay,
+        lensAtWorld,
+        { width: MAGNIFIER_SIZE, height: MAGNIFIER_SIZE },
+        visibleWorldBounds,
+      );
+    }
+    context.globalAlpha = 1;
+    context.shadowBlur = 0;
+  }, [
+    drawMapTile,
+    explorationState,
+    highlightRoute,
+    isExploring,
+    layers,
+    lod,
+    magnifierEnabled,
+    magnifierPosition,
+    magnifierRenderScale,
+    renderedHighlights,
+    renderVersion,
+    selectedHighlightId,
+    worldAtScreen,
   ]);
 
   const zoomAt = useCallback(
@@ -3637,6 +4422,32 @@ export function MapViewer() {
     const rect = event.currentTarget.getBoundingClientRect();
     const screenX = event.clientX - rect.left;
     const screenY = event.clientY - rect.top;
+    if (magnifierEnabled && isExploring) {
+      const halfLens = MAGNIFIER_SIZE / 2;
+      const visible =
+        event.pointerType !== "touch" &&
+        screenX >= 0 &&
+        screenY >= 0 &&
+        screenX <= rect.width &&
+        screenY <= rect.height;
+      scheduleMagnifierPosition({
+        x: screenX,
+        y: screenY,
+        lensX: clamp(
+          screenX,
+          halfLens + MAGNIFIER_EDGE_GAP,
+          rect.width - halfLens - MAGNIFIER_EDGE_GAP,
+        ),
+        lensY: clamp(
+          screenY,
+          halfLens + MAGNIFIER_EDGE_GAP,
+          rect.height - halfLens - MAGNIFIER_EDGE_GAP,
+        ),
+        visible,
+      });
+    } else if (magnifierPosition.visible) {
+      hideMagnifier();
+    }
     const world = worldAtScreen(screenX, screenY);
     setCursor(world);
     if (atlasMode) {
@@ -3952,7 +4763,6 @@ export function MapViewer() {
         setQuickHighlightMenu(null);
         return;
       }
-      if (workspaceMutationsBlocked) return;
       const target =
         event.target instanceof HTMLElement ? event.target : null;
       const interactiveTarget = target?.closest(
@@ -3962,6 +4772,22 @@ export function MapViewer() {
         if (event.key === "Escape") target?.blur();
         return;
       }
+      if (
+        (event.key === "l" || event.key === "L") &&
+        !event.altKey &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.shiftKey &&
+        isExploring
+      ) {
+        event.preventDefault();
+        if (!event.repeat) {
+          hideMagnifier();
+          setMagnifierEnabled((enabled) => !enabled);
+        }
+        return;
+      }
+      if (workspaceMutationsBlocked) return;
       if (event.key === "g" || event.key === "G") {
         event.preventDefault();
         searchRef.current?.focus();
@@ -4081,6 +4907,8 @@ export function MapViewer() {
     commitCoverageSelection,
     coverageSelection,
     explorationState,
+    hideMagnifier,
+    isExploring,
     moveExplorationCardinal,
     quickHighlightMenu,
     scale,
@@ -4343,6 +5171,52 @@ export function MapViewer() {
     notify("Copia JSON de highlights descargada");
   };
 
+  const exportHighlightRoute = () => {
+    if (!highlightRoute || !activeExplorationRegion) return;
+    const payload = {
+      ...createHighlightRouteExport(highlightRoute),
+      exportedAt: new Date().toISOString(),
+      region: {
+        id: activeExplorationRegion.id,
+        name: activeExplorationRegion.name,
+        lod: activeExplorationRegion.lod,
+        bounds: activeExplorationRegion.bounds,
+      },
+      segments: highlightRoute.overlay.segments,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "obsidian-atlas-ruta-highlights.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+    notify("Ruta etiquetada descargada en JSON");
+  };
+
+  const exportHighlightRouteImage = () => {
+    if (!highlightRoute || !canvasRef.current) return;
+    try {
+      canvasRef.current.toBlob((blob) => {
+        if (!blob) {
+          notify("No se pudo generar la imagen de la ruta");
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = "obsidian-atlas-ruta-vista.png";
+        anchor.click();
+        URL.revokeObjectURL(url);
+        notify("Vista actual de la ruta descargada en PNG");
+      }, "image/png");
+    } catch {
+      notify("No se pudo exportar la vista actual de la ruta");
+    }
+  };
+
   const prepareXaeroOperation = async () => {
     if (!localRuntime) {
       setXaeroError("El runtime local todavía no está disponible");
@@ -4563,10 +5437,17 @@ export function MapViewer() {
           ref={canvasRef}
           className="map-canvas"
           aria-label="Mapa interactivo del Overworld de 2b2t"
-          aria-describedby={atlasMode ? "atlas-sector-announcement" : undefined}
+          aria-describedby={
+            atlasMode
+              ? "atlas-sector-announcement"
+              : isExploring
+                ? "map-magnifier-help"
+                : undefined
+          }
           tabIndex={0}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
+          onPointerLeave={hideMagnifier}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerCancel}
           onWheel={handleWheel}
@@ -4581,6 +5462,28 @@ export function MapViewer() {
             );
           }}
         />
+        {isExploring &&
+        magnifierEnabled &&
+        magnifierPosition.visible ? (
+          <div
+            className="map-magnifier"
+            style={{
+              left: magnifierPosition.lensX,
+              top: magnifierPosition.lensY,
+            }}
+            aria-hidden="true"
+          >
+            <canvas
+              ref={magnifierCanvasRef}
+              width={MAGNIFIER_SIZE}
+              height={MAGNIFIER_SIZE}
+            />
+            <span className="map-magnifier-reticle" />
+            <span className="map-magnifier-scale">
+              LUPA · {formatMapZoom(magnifierZoomFactor)}×
+            </span>
+          </div>
+        ) : null}
         <div className="map-vignette" />
         <div className="center-reticle" aria-hidden="true">
           <span />
@@ -6849,14 +7752,251 @@ export function MapViewer() {
                     {explorationState?.region.name ?? "Highlights generales"}
                   </strong>
                   <em>
-                    {scopedHighlights.length.toLocaleString("es-GT")} visible
-                    {scopedHighlights.length === 1 ? "" : "s"} en este
-                    cuadrante
+                    {scopedHighlights.length.toLocaleString("es-GT")}{" "}
+                    {scopedHighlights.length === 1
+                      ? "highlight guardado"
+                      : "highlights guardados"}{" "}
+                    en esta región
                     {highlights.length > scopedHighlights.length
                       ? ` · ${(highlights.length - scopedHighlights.length).toLocaleString("es-GT")} de otras regiones ocultos`
                       : ""}
                   </em>
                 </span>
+              </section>
+
+              <section
+                className={`highlight-route-card ${highlightRouteEnabled ? "active" : ""}`}
+                aria-labelledby="highlight-route-title"
+                aria-busy={highlightRouteIsCalculating}
+              >
+                <div className="highlight-route-heading">
+                  <span className="highlight-route-icon">
+                    <Route size={18} />
+                  </span>
+                  <span>
+                    <small>ANÁLISIS DE RECORRIDO</small>
+                    <strong id="highlight-route-title">Ruta inteligente</strong>
+                    <em>
+                      Conecta todos los highlights en línea recta, sin regresar
+                      al inicio.
+                    </em>
+                  </span>
+                </div>
+
+                {!activeExplorationRegion ? (
+                  <p className="highlight-route-empty">
+                    Abre una región explorada para calcular su recorrido.
+                  </p>
+                ) : scopedHighlights.length === 0 ? (
+                  <p className="highlight-route-empty">
+                    Crea al menos un highlight en esta región para iniciar el
+                    análisis.
+                  </p>
+                ) : (
+                  <>
+                    <label
+                      className="highlight-route-start"
+                      htmlFor="highlight-route-start"
+                    >
+                      <span>PUNTO INICIAL</span>
+                      <input
+                        type="search"
+                        value={highlightRouteStartSearch}
+                        onChange={(event) =>
+                          setHighlightRouteStartSearch(event.target.value)
+                        }
+                        placeholder="Filtrar por nombre, ID o coordenadas"
+                        aria-label="Filtrar puntos iniciales"
+                      />
+                      <select
+                        id="highlight-route-start"
+                        value={validHighlightRouteStartId ?? ""}
+                        onChange={(event) =>
+                          setHighlightRouteStartId(
+                            event.target.value === ""
+                              ? null
+                              : event.target.value,
+                          )
+                        }
+                      >
+                        <option value="">
+                          Automático · esquina superior izquierda
+                        </option>
+                        {highlightRouteStartOptions.map((highlight) => (
+                          <option key={highlight.id} value={highlight.id}>
+                            {highlight.title} · X {Math.round(highlight.x)}, Z{" "}
+                            {Math.round(highlight.z)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <p className="highlight-route-start-help">
+                      El automático elige el punto más cercano a minX/minZ.
+                      También puedes fijar manualmente la primera parada.
+                      {scopedHighlights.length >
+                      highlightRouteStartOptions.length
+                        ? ` Se muestran hasta ${MAX_HIGHLIGHT_ROUTE_START_OPTIONS}; usa el filtro para encontrar cualquier otro.`
+                        : ""}
+                    </p>
+
+                    {highlightRouteIsCalculating ? (
+                      <div
+                        className="highlight-route-calculation"
+                        role="status"
+                      >
+                        <RotateCcw
+                          className="highlight-route-spinner"
+                          size={16}
+                        />
+                        <span>
+                          <strong>Calculando en segundo plano…</strong>
+                          <small>
+                            Puedes seguir usando el mapa mientras termina.
+                          </small>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setHighlightRouteEnabled(false)}
+                        >
+                          Cancelar
+                        </button>
+                      </div>
+                    ) : highlightRouteError ? (
+                      <div className="highlight-route-error" role="alert">
+                        <p>{highlightRouteError}</p>
+                        <button
+                          type="button"
+                          className="highlight-route-primary"
+                          onClick={() =>
+                            setHighlightRouteRetry(
+                              (current) => current + 1,
+                            )
+                          }
+                        >
+                          <RotateCcw size={16} />
+                          Reintentar cálculo
+                        </button>
+                      </div>
+                    ) : !highlightRoute ? (
+                      <button
+                        type="button"
+                        className="highlight-route-primary"
+                        onClick={() => setHighlightRouteEnabled(true)}
+                      >
+                        <Route size={16} />
+                        Calcular y superponer ruta
+                      </button>
+                    ) : (
+                      <>
+                        <div
+                          className="highlight-route-metrics"
+                          aria-live="polite"
+                        >
+                          <span>
+                            <small>PARADAS</small>
+                            <strong>
+                              {highlightRoute.stops.length.toLocaleString(
+                                "es-GT",
+                              )}
+                            </strong>
+                          </span>
+                          <span>
+                            <small>DISTANCIA</small>
+                            <strong>
+                              {Math.round(
+                                highlightRoute.totalDistance,
+                              ).toLocaleString("es-GT")}{" "}
+                              bl.
+                            </strong>
+                          </span>
+                        </div>
+                        <p className="highlight-route-method">
+                          {highlightRoute.optimal
+                            ? "Ruta óptima exacta · Held–Karp"
+                            : "Ruta heurística escalable · vecino más cercano + 2-opt"}
+                        </p>
+                        <div className="highlight-route-actions">
+                          <button
+                            type="button"
+                            onClick={() => setHighlightRouteEnabled(false)}
+                          >
+                            <EyeOff size={14} />
+                            Ocultar
+                          </button>
+                          <button type="button" onClick={exportHighlightRoute}>
+                            <Download size={14} />
+                            JSON
+                          </button>
+                          <button
+                            type="button"
+                            onClick={exportHighlightRouteImage}
+                          >
+                            <Download size={14} />
+                            PNG vista
+                          </button>
+                        </div>
+                        <div className="highlight-route-list-heading">
+                          <span>ORDEN DE VISITA</span>
+                          <small>
+                            {highlightRoute.startMode === "selected"
+                              ? "Inicio elegido"
+                              : "Inicio automático"}
+                          </small>
+                        </div>
+                        <ol className="highlight-route-list">
+                          {highlightRoute.stops
+                            .slice(0, MAX_VISIBLE_ROUTE_STOPS)
+                            .map((stop) => (
+                              <li key={stop.highlight.id}>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedHighlightId(stop.highlight.id);
+                                    focusMapPoint(
+                                      stop.highlight.x,
+                                      stop.highlight.z,
+                                    );
+                                  }}
+                                >
+                                  <span
+                                    className={
+                                      stop.order === 1
+                                        ? "route-order start"
+                                        : "route-order"
+                                    }
+                                  >
+                                    {stop.label}
+                                  </span>
+                                  <span>
+                                    <strong>{stop.highlight.title}</strong>
+                                    <small>
+                                      X {formatCoordinate(stop.highlight.x)} · Z{" "}
+                                      {formatCoordinate(stop.highlight.z)}
+                                      {stop.order > 1
+                                        ? ` · +${Math.round(stop.distanceFromPrevious).toLocaleString("es-GT")} bl.`
+                                        : " · inicio"}
+                                    </small>
+                                  </span>
+                                </button>
+                              </li>
+                            ))}
+                        </ol>
+                        {highlightRoute.stops.length >
+                        MAX_VISIBLE_ROUTE_STOPS ? (
+                          <p className="highlight-route-overflow">
+                            Se muestran las primeras{" "}
+                            {MAX_VISIBLE_ROUTE_STOPS.toLocaleString("es-GT")}{" "}
+                            paradas; el overlay y el JSON conservan las{" "}
+                            {highlightRoute.stops.length.toLocaleString(
+                              "es-GT",
+                            )}{" "}
+                            completas.
+                          </p>
+                        ) : null}
+                      </>
+                    )}
+                  </>
+                )}
               </section>
 
               <div className="highlight-tools">
@@ -6997,6 +8137,31 @@ export function MapViewer() {
                       <Crosshair size={16} />
                     </button>
                   </div>
+                  {activeExplorationRegion ? (
+                    <button
+                      type="button"
+                      className={`highlight-route-select-start ${
+                        validHighlightRouteStartId === selectedHighlight.id
+                          ? "active"
+                          : ""
+                      }`}
+                      aria-pressed={
+                        validHighlightRouteStartId === selectedHighlight.id
+                      }
+                      onClick={() => {
+                        setHighlightRouteStartId(selectedHighlight.id);
+                        setHighlightRouteEnabled(true);
+                        notify(
+                          `“${selectedHighlight.title}” será el inicio de la ruta`,
+                        );
+                      }}
+                    >
+                      <Route size={15} />
+                      {validHighlightRouteStartId === selectedHighlight.id
+                        ? "Punto inicial de la ruta"
+                        : "Usar como punto inicial"}
+                    </button>
+                  ) : null}
                   {selectedHighlight.bounds && (
                     <p className="bounds-readout">
                       X {formatCoordinate(selectedHighlight.bounds.x1)} →{" "}
@@ -7133,6 +8298,7 @@ export function MapViewer() {
                 <Shortcut keys="G" label="Ir a coordenadas" />
                 <Shortcut keys="E" label="Abrir exploración" />
                 <Shortcut keys="M" label="Marcar punto" />
+                <Shortcut keys="L" label="Activar o desactivar lupa" />
                 <Shortcut keys="R" label="Dibujar área" />
                 <Shortcut keys="Esc" label="Cancelar o cerrar" />
               </div>
@@ -7179,10 +8345,44 @@ export function MapViewer() {
         </span>
       </div>
 
+      {isExploring ? (
+        <>
+          <button
+            type="button"
+            className={`magnifier-toggle glass-card ${magnifierEnabled ? "active" : ""}`}
+            aria-label={
+              magnifierEnabled
+                ? "Desactivar lupa del mapa"
+                : "Activar lupa del mapa"
+            }
+            aria-keyshortcuts="L"
+            aria-pressed={magnifierEnabled}
+            onClick={() => {
+              hideMagnifier();
+              setMagnifierEnabled((enabled) => !enabled);
+            }}
+          >
+            <ScanSearch size={15} aria-hidden="true" />
+            <span>{magnifierEnabled ? "Lupa activa" : "Lupa"}</span>
+            <kbd>L</kbd>
+          </button>
+          <span id="map-magnifier-help" className="sr-only">
+            Presiona L para activar o desactivar una lupa de detalle que sigue
+            el puntero.
+          </span>
+          <span className="sr-only" role="status" aria-live="polite">
+            {magnifierEnabled ? "Lupa activada" : "Lupa desactivada"}
+          </span>
+        </>
+      ) : null}
+
       <div
         ref={fallbackBadgeRef}
         className="fallback-badge glass-card"
         data-active="false"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
       >
         <RotateCcw size={14} aria-hidden="true" />
         <span ref={fallbackTextRef} />

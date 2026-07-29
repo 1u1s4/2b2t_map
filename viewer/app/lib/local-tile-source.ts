@@ -45,6 +45,15 @@ export interface WorldTilePosition {
   readonly pixelZ: number;
 }
 
+export interface AncestorTileCrop {
+  readonly lod: number;
+  readonly tileX: number;
+  readonly tileZ: number;
+  readonly sourceX: number;
+  readonly sourceZ: number;
+  readonly sourceSize: number;
+}
+
 export type TilePathSegments = readonly [
   layer: TileLayer,
   lod: string,
@@ -113,9 +122,15 @@ export interface PickTileDirectoryOptions {
 }
 
 export class LocalTileSourceError extends Error {
+  public readonly code:
+    | "UNSUPPORTED"
+    | "WRONG_DIRECTORY"
+    | "DISPOSED"
+    | "INVALID_TILE_KEY";
+
   constructor(
     message: string,
-    public readonly code:
+    code:
       | "UNSUPPORTED"
       | "WRONG_DIRECTORY"
       | "DISPOSED"
@@ -123,6 +138,7 @@ export class LocalTileSourceError extends Error {
   ) {
     super(message);
     this.name = "LocalTileSourceError";
+    this.code = code;
   }
 }
 
@@ -255,6 +271,48 @@ function assertLod(lod: number): void {
 
 export function isTileLayer(value: string): value is TileLayer {
   return (TILE_LAYERS as readonly string[]).includes(value);
+}
+
+/**
+ * Only terrain is spatially continuous across LODs. Sparse semantic layers
+ * use a missing tile to mean "nothing to draw"; enlarging an aggregated
+ * ancestor pixel would invent overlay coverage and can obscure the base map.
+ */
+export function allowsAncestorTileFallback(layer: TileLayer): boolean {
+  return layer === "base";
+}
+
+/**
+ * Resolves the native-pixel crop that represents one detailed child tile
+ * inside a coarser ancestor. Math.floor is intentional for negative tiles.
+ */
+export function resolveAncestorTileCrop(
+  key: Readonly<TileKey>,
+  ancestorLod: number,
+): AncestorTileCrop {
+  if (
+    !Number.isInteger(ancestorLod) ||
+    ancestorLod <= key.lod ||
+    ancestorLod > MAX_TILE_LOD
+  ) {
+    throw new RangeError(
+      `ancestorLod must be greater than ${key.lod} and at most ${MAX_TILE_LOD}`,
+    );
+  }
+  const subdivision = 2 ** (ancestorLod - key.lod);
+  const tileX = Math.floor(key.tileX / subdivision);
+  const tileZ = Math.floor(key.tileZ / subdivision);
+  const childX = key.tileX - tileX * subdivision;
+  const childZ = key.tileZ - tileZ * subdivision;
+  const sourceSize = TILE_SIZE_PIXELS / subdivision;
+  return Object.freeze({
+    lod: ancestorLod,
+    tileX,
+    tileZ,
+    sourceX: childX * sourceSize,
+    sourceZ: childZ * sourceSize,
+    sourceSize,
+  });
 }
 
 /**
@@ -483,8 +541,11 @@ export async function readTileFile(
 export class LocalTileSource {
   readonly #revokeByUrl = new Map<string, () => void>();
   #disposed = false;
+  readonly directory: FileSystemDirectoryHandle;
 
-  constructor(public readonly directory: FileSystemDirectoryHandle) {}
+  constructor(directory: FileSystemDirectoryHandle) {
+    this.directory = directory;
+  }
 
   get activeObjectUrlCount(): number {
     return this.#revokeByUrl.size;
