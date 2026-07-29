@@ -93,7 +93,7 @@ test("exploration header hides by default and reveals by proximity or focus", ()
 test("exploration magnifier uses a passive circular tile render and the L shortcut", () => {
   assert.match(
     viewerSource,
-    /\(event\.key === "l" \|\| event\.key === "L"\)[\s\S]*?!event\.altKey[\s\S]*?!event\.ctrlKey[\s\S]*?!event\.metaKey[\s\S]*?!event\.shiftKey[\s\S]*?isExploring[\s\S]*?setMagnifierEnabled/,
+    /\(event\.key === "l" \|\| event\.key === "L"\)[\s\S]*?!event\.altKey[\s\S]*?!event\.ctrlKey[\s\S]*?!event\.metaKey[\s\S]*?!event\.shiftKey[\s\S]*?isExploring[\s\S]*?toggleMagnifier\(\)/,
   );
   assert.match(
     viewerSource,
@@ -138,6 +138,25 @@ test("exploration magnifier uses a passive circular tile render and the L shortc
     styles,
     /\.map-magnifier\s*\{[\s\S]*?border-radius:\s*50%[\s\S]*?pointer-events:\s*none/,
   );
+  assert.match(
+    viewerSource,
+    /magnifierEnabled && isExploring \? "is-magnifier-active" : ""/,
+  );
+  assert.match(
+    styles,
+    /\.atlas-shell\.is-magnifier-active \.map-canvas,[\s\S]*?cursor:\s*none/,
+  );
+  assert.doesNotMatch(viewerSource, /map-magnifier-reticle/);
+  assert.doesNotMatch(styles, /\.map-magnifier-reticle/);
+  assert.match(
+    viewerSource,
+    /const toggleMagnifier[\s\S]*?lastMagnifierPositionRef\.current \?\?[\s\S]*?scheduleMagnifierPosition/,
+  );
+  assert.match(
+    viewerSource,
+    /lastMagnifierPositionRef\.current =[\s\S]*?if \(magnifierEnabled && isExploring\)/,
+  );
+  assert.match(viewerSource, /onPointerLeave=\{leaveMagnifier\}/);
   assert.match(
     viewerSource,
     /event\.key === "m" \|\| event\.key === "M"[\s\S]*?beginMarkMode\("pin"\)/,

@@ -965,6 +965,8 @@ export function MapViewer() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const magnifierCanvasRef = useRef<HTMLCanvasElement>(null);
   const magnifierFrameRef = useRef<number | null>(null);
+  const lastMagnifierPositionRef =
+    useRef<MagnifierPosition | null>(null);
   const pendingMagnifierPositionRef =
     useRef<MagnifierPosition | null>(null);
   const mapRef = useRef<HTMLDivElement>(null);
@@ -1148,12 +1150,12 @@ export function MapViewer() {
   const [magnifierEnabled, setMagnifierEnabled] = useState(false);
   const [magnifierPosition, setMagnifierPosition] =
     useState<MagnifierPosition>({
-    x: INITIAL_VIEW_SIZE.width / 2,
-    y: INITIAL_VIEW_SIZE.height / 2,
-    lensX: INITIAL_VIEW_SIZE.width / 2,
-    lensY: INITIAL_VIEW_SIZE.height / 2,
-    visible: false,
-  });
+      x: INITIAL_VIEW_SIZE.width / 2,
+      y: INITIAL_VIEW_SIZE.height / 2,
+      lensX: INITIAL_VIEW_SIZE.width / 2,
+      lensY: INITIAL_VIEW_SIZE.height / 2,
+      visible: false,
+    });
   const [highlightRouteEnabled, setHighlightRouteEnabled] = useState(false);
   const [highlightRouteStartId, setHighlightRouteStartId] = useState<
     string | null
@@ -1196,6 +1198,35 @@ export function MapViewer() {
       current.visible ? { ...current, visible: false } : current,
     );
   }, []);
+  const leaveMagnifier = useCallback(() => {
+    lastMagnifierPositionRef.current = null;
+    hideMagnifier();
+  }, [hideMagnifier]);
+  const toggleMagnifier = useCallback(() => {
+    const enabled = !magnifierEnabled;
+    setMagnifierEnabled(enabled);
+    if (!enabled) {
+      hideMagnifier();
+      return;
+    }
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const fallbackX = (rect?.width ?? INITIAL_VIEW_SIZE.width) / 2;
+    const fallbackY = (rect?.height ?? INITIAL_VIEW_SIZE.height) / 2;
+    scheduleMagnifierPosition({
+      ...(lastMagnifierPositionRef.current ?? {
+        x: fallbackX,
+        y: fallbackY,
+        lensX: fallbackX,
+        lensY: fallbackY,
+        visible: true,
+      }),
+      visible: true,
+    });
+  }, [
+    hideMagnifier,
+    magnifierEnabled,
+    scheduleMagnifierPosition,
+  ]);
   useEffect(
     () => () => {
       if (magnifierFrameRef.current !== null) {
@@ -4422,29 +4453,32 @@ export function MapViewer() {
     const rect = event.currentTarget.getBoundingClientRect();
     const screenX = event.clientX - rect.left;
     const screenY = event.clientY - rect.top;
+    const halfLens = MAGNIFIER_SIZE / 2;
+    const visible =
+      event.pointerType !== "touch" &&
+      screenX >= 0 &&
+      screenY >= 0 &&
+      screenX <= rect.width &&
+      screenY <= rect.height;
+    const nextMagnifierPosition: MagnifierPosition = {
+      x: screenX,
+      y: screenY,
+      lensX: clamp(
+        screenX,
+        halfLens + MAGNIFIER_EDGE_GAP,
+        rect.width - halfLens - MAGNIFIER_EDGE_GAP,
+      ),
+      lensY: clamp(
+        screenY,
+        halfLens + MAGNIFIER_EDGE_GAP,
+        rect.height - halfLens - MAGNIFIER_EDGE_GAP,
+      ),
+      visible,
+    };
+    lastMagnifierPositionRef.current =
+      visible && isExploring ? nextMagnifierPosition : null;
     if (magnifierEnabled && isExploring) {
-      const halfLens = MAGNIFIER_SIZE / 2;
-      const visible =
-        event.pointerType !== "touch" &&
-        screenX >= 0 &&
-        screenY >= 0 &&
-        screenX <= rect.width &&
-        screenY <= rect.height;
-      scheduleMagnifierPosition({
-        x: screenX,
-        y: screenY,
-        lensX: clamp(
-          screenX,
-          halfLens + MAGNIFIER_EDGE_GAP,
-          rect.width - halfLens - MAGNIFIER_EDGE_GAP,
-        ),
-        lensY: clamp(
-          screenY,
-          halfLens + MAGNIFIER_EDGE_GAP,
-          rect.height - halfLens - MAGNIFIER_EDGE_GAP,
-        ),
-        visible,
-      });
+      scheduleMagnifierPosition(nextMagnifierPosition);
     } else if (magnifierPosition.visible) {
       hideMagnifier();
     }
@@ -4782,8 +4816,7 @@ export function MapViewer() {
       ) {
         event.preventDefault();
         if (!event.repeat) {
-          hideMagnifier();
-          setMagnifierEnabled((enabled) => !enabled);
+          toggleMagnifier();
         }
         return;
       }
@@ -4907,12 +4940,12 @@ export function MapViewer() {
     commitCoverageSelection,
     coverageSelection,
     explorationState,
-    hideMagnifier,
     isExploring,
     moveExplorationCardinal,
     quickHighlightMenu,
     scale,
     selectAtlasCell,
+    toggleMagnifier,
     viewFullCoverage,
     workspaceMutationsBlocked,
     zoomAt,
@@ -5395,7 +5428,7 @@ export function MapViewer() {
 
   return (
     <main
-      className={`atlas-shell ${drawer ? "has-drawer" : ""} ${atlasMode ? "is-atlas-mode" : ""} ${isExploring ? "is-exploring" : ""} ${topbarRevealed ? "is-topbar-revealed" : ""} ${markMode ? "is-marking" : ""}`}
+      className={`atlas-shell ${drawer ? "has-drawer" : ""} ${atlasMode ? "is-atlas-mode" : ""} ${isExploring ? "is-exploring" : ""} ${topbarRevealed ? "is-topbar-revealed" : ""} ${markMode ? "is-marking" : ""} ${magnifierEnabled && isExploring ? "is-magnifier-active" : ""}`}
       aria-busy={workspaceMutationsBlocked}
       onPointerMoveCapture={handleShellPointerMove}
       onPointerLeave={() => setTopbarRevealed(false)}
@@ -5447,7 +5480,7 @@ export function MapViewer() {
           tabIndex={0}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
-          onPointerLeave={hideMagnifier}
+          onPointerLeave={leaveMagnifier}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerCancel}
           onWheel={handleWheel}
@@ -5478,7 +5511,6 @@ export function MapViewer() {
               width={MAGNIFIER_SIZE}
               height={MAGNIFIER_SIZE}
             />
-            <span className="map-magnifier-reticle" />
             <span className="map-magnifier-scale">
               LUPA · {formatMapZoom(magnifierZoomFactor)}×
             </span>
@@ -8357,10 +8389,7 @@ export function MapViewer() {
             }
             aria-keyshortcuts="L"
             aria-pressed={magnifierEnabled}
-            onClick={() => {
-              hideMagnifier();
-              setMagnifierEnabled((enabled) => !enabled);
-            }}
+            onClick={toggleMagnifier}
           >
             <ScanSearch size={15} aria-hidden="true" />
             <span>{magnifierEnabled ? "Lupa activa" : "Lupa"}</span>

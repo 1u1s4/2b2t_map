@@ -135,6 +135,11 @@ canvas:focus-visible {
   cursor: crosshair;
 }
 
+.atlas-shell.is-magnifier-active .map-canvas,
+.atlas-shell.is-magnifier-active .map-canvas:active {
+  cursor: none;
+}
+
 .map-vignette {
   pointer-events: none;
   z-index: 1;
@@ -166,41 +171,6 @@ canvas:focus-visible {
   display: block;
   width: 100%;
   height: 100%;
-}
-
-.map-magnifier-reticle {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 20px;
-  height: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.82);
-  border-radius: 50%;
-  box-shadow:
-    0 0 0 1px rgba(4, 11, 20, 0.72),
-    0 0 10px rgba(4, 11, 20, 0.72);
-  transform: translate(-50%, -50%);
-}
-
-.map-magnifier-reticle::before,
-.map-magnifier-reticle::after {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  content: "";
-  background: rgba(255, 255, 255, 0.82);
-  box-shadow: 0 0 2px rgba(4, 11, 20, 0.9);
-  transform: translate(-50%, -50%);
-}
-
-.map-magnifier-reticle::before {
-  width: 30px;
-  height: 1px;
-}
-
-.map-magnifier-reticle::after {
-  width: 1px;
-  height: 30px;
 }
 
 .map-magnifier-scale {
