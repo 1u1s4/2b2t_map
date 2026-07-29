@@ -22,6 +22,11 @@ import {
   atlasWorkspaceEtag,
   parseAtlasWorkspaceEtag,
 } from "./local-atlas-workspace.ts";
+import {
+  LocalAtlasXaeroExporter,
+  XaeroExportError,
+  type XaeroExportSelection,
+} from "./local-atlas-xaero.ts";
 
 const STATUS_ENDPOINT = "/api/local-atlas/status";
 const COVERAGE_ENDPOINT = "/api/local-atlas/coverage";
@@ -29,6 +34,8 @@ const REGION_STATUS_ENDPOINT = "/api/local-atlas/region-status";
 const DOWNLOAD_ENDPOINT = "/api/local-atlas/download";
 const STOP_ENDPOINT = "/api/local-atlas/stop";
 const WORKSPACE_ENDPOINT = "/api/local-atlas/workspace";
+const XAERO_PREVIEW_ENDPOINT = "/api/local-atlas/xaero-export/preview";
+const XAERO_EXPORT_ENDPOINT = "/api/local-atlas/xaero-export";
 const TILE_ENDPOINT = "/api/tile";
 const TILE_SIZE_PIXELS = 512;
 const TILES_PER_SHARD = 32;
@@ -242,6 +249,33 @@ const MAX_LOCAL_COVERAGE_BYTES = 512 * 1024;
 const LOCAL_COVERAGE_QUERY_TIMEOUT_MS = 15_000;
 const MAX_LOCAL_REGION_STATUS_BYTES = 64 * 1024 * 1024;
 const LOCAL_REGION_STATUS_QUERY_TIMEOUT_MS = 120_000;
+const MAX_LOCAL_ARCHIVE_BYTES_OUTPUT = 64;
+const LOCAL_ARCHIVE_BYTES_QUERY_TIMEOUT_MS = 15_000;
+
+const LOCAL_ARCHIVE_BYTES_QUERY = String.raw`
+import sqlite3
+import sys
+
+database_path = sys.argv[1]
+connection = sqlite3.connect(
+    f"file:{database_path}?mode=ro",
+    uri=True,
+    timeout=5,
+)
+connection.execute("PRAGMA query_only = ON")
+row = connection.execute(
+    """
+    SELECT SUM(size_bytes)
+    FROM tiles
+    WHERE status = 'complete'
+    """
+).fetchone()
+connection.close()
+value = 0 if row is None or row[0] is None else row[0]
+if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    raise ValueError("invalid archive byte total")
+print(value)
+`;
 
 const LOCAL_REGION_STATUS_QUERY = String.raw`
 import hashlib
@@ -472,6 +506,8 @@ export interface LocalAtlasOptions {
   readonly tileRoot?: string;
   readonly regionalTileRoot?: string;
   readonly backingRoot?: string;
+  readonly minecraftRoot?: string;
+  readonly minecraftOpenProbe?: (lockPath: string) => Promise<boolean>;
   readonly pythonBin?: string;
   readonly projectRoot?: string;
   readonly overworldRequirementBytes?: number;
@@ -686,6 +722,44 @@ function writeWorkspaceError(
   );
 }
 
+function writeXaeroError(
+  response: ServerResponse,
+  error: unknown,
+): void {
+  if (error instanceof RangeError) {
+    writeJson(response, 413, { error: error.message });
+    return;
+  }
+  if (error instanceof TypeError) {
+    writeJson(response, 400, { error: error.message });
+    return;
+  }
+  if (!(error instanceof XaeroExportError)) {
+    writeJson(response, 500, {
+      error: "No se pudo preparar la exportación a Xaero",
+    });
+    return;
+  }
+  const statusCode =
+    error.code === "XAERO_MINECRAFT_OPEN" ||
+    error.code === "XAERO_LOCKED"
+      ? 423
+      : error.code === "XAERO_STALE_PREVIEW"
+        ? 409
+        : error.code === "XAERO_NO_CHANGES"
+          ? 409
+          : error.code === "XAERO_INVALID_FILE" ||
+              error.code === "XAERO_MANIFEST_INVALID"
+            ? 422
+            : error.code === "XAERO_RECOVERY_CONFLICT"
+              ? 409
+              : 503;
+  writeJson(response, statusCode, {
+    error: error.message,
+    code: error.code,
+  });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -737,6 +811,75 @@ function requestPath(request: IncomingMessage): string | null {
   } catch {
     return null;
   }
+}
+
+function parseXaeroSelection(
+  operationValue: unknown,
+  scopeValue: unknown,
+  explorationIdValue: unknown,
+): XaeroExportSelection {
+  const operation =
+    operationValue === undefined ? "export" : operationValue;
+  const scope =
+    scopeValue === undefined ? "all" : scopeValue;
+  if (!(operation === "export" || operation === "remove")) {
+    throw new TypeError("operation debe ser export o remove");
+  }
+  if (!(scope === "all" || scope === "exploration")) {
+    throw new TypeError("scope debe ser all o exploration");
+  }
+  if (scope === "all") {
+    if (
+      explorationIdValue !== undefined &&
+      explorationIdValue !== null &&
+      explorationIdValue !== ""
+    ) {
+      throw new TypeError(
+        "explorationId no corresponde al alcance global",
+      );
+    }
+    return { operation, scope };
+  }
+  if (
+    typeof explorationIdValue !== "string" ||
+    explorationIdValue.length === 0 ||
+    explorationIdValue.length > 100
+  ) {
+    throw new TypeError(
+      "explorationId es obligatorio para el alcance regional",
+    );
+  }
+  return {
+    operation,
+    scope,
+    explorationId: explorationIdValue,
+  };
+}
+
+function parseXaeroPreviewSelection(
+  requestUrl: string | undefined,
+): XaeroExportSelection {
+  if (!requestUrl) {
+    return { operation: "export", scope: "all" };
+  }
+  const parsed = new URL(requestUrl, "http://localhost");
+  const allowed = new Set([
+    "operation",
+    "scope",
+    "explorationId",
+  ]);
+  for (const key of parsed.searchParams.keys()) {
+    if (!allowed.has(key) || parsed.searchParams.getAll(key).length !== 1) {
+      throw new TypeError(
+        "La previsualización Xaero contiene filtros inválidos",
+      );
+    }
+  }
+  return parseXaeroSelection(
+    parsed.searchParams.get("operation") ?? undefined,
+    parsed.searchParams.get("scope") ?? undefined,
+    parsed.searchParams.get("explorationId") ?? undefined,
+  );
 }
 
 function requireLocalRequest(
@@ -1012,7 +1155,7 @@ async function readRequestBody(
   }
 }
 
-async function readArchiveBytes(tileRoot: string): Promise<number> {
+async function readLegacyArchiveBytes(tileRoot: string): Promise<number> {
   try {
     const value = JSON.parse(
       await readFile(resolve(tileRoot, "progress.json"), "utf8"),
@@ -1033,6 +1176,95 @@ async function readArchiveBytes(tileRoot: string): Promise<number> {
     // A capacity snapshot can still be useful without legacy size metadata.
   }
   return 0;
+}
+
+async function queryLocalArchiveBytes(
+  tileRoot: string,
+  pythonBin: string,
+): Promise<number> {
+  const databasePath = resolve(tileRoot, "tiles.sqlite3");
+  return await new Promise<number>((resolvePromise, rejectPromise) => {
+    const child: ChildProcess = spawn(
+      pythonBin,
+      ["-c", LOCAL_ARCHIVE_BYTES_QUERY, databasePath],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          NODE_ENV: process.env.NODE_ENV,
+          PATH: process.env.PATH,
+          LANG: process.env.LANG,
+          LC_ALL: process.env.LC_ALL,
+          VIRTUAL_ENV: process.env.VIRTUAL_ENV,
+          PYTHONUNBUFFERED: "1",
+        },
+      },
+    );
+    const stdout: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderr = "";
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish(() =>
+        rejectPromise(
+          new Error("La lectura del almacenamiento local superó el tiempo límite"),
+        ),
+      );
+    }, LOCAL_ARCHIVE_BYTES_QUERY_TIMEOUT_MS);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.byteLength;
+      if (stdoutBytes > MAX_LOCAL_ARCHIVE_BYTES_OUTPUT) {
+        child.kill("SIGTERM");
+        finish(() =>
+          rejectPromise(
+            new Error("La métrica de almacenamiento local no es válida"),
+          ),
+        );
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderr.length < 4_096) stderr += chunk.toString("utf8");
+    });
+    child.once("error", (error) => {
+      finish(() => rejectPromise(error));
+    });
+    child.once("exit", (code) => {
+      finish(() => {
+        if (code !== 0) {
+          rejectPromise(
+            new Error(
+              stderr.trim() ||
+                "No se pudo calcular el almacenamiento del catálogo local",
+            ),
+          );
+          return;
+        }
+        const output = Buffer.concat(stdout).toString("utf8").trim();
+        if (!/^\d+$/.test(output)) {
+          rejectPromise(
+            new Error("La métrica de almacenamiento local no es válida"),
+          );
+          return;
+        }
+        const bytes = Number(output);
+        if (!Number.isSafeInteger(bytes) || bytes < 0) {
+          rejectPromise(
+            new Error("La métrica de almacenamiento local no es segura"),
+          );
+          return;
+        }
+        resolvePromise(bytes);
+      });
+    });
+  });
 }
 
 async function readLocalCatalogSnapshot(
@@ -1511,6 +1743,7 @@ async function readCapacity(
   tileRoot: string | undefined,
   backingRoot: string | undefined,
   requirementOverrideBytes: number | undefined,
+  readArchiveBytes: (tileRoot: string) => Promise<number>,
 ) {
   // On-demand mode has no whole-world storage target. Keep these legacy
   // fields in the response contract so older clients remain parseable.
@@ -1696,16 +1929,16 @@ function parseJobProgressLine(
           metric < 0 ||
           metric > Number.MAX_SAFE_INTEGER),
     ) ||
-    (value.tilesPerSecond !== undefined &&
-      resolvedPerSecond !== undefined &&
+    (typeof value.tilesPerSecond === "number" &&
+      typeof resolvedPerSecond === "number" &&
       Math.abs(value.tilesPerSecond - resolvedPerSecond) >
         RATE_METRIC_TOLERANCE) ||
-    (resolvedPerSecond !== undefined &&
-      networkTilesPerSecond !== undefined &&
+    (typeof resolvedPerSecond === "number" &&
+      typeof networkTilesPerSecond === "number" &&
       networkTilesPerSecond >
         resolvedPerSecond + RATE_METRIC_TOLERANCE) ||
-    (achievedRps !== undefined &&
-      networkTilesPerSecond !== undefined &&
+    (typeof achievedRps === "number" &&
+      typeof networkTilesPerSecond === "number" &&
       networkTilesPerSecond > achievedRps + RATE_METRIC_TOLERANCE) ||
     (value.etaSeconds !== undefined &&
       value.etaSeconds !== null &&
@@ -1721,56 +1954,57 @@ function parseJobProgressLine(
       : cooldownSeconds > 0
         ? new Date(Date.now() + cooldownSeconds * 1_000).toISOString()
         : null;
+  const parsed = value as unknown as LocalJobProgress;
   return Object.freeze({
     requested: expectedRequested,
-    processed: value.processed,
-    complete: value.complete,
-    absent: value.absent,
-    failed: value.failed,
-    reused: value.reused,
-    reusedAbsent: value.reusedAbsent,
-    downloadedBytes: value.downloadedBytes,
-    percent: value.percent,
-    status: value.status,
-    ...(value.requestAttempts !== undefined
-      ? { requestAttempts: value.requestAttempts }
+    processed: parsed.processed,
+    complete: parsed.complete,
+    absent: parsed.absent,
+    failed: parsed.failed,
+    reused: parsed.reused,
+    reusedAbsent: parsed.reusedAbsent,
+    downloadedBytes: parsed.downloadedBytes,
+    percent: parsed.percent,
+    status: parsed.status,
+    ...(parsed.requestAttempts !== undefined
+      ? { requestAttempts: parsed.requestAttempts }
       : {}),
-    ...(value.elapsedSeconds !== undefined
-      ? { elapsedSeconds: value.elapsedSeconds }
+    ...(parsed.elapsedSeconds !== undefined
+      ? { elapsedSeconds: parsed.elapsedSeconds }
       : {}),
-    ...(value.tilesPerSecond !== undefined
-      ? { tilesPerSecond: value.tilesPerSecond }
+    ...(parsed.tilesPerSecond !== undefined
+      ? { tilesPerSecond: parsed.tilesPerSecond }
       : {}),
-    ...(value.bytesPerSecond !== undefined
-      ? { bytesPerSecond: value.bytesPerSecond }
+    ...(parsed.bytesPerSecond !== undefined
+      ? { bytesPerSecond: parsed.bytesPerSecond }
       : {}),
-    ...(value.etaSeconds !== undefined
-      ? { etaSeconds: value.etaSeconds }
+    ...(parsed.etaSeconds !== undefined
+      ? { etaSeconds: parsed.etaSeconds }
       : {}),
-    ...(value.effectiveRps !== undefined
-      ? { effectiveRps: value.effectiveRps }
+    ...(parsed.effectiveRps !== undefined
+      ? { effectiveRps: parsed.effectiveRps }
       : {}),
-    ...(value.targetRps !== undefined
-      ? { targetRps: value.targetRps }
+    ...(parsed.targetRps !== undefined
+      ? { targetRps: parsed.targetRps }
       : {}),
-    ...(value.cooldownSeconds !== undefined
-      ? { cooldownSeconds: value.cooldownSeconds }
+    ...(parsed.cooldownSeconds !== undefined
+      ? { cooldownSeconds: parsed.cooldownSeconds }
       : {}),
     ...(cooldownUntil !== undefined ? { cooldownUntil } : {}),
-    ...(value.networkRequested !== undefined
-      ? { networkRequested: value.networkRequested }
+    ...(parsed.networkRequested !== undefined
+      ? { networkRequested: parsed.networkRequested }
       : {}),
-    ...(value.networkProcessed !== undefined
-      ? { networkProcessed: value.networkProcessed }
+    ...(parsed.networkProcessed !== undefined
+      ? { networkProcessed: parsed.networkProcessed }
       : {}),
-    ...(value.resolvedPerSecond !== undefined
-      ? { resolvedPerSecond: value.resolvedPerSecond }
+    ...(parsed.resolvedPerSecond !== undefined
+      ? { resolvedPerSecond: parsed.resolvedPerSecond }
       : {}),
-    ...(value.networkTilesPerSecond !== undefined
-      ? { networkTilesPerSecond: value.networkTilesPerSecond }
+    ...(parsed.networkTilesPerSecond !== undefined
+      ? { networkTilesPerSecond: parsed.networkTilesPerSecond }
       : {}),
-    ...(value.achievedRps !== undefined
-      ? { achievedRps: value.achievedRps }
+    ...(parsed.achievedRps !== undefined
+      ? { achievedRps: parsed.achievedRps }
       : {}),
   });
 }
@@ -2078,6 +2312,9 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   const backingRoot = options.backingRoot?.trim()
     ? resolve(options.backingRoot)
     : undefined;
+  const minecraftRoot = options.minecraftRoot?.trim()
+    ? resolve(options.minecraftRoot)
+    : undefined;
   const requirementOverrideBytes =
     options.overworldRequirementBytes &&
     Number.isSafeInteger(options.overworldRequirementBytes) &&
@@ -2094,6 +2331,14 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   const workspaceStore = backingRoot
     ? new LocalAtlasWorkspaceStore(backingRoot)
     : null;
+  const xaeroExporter =
+    backingRoot && minecraftRoot
+      ? new LocalAtlasXaeroExporter({
+          backingRoot,
+          minecraftRoot,
+          minecraftOpenProbe: options.minecraftOpenProbe,
+        })
+      : null;
   const coverageCache = new Map<
     number,
     { readonly fingerprint: string; readonly result: LocalCoverageResult }
@@ -2110,6 +2355,51 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     string,
     Promise<LocalRegionStatusInventory>
   >();
+  const archiveBytesCache = new Map<
+    string,
+    { readonly fingerprint: string; readonly bytes: number }
+  >();
+  const archiveBytesQueries = new Map<string, Promise<number>>();
+
+  const readCachedArchiveBytes = async (
+    catalogRoot: string,
+  ): Promise<number> => {
+    let snapshot: Awaited<ReturnType<typeof readLocalCatalogSnapshot>>;
+    try {
+      snapshot = await readLocalCatalogSnapshot(catalogRoot);
+    } catch {
+      snapshot = null;
+    }
+    if (snapshot) {
+      const cached = archiveBytesCache.get(catalogRoot);
+      if (cached?.fingerprint === snapshot.fingerprint) {
+        return cached.bytes;
+      }
+      const queryKey = `${catalogRoot}:${snapshot.fingerprint}`;
+      let query = archiveBytesQueries.get(queryKey);
+      if (!query) {
+        query = queryLocalArchiveBytes(catalogRoot, pythonBin)
+          .then((bytes) => {
+            archiveBytesCache.set(catalogRoot, {
+              fingerprint: snapshot.fingerprint,
+              bytes,
+            });
+            return bytes;
+          })
+          .finally(() => {
+            archiveBytesQueries.delete(queryKey);
+          });
+        archiveBytesQueries.set(queryKey, query);
+      }
+      try {
+        return await query;
+      } catch {
+        // An absent, incompatible, or transiently locked catalog can still
+        // expose the last trustworthy legacy progress metric.
+      }
+    }
+    return await readLegacyArchiveBytes(catalogRoot);
+  };
 
   const readCachedLocalCoverage = async (
     lod: number,
@@ -2256,6 +2546,8 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
       path !== DOWNLOAD_ENDPOINT &&
       path !== STOP_ENDPOINT &&
       path !== WORKSPACE_ENDPOINT &&
+      path !== XAERO_PREVIEW_ENDPOINT &&
+      path !== XAERO_EXPORT_ENDPOINT &&
       path !== TILE_ENDPOINT
     ) {
       next();
@@ -2263,6 +2555,135 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
     }
 
     if (!requireLocalRequest(request, response)) return;
+
+    if (path === XAERO_PREVIEW_ENDPOINT && request.method === "GET") {
+      if (!workspaceStore || !xaeroExporter) {
+        writeJson(response, 503, {
+          error: "La exportación local a Xaero no está configurada",
+        });
+        return;
+      }
+      try {
+        const { workspace } = await workspaceStore.read();
+        const selection = parseXaeroPreviewSelection(request.url);
+        writeJson(
+          response,
+          200,
+          await xaeroExporter.preview(workspace, selection),
+          {
+            ETag: atlasWorkspaceEtag(
+              workspace.workspaceId,
+              workspace.revision,
+            ),
+          },
+        );
+      } catch (error) {
+        writeXaeroError(response, error);
+      }
+      return;
+    }
+
+    if (path === XAERO_EXPORT_ENDPOINT && request.method === "POST") {
+      if (request.headers["x-atlas-token"] !== mutationToken) {
+        writeJson(response, 403, {
+          error: "Token local inválido; recarga el visor",
+        });
+        return;
+      }
+      if (!workspaceStore || !xaeroExporter) {
+        writeJson(response, 503, {
+          error: "La exportación local a Xaero no está configurada",
+        });
+        return;
+      }
+      const expected = parseAtlasWorkspaceEtag(
+        request.headers["if-match"],
+      );
+      if (!expected) {
+        writeJson(response, 428, {
+          error: "If-Match es obligatorio para exportar a Xaero",
+        });
+        return;
+      }
+      const writeId = request.headers["x-atlas-write-id"];
+      if (
+        typeof writeId !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          writeId,
+        )
+      ) {
+        writeJson(response, 400, {
+          error: "X-Atlas-Write-Id es obligatorio para exportar a Xaero",
+        });
+        return;
+      }
+      try {
+        const body = await readRequestBody(request);
+        const allowedBodyKeys = new Set([
+          "previewId",
+          "operation",
+          "scope",
+          "explorationId",
+        ]);
+        if (
+          !isRecord(body) ||
+          Object.keys(body).some((key) => !allowedBodyKeys.has(key)) ||
+          typeof body.previewId !== "string" ||
+          !/^[0-9a-f]{64}$/.test(body.previewId)
+        ) {
+          throw new TypeError(
+            "La exportación necesita una previsualización válida",
+          );
+        }
+        const selection = parseXaeroSelection(
+          body.operation,
+          body.scope,
+          body.explorationId,
+        );
+        const { workspace } = await workspaceStore.read();
+        if (
+          workspace.workspaceId !== expected.workspaceId ||
+          workspace.revision !== expected.revision
+        ) {
+          writeJson(
+            response,
+            412,
+            {
+              error:
+                "El workspace cambió; vuelve a previsualizar la exportación",
+              code: "WORKSPACE_CONFLICT",
+              currentRevision: workspace.revision,
+            },
+            {
+              ETag: atlasWorkspaceEtag(
+                workspace.workspaceId,
+                workspace.revision,
+              ),
+            },
+          );
+          return;
+        }
+        writeJson(
+          response,
+          200,
+          await xaeroExporter.commit(
+            workspace,
+            body.previewId,
+            writeId,
+            selection,
+          ),
+          {
+            ETag: atlasWorkspaceEtag(
+              workspace.workspaceId,
+              workspace.revision,
+            ),
+          },
+        );
+      } catch (error) {
+        writeXaeroError(response, error);
+      }
+      return;
+    }
 
     if (path === REGION_STATUS_ENDPOINT && request.method === "GET") {
       const regionRequest = parseLocalRegionStatusRequest(request.url);
@@ -2350,6 +2771,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
           regionalTileRoot,
           backingRoot,
           requirementOverrideBytes,
+          readCachedArchiveBytes,
         ),
         workspaceStore
           ? workspaceStore.availability()
@@ -2482,6 +2904,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
           regionalTileRoot,
           backingRoot,
           requirementOverrideBytes,
+          readCachedArchiveBytes,
         );
         let inventory: LocalRegionStatusInventory;
         try {
@@ -2589,6 +3012,8 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
       coverageQueries.clear();
       regionStatusCache.clear();
       regionStatusQueries.clear();
+      archiveBytesCache.clear();
+      archiveBytesQueries.clear();
       if (state.stopTimer) clearTimeout(state.stopTimer);
       if (state.child) state.child.kill("SIGINT");
     },

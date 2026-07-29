@@ -1,4 +1,6 @@
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import vinext from "vinext";
 import { defineConfig, loadEnv } from "vite";
 import {
@@ -49,6 +51,18 @@ export default defineConfig(async ({ command, mode }) => {
       repositoryRegionalTileRoot: REPOSITORY_REGIONAL_TILE_ROOT,
     });
   const pythonBin = atlasEnvironment.OBSIDIAN_ATLAS_PYTHON;
+  const minecraftRoot =
+    command === "serve"
+      ? resolve(
+          atlasEnvironment.OBSIDIAN_ATLAS_MINECRAFT_ROOT ||
+            resolve(
+              homedir(),
+              "Library",
+              "Application Support",
+              "minecraft",
+            ),
+        )
+      : undefined;
   const requirementText =
     atlasEnvironment.OBSIDIAN_ATLAS_OVERWORLD_REQUIREMENT_BYTES;
   const requirementBytes = requirementText
@@ -71,6 +85,7 @@ export default defineConfig(async ({ command, mode }) => {
         tileRoot,
         regionalTileRoot,
         backingRoot,
+        minecraftRoot,
         pythonBin,
         projectRoot: fileURLToPath(new URL("..", import.meta.url)),
         overworldRequirementBytes: requirementBytes,

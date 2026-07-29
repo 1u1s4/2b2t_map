@@ -342,6 +342,24 @@ export function createCoverageSelection(
   });
 }
 
+/**
+ * Converts the Atlas cell in focus into the single-sector selection used by
+ * downloads and exploration. Empty overview cells deliberately clear the
+ * operational selection instead of leaving an older region active.
+ */
+export function coverageSelectionForOverviewCellIndex(
+  index: number,
+): OverworldCoverageSelection | null {
+  const cell = overviewCellForIndex(index);
+  if (cell.coverageStatus === "empty") return null;
+  return createCoverageSelection(
+    cell.row,
+    cell.column,
+    cell.row + 1,
+    cell.column + 1,
+  );
+}
+
 export function coverageSelectionBetweenCells(
   first: Pick<OverworldOverviewCell, "row" | "column">,
   second: Pick<OverworldOverviewCell, "row" | "column">,

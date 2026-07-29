@@ -161,6 +161,53 @@ export function consolidateSingleWorkspaceContent<
   };
 }
 
+/**
+ * Recover human review progress from a journal that belongs to the exact
+ * same spatial session while keeping the current workspace metadata. This is
+ * safe when the journal's CAS base is older than disk: highlights, coverage,
+ * and other independently editable fields continue to come from disk.
+ */
+export function mergeMatchingWorkspaceProgress<
+  Exploration extends WorkspaceExplorationRecord,
+  Highlight,
+  CoverageSelection,
+>(
+  current: WorkspaceContentRecord<
+    Exploration,
+    Highlight,
+    CoverageSelection
+  >,
+  recovery: WorkspaceContentRecord<
+    Exploration,
+    Highlight,
+    CoverageSelection
+  >,
+): WorkspaceContentRecord<Exploration, Highlight, CoverageSelection> | null {
+  const currentExploration = current.explorations[0];
+  const recoveryExploration = recovery.explorations[0];
+  if (!currentExploration || !recoveryExploration) return null;
+  const currentState = stateFor(currentExploration);
+  const recoveryState = stateFor(recoveryExploration);
+  const currentBounds = currentState.region.bounds;
+  const recoveryBounds = recoveryState.region.bounds;
+  if (
+    currentState.region.dimension !== recoveryState.region.dimension ||
+    currentState.region.lod !== recoveryState.region.lod ||
+    currentBounds.minX !== recoveryBounds.minX ||
+    currentBounds.minZ !== recoveryBounds.minZ ||
+    currentBounds.maxXExclusive !== recoveryBounds.maxXExclusive ||
+    currentBounds.maxZExclusive !== recoveryBounds.maxZExclusive
+  ) {
+    return null;
+  }
+  return consolidateSingleWorkspaceContent({
+    ...current,
+    activeExplorationId:
+      current.activeExplorationId ?? recovery.activeExplorationId,
+    explorations: [currentExploration, recoveryExploration],
+  });
+}
+
 function richerDuplicate<
   Exploration extends WorkspaceExplorationRecord,
 >(

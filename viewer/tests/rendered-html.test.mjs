@@ -50,6 +50,8 @@ test("server-renders the Obsidian Atlas product shell and metadata", async () =>
   );
   assert.match(html, /OBSIDIAN ATLAS/);
   assert.match(html, /2b2t · exploración local/);
+  assert.match(html, /Atlas requiere una ventana de escritorio/);
+  assert.match(html, /La interfaz móvil está deshabilitada/);
   assert.match(
     html,
     /<canvas[^>]+aria-label="Mapa interactivo del Overworld de 2b2t"/i,
@@ -58,6 +60,7 @@ test("server-renders the Obsidian Atlas product shell and metadata", async () =>
   assert.match(html, /Solo local/);
   assert.match(html, /Explorar/);
   assert.match(html, /class="atlas-shell[^"]*is-atlas-mode/i);
+  assert.doesNotMatch(html, /class="atlas-shell[^"]*is-exploring/i);
   assert.match(html, /Mapa general/);
   assert.match(html, /Vista completa · Overworld/i);
   assert.match(html, /1,089 sectores en una sola vista/i);

@@ -57,6 +57,17 @@ import {
   resolveExplorationFocusView,
   type ExplorationFocusRequest,
 } from "./lib/exploration-camera";
+import { resolveExplorationSelection } from "./lib/exploration-session-selection";
+import {
+  HIGHLIGHT_NAME_PRESETS,
+  highlightRegionKey,
+  highlightsForRegion,
+  inferLegacyHighlightRegionKey,
+  isHighlightRegionKey,
+  nextHighlightPresetName,
+  normalizeHighlightName,
+  pointIsInsideBounds,
+} from "./lib/highlights";
 import {
   cardinalNeighbor,
   clampCameraToExploration,
@@ -77,6 +88,7 @@ import {
   withCurrentCellVisited,
   withVisitedIndex,
   type CardinalDirection,
+  type ExplorationCellAppearance,
   type ExplorationState,
   type WorldBounds,
 } from "./lib/exploration-grid";
@@ -87,8 +99,8 @@ import {
   OVERWORLD_OVERVIEW_COLUMNS,
   OVERWORLD_OVERVIEW_GRID_BOUNDS,
   OVERWORLD_OVERVIEW_ROWS,
-  createCoverageSelection,
   coverageSelectionBetweenCells,
+  coverageSelectionForOverviewCellIndex,
   overviewCellAtWorld,
   overviewCellForIndex,
   type OverworldCoverageSelection,
@@ -99,6 +111,7 @@ import {
   type OverworldProgressStatus,
 } from "./lib/overworld-progress";
 import {
+  applyLocalAtlasXaeroPreview,
   downloadExplorationRegion,
   LocalAtlasWorkspaceConflictError,
   localAtlasWorkspaceContent,
@@ -107,6 +120,7 @@ import {
   readLocalAtlasRegionStatus,
   readLocalAtlasRuntime,
   readLocalAtlasWorkspace,
+  readLocalAtlasXaeroPreview,
   regionJobMatchesBounds,
   stopLocalRegionJob,
   writeLocalAtlasWorkspace,
@@ -117,18 +131,30 @@ import {
   type LocalAtlasWorkspaceContent,
   type LocalAtlasWorkspaceExploration,
   type LocalAtlasWorkspacePrecondition,
+  type LocalAtlasXaeroOperation,
+  type LocalAtlasXaeroPreview,
+  type LocalAtlasXaeroRequest,
+  type LocalAtlasXaeroResult,
+  type LocalAtlasXaeroScope,
 } from "./lib/local-atlas-runtime";
 import {
   consolidateSingleWorkspaceContent,
+  mergeMatchingWorkspaceProgress,
   mergeWorkspaceContentCandidates,
 } from "./lib/single-workspace-session";
 import {
+  cancelWorkspaceAutosave,
+  scheduleWorkspaceAutosave,
+} from "./lib/workspace-autosave";
+import {
   type ChangeEvent,
   type FormEvent,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -140,8 +166,39 @@ const INITIAL_VIEW_SIZE = { width: 1280, height: 760 };
 const MIN_SCALE = 1 / 1_500;
 const ATLAS_MIN_SCALE = 1 / 10_000;
 const MAX_SCALE = 8;
+const HIGHLIGHT_COMPACT_SCALE = 1 / 32;
+const REGIONAL_REQUESTS_PER_SECOND = 16;
 const MAX_WORKSPACE_EXPLORATIONS = 1;
 const MAX_WORKSPACE_HIGHLIGHTS = 10_000;
+const EXPLORATION_CELL_VISUALS = {
+  "current-new": {
+    fill: "rgba(0, 0, 0, 0)",
+    stroke: "rgba(133, 196, 255, 0.95)",
+    label: "rgba(224, 242, 255, 0.98)",
+    glow: null,
+  },
+  "current-reviewed": {
+    fill: "rgba(0, 0, 0, 0)",
+    stroke: "rgba(74, 222, 128, 0.98)",
+    label: "rgba(209, 250, 229, 0.98)",
+    glow: "rgba(74, 222, 128, 0.92)",
+  },
+  reviewed: {
+    fill: "rgba(34, 197, 94, 0.18)",
+    stroke: "rgba(74, 222, 128, 0.84)",
+    label: "rgba(209, 250, 229, 0.92)",
+    glow: null,
+  },
+  pending: {
+    fill: "rgba(4, 11, 20, 0.05)",
+    stroke: "rgba(255, 255, 255, 0.24)",
+    label: "rgba(232, 240, 248, 0.72)",
+    glow: null,
+  },
+} satisfies Record<
+  ExplorationCellAppearance,
+  { fill: string; stroke: string; label: string; glow: string | null }
+>;
 const LEGACY_HIGHLIGHT_STORAGE_KEY = "obsidian-atlas-highlights-v1";
 const LEGACY_EXPLORATION_STORAGE_KEY = "obsidian-atlas-exploration-v1";
 const LEGACY_SAVED_EXPLORATIONS_STORAGE_KEY =
@@ -189,6 +246,7 @@ type Highlight = {
   title: string;
   note: string;
   color: string;
+  regionKey?: string | null;
   x: number;
   z: number;
   bounds?: {
@@ -241,6 +299,14 @@ type ActivePointer = {
   clientY: number;
   screenX: number;
   screenY: number;
+};
+
+type QuickHighlightMenu = {
+  readonly left: number;
+  readonly top: number;
+  readonly point: Camera;
+  readonly custom: boolean;
+  readonly customName: string;
 };
 
 type BrowserWorkspaceRecovery = {
@@ -456,6 +522,18 @@ function adaptiveGridStep(scale: number) {
   return 2 ** clamp(Math.round(Math.log2(targetBlocks)), 4, 20);
 }
 
+function pinIsInsideExploration(
+  highlight: Highlight,
+  exploration: LocalAtlasWorkspaceExploration,
+) {
+  if (highlight.type !== "pin") return false;
+  const bounds = exploration.state.region.bounds;
+  if (highlight.regionKey !== undefined) {
+    return highlight.regionKey === highlightRegionKey(bounds);
+  }
+  return pointIsInsideBounds(highlight, bounds);
+}
+
 function parseLocation(
   value: string,
   highlights: Highlight[],
@@ -539,6 +617,9 @@ function isValidHighlight(value: unknown): value is Highlight {
     item.note.length <= 20_000 &&
     typeof item.color === "string" &&
     /^#[0-9a-f]{6}$/i.test(item.color) &&
+    (item.regionKey === undefined ||
+      item.regionKey === null ||
+      isHighlightRegionKey(item.regionKey)) &&
     isSafeMapCoordinate(item.x) &&
     isSafeMapCoordinate(item.z) &&
     typeof item.visible === "boolean" &&
@@ -572,6 +653,42 @@ function readHighlightList(
     result.push(item);
   }
   return result;
+}
+
+function migrateLegacyHighlightScopes(
+  highlights: readonly Highlight[],
+  explorations: readonly LocalAtlasWorkspaceExploration[],
+): Highlight[] {
+  const regionBounds = explorations.map(
+    (exploration) => exploration.state.region.bounds,
+  );
+  return highlights.map((highlight) =>
+    highlight.regionKey === undefined
+      ? highlightWithRegionKey(
+          highlight,
+          inferLegacyHighlightRegionKey(highlight, regionBounds),
+        )
+      : highlight,
+  );
+}
+
+function highlightWithRegionKey(
+  highlight: Highlight,
+  regionKey: string | null,
+): Highlight {
+  return {
+    id: highlight.id,
+    type: highlight.type,
+    title: highlight.title,
+    note: highlight.note,
+    color: highlight.color,
+    regionKey,
+    x: highlight.x,
+    z: highlight.z,
+    ...(highlight.bounds ? { bounds: highlight.bounds } : {}),
+    visible: highlight.visible,
+    createdAt: highlight.createdAt,
+  };
 }
 
 function locationHash(camera: Camera, scale: number) {
@@ -689,6 +806,8 @@ export function MapViewer() {
   const workspaceSavePromiseRef = useRef<Promise<boolean> | null>(null);
   const workspaceSaveTimerRef = useRef<number | null>(null);
   const lastSavedWorkspaceRef = useRef<string | null>(null);
+  const xaeroDefaultScopeAppliedRef = useRef(false);
+  const xaeroScopeRef = useRef<LocalAtlasXaeroScope>({ kind: "all" });
   const pendingWorkspaceWriteRef = useRef<{
     readonly content: LocalAtlasWorkspaceContent;
     readonly expected: LocalAtlasWorkspacePrecondition;
@@ -761,6 +880,23 @@ export function MapViewer() {
   const [selectedHighlightId, setSelectedHighlightId] = useState<string | null>(
     null,
   );
+  const [quickHighlightMenu, setQuickHighlightMenu] =
+    useState<QuickHighlightMenu | null>(null);
+  const [xaeroPreview, setXaeroPreview] =
+    useState<LocalAtlasXaeroPreview | null>(null);
+  const [xaeroResult, setXaeroResult] =
+    useState<LocalAtlasXaeroResult | null>(null);
+  const [xaeroBusy, setXaeroBusy] = useState<
+    "preview" | LocalAtlasXaeroOperation | null
+  >(null);
+  const [xaeroError, setXaeroError] = useState<string | null>(null);
+  const [xaeroExpanded, setXaeroExpanded] = useState(false);
+  const [xaeroOperation, setXaeroOperation] =
+    useState<LocalAtlasXaeroOperation>("export");
+  const [xaeroScope, setXaeroScope] = useState<LocalAtlasXaeroScope>({
+    kind: "all",
+  });
+  const [xaeroRemoveConfirmed, setXaeroRemoveConfirmed] = useState(false);
   const [highlightsReady, setHighlightsReady] = useState(false);
   const [explorationState, setExplorationState] =
     useState<ExplorationState | null>(null);
@@ -786,7 +922,6 @@ export function MapViewer() {
     maxXExclusive: "-84000",
     maxZExclusive: "169000",
   });
-  const [requestsPerSecond, setRequestsPerSecond] = useState(16);
   const [localRuntime, setLocalRuntime] =
     useState<LocalAtlasRuntime | null>(null);
   const [runtimeChecked, setRuntimeChecked] = useState(false);
@@ -799,8 +934,10 @@ export function MapViewer() {
     "Comprobando LuisA…",
   );
   const [toast, setToast] = useState<string | null>(null);
+  const [topbarRevealed, setTopbarRevealed] = useState(false);
 
   const atlasMode = drawer === "atlas";
+  const isExploring = explorationState !== null && !atlasMode;
   const localCoverageState: "loading" | "ready" | "stale" | "error" =
     localCoverageError
       ? localCoverage !== null
@@ -815,9 +952,51 @@ export function MapViewer() {
       : lodForScale(scale);
   const blocksPerPixel = blocksPerPixelAtLod(lod);
   const gridStep = adaptiveGridStep(scale);
-  const selectedHighlight = highlights.find(
+  const compactHighlights = scale <= HIGHLIGHT_COMPACT_SCALE;
+  const activeExplorationRegion = explorationState?.region ?? null;
+  const activeHighlightRegionKey = activeExplorationRegion
+    ? highlightRegionKey(activeExplorationRegion.bounds)
+    : null;
+  const scopedHighlights = useMemo(
+    () =>
+      atlasMode
+        ? []
+        : highlightsForRegion(
+            highlights,
+            activeExplorationRegion?.bounds ?? null,
+          ),
+    [activeExplorationRegion, atlasMode, highlights],
+  );
+  const renderedHighlights = atlasMode ? highlights : scopedHighlights;
+  const selectedHighlight = scopedHighlights.find(
     (highlight) => highlight.id === selectedHighlightId,
   );
+  const quickHighlightPresetNames = useMemo(
+    () =>
+      HIGHLIGHT_NAME_PRESETS.map((preset) => ({
+        preset,
+        title: nextHighlightPresetName(
+          preset,
+          highlights,
+          activeHighlightRegionKey,
+        ),
+      })),
+    [activeHighlightRegionKey, highlights],
+  );
+  const selectedHighlightPresetNames = useMemo(() => {
+    if (!selectedHighlight) return [];
+    const otherHighlights = highlights.filter(
+      (highlight) => highlight.id !== selectedHighlight.id,
+    );
+    return HIGHLIGHT_NAME_PRESETS.map((preset) => ({
+      preset,
+      title: nextHighlightPresetName(
+        preset,
+        otherHighlights,
+        selectedHighlight.regionKey,
+      ),
+    }));
+  }, [highlights, selectedHighlight]);
   const currentExplorationCell = explorationState
     ? cellForIndex(
         explorationState.region,
@@ -897,8 +1076,6 @@ export function MapViewer() {
     matchingRegionDownloadJob && localRuntime?.job?.status === "error"
       ? localRuntime.job.message
       : null;
-  const regionalRateLimit = 16;
-  const effectiveRegionalRequestRate = requestsPerSecond;
   const downloadCooldownUntilMs = activeDownloadProgress?.cooldownUntil
     ? Date.parse(activeDownloadProgress.cooldownUntil)
     : null;
@@ -1013,6 +1190,29 @@ export function MapViewer() {
       ),
     [savedExplorations],
   );
+  const xaeroRegionOptions = useMemo(
+    () =>
+      orderedSavedExplorations.map((exploration) => ({
+        id: exploration.id,
+        name: exploration.state.region.name,
+        pinCount: highlights.filter((highlight) =>
+          pinIsInsideExploration(highlight, exploration),
+        ).length,
+      })),
+    [highlights, orderedSavedExplorations],
+  );
+  const selectedXaeroRegion =
+    xaeroScope.kind === "exploration"
+      ? xaeroRegionOptions.find(
+          (region) => region.id === xaeroScope.explorationId,
+        ) ?? null
+      : null;
+  const xaeroSelectionLabel =
+    xaeroScope.kind === "all"
+      ? `Todo el Atlas · ${highlights.filter((highlight) => highlight.type === "pin").length.toLocaleString("es-GT")} puntos actuales`
+      : selectedXaeroRegion
+        ? `${selectedXaeroRegion.name} · ${selectedXaeroRegion.pinCount.toLocaleString("es-GT")} puntos actuales`
+        : "Región no disponible";
   const atlasProgress = useMemo(
     () => summarizeLocalCoverage(localCoverage, MAX_DETAIL_EXPLORATION_LOD),
     [localCoverage],
@@ -1069,12 +1269,130 @@ export function MapViewer() {
           : persistenceState === "readonly"
             ? "Solo lectura"
             : persistenceState === "offline"
-              ? "Sin disco"
+            ? "Sin disco"
               : "Atención";
+  const workspaceShieldNeedsAction =
+    runtimeChecked &&
+    !pauseBusy &&
+    (persistenceState === "offline" ||
+      persistenceState === "readonly" ||
+      persistenceState === "error" ||
+      !runtimePersistenceConfigured ||
+      !runtimePersistenceWritable);
+  const workspaceShieldTitle = pauseBusy
+    ? "Guardando sesión"
+    : !runtimeChecked || persistenceState === "checking"
+      ? "Comprobando LuisA"
+      : !runtimePersistenceConfigured || persistenceState === "offline"
+        ? "LuisA no está disponible"
+        : !runtimePersistenceWritable || persistenceState === "readonly"
+          ? "LuisA está en solo lectura"
+          : persistenceState === "error"
+            ? "No se pudo abrir el workspace"
+            : "Sincronizando workspace";
+  const workspaceShieldMessage = pauseBusy
+    ? "Asegurando una copia antes de pausar…"
+    : !runtimeChecked || persistenceState === "checking"
+      ? persistenceMessage
+      : !runtimePersistenceConfigured || persistenceState === "offline"
+        ? "Monta LuisA; Atlas detectará la unidad y recuperará tu sesión automáticamente."
+        : !runtimePersistenceWritable || persistenceState === "readonly"
+          ? "Habilita escritura en LuisA y vuelve a abrir Atlas para editar con seguridad."
+          : persistenceState === "error"
+            ? `${persistenceMessage}. Comprueba LuisA y vuelve a abrir Atlas.`
+            : persistenceMessage;
   const notify = useCallback((message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(null), 1_700);
   }, []);
+
+  const journalWorkspace = useCallback(
+    (content: LocalAtlasWorkspaceContent | null): boolean => {
+      if (!content) return true;
+      const existingRecovery = readBrowserWorkspaceRecovery();
+      const base =
+        workspacePreconditionRef.current ?? existingRecovery?.base ?? null;
+      if (!base) return false;
+      return writeBrowserWorkspaceRecovery(content, base);
+    },
+    [],
+  );
+
+  const commitExplorationProgress = useCallback(
+    (next: ExplorationState) => {
+      explorationStateRef.current = next;
+      const baseContent = workspaceContentRef.current ?? workspaceContent;
+      const nextExplorations = upsertWorkspaceExploration(
+        [...baseContent.explorations],
+        next,
+      );
+      const nextContent: LocalAtlasWorkspaceContent = {
+        ...baseContent,
+        activeExplorationId: next.region.id,
+        explorations: nextExplorations,
+      };
+      workspaceContentRef.current = nextContent;
+      const journaled = !workspaceReady || journalWorkspace(nextContent);
+      setSavedExplorations(nextExplorations);
+      setExplorationState(next);
+      if (!journaled) {
+        notify("No se pudo actualizar la copia inmediata de recuperación");
+      }
+    },
+    [journalWorkspace, notify, workspaceContent, workspaceReady],
+  );
+
+  useEffect(() => {
+    if (
+      !quickHighlightMenu ||
+      !isExploring ||
+      workspaceMutationsBlocked
+    ) return;
+    const closeOutside = (event: globalThis.PointerEvent) => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest(".highlight-quick-menu")
+      ) {
+        return;
+      }
+      setQuickHighlightMenu(null);
+    };
+    window.addEventListener("pointerdown", closeOutside);
+    return () => window.removeEventListener("pointerdown", closeOutside);
+  }, [isExploring, quickHighlightMenu, workspaceMutationsBlocked]);
+
+  const invalidateXaeroPreview = useCallback(() => {
+    setXaeroPreview(null);
+    setXaeroResult(null);
+    setXaeroError(null);
+    setXaeroRemoveConfirmed(false);
+  }, []);
+  const chooseXaeroScope = useCallback((scope: LocalAtlasXaeroScope) => {
+    xaeroScopeRef.current = scope;
+    setXaeroScope(scope);
+  }, []);
+  const reconcileXaeroScope = useCallback(
+    (explorations: readonly Pick<LocalAtlasWorkspaceExploration, "id">[]) => {
+      const current = xaeroScopeRef.current;
+      if (
+        current.kind === "all" ||
+        explorations.some(
+          (exploration) => exploration.id === current.explorationId,
+        )
+      ) {
+        return;
+      }
+      const replacement = explorations[0];
+      chooseXaeroScope(
+        replacement
+          ? { kind: "exploration", explorationId: replacement.id }
+          : { kind: "all" },
+      );
+      invalidateXaeroPreview();
+    },
+    [chooseXaeroScope, invalidateXaeroPreview],
+  );
 
   const clearTileCache = useCallback(() => {
     tileGenerationRef.current += 1;
@@ -1129,11 +1447,17 @@ export function MapViewer() {
         return false;
       }
       const next = withVisitedIndex(explorationState, index);
-      setExplorationState(next);
+      commitExplorationProgress(next);
       focusExploration(next, { mode: "preserve", scale });
       return true;
     },
-    [explorationState, focusExploration, notify, scale],
+    [
+      commitExplorationProgress,
+      explorationState,
+      focusExploration,
+      notify,
+      scale,
+    ],
   );
 
   const archiveExploration = useCallback((state: ExplorationState) => {
@@ -1155,6 +1479,7 @@ export function MapViewer() {
               name: `${requestedState.region.name} · LOD 0`,
               bounds: requestedState.region.bounds,
             });
+      reconcileXaeroScope([{ id: state.region.id }]);
       explorationStateRef.current = null;
       setExplorationState(null);
       setExplorationPlan({
@@ -1172,7 +1497,7 @@ export function MapViewer() {
       clearTileCache();
       setDrawer(source === "hydrated" ? "atlas" : "exploration");
     },
-    [clearTileCache],
+    [clearTileCache, reconcileXaeroScope],
   );
 
   const activateDownloadedExploration = useCallback(
@@ -1189,8 +1514,7 @@ export function MapViewer() {
       }
       let next = withCellsSkipped(plan.state, absentIndexes);
       next = withCurrentCellVisited(next);
-      explorationStateRef.current = next;
-      setExplorationState(next);
+      commitExplorationProgress(next);
       setExplorationPlan(null);
       setRegionStatusSnapshot(null);
       setRegionStatusError(null);
@@ -1203,7 +1527,7 @@ export function MapViewer() {
         `${next.region.name} lista · la primera celda quedó explorada`,
       );
     },
-    [clearTileCache, focusExploration, notify],
+    [clearTileCache, commitExplorationProgress, focusExploration, notify],
   );
 
   const startRegionDownload = useCallback(
@@ -1233,7 +1557,7 @@ export function MapViewer() {
           localRuntime,
           plan.state.region.bounds,
           REGIONAL_DOWNLOAD_LAYERS,
-          effectiveRegionalRequestRate,
+          REGIONAL_REQUESTS_PER_SECOND,
         );
         setLocalRuntime(await readLocalAtlasRuntime());
         notify("Guardado regional iniciado a máxima velocidad");
@@ -1247,10 +1571,10 @@ export function MapViewer() {
         setRuntimeBusy(false);
       }
     },
-    [effectiveRegionalRequestRate, localRuntime, notify],
+    [localRuntime, notify],
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     workspaceContentRef.current = workspaceContent;
   }, [workspaceContent]);
 
@@ -1258,7 +1582,7 @@ export function MapViewer() {
     workspaceRuntimeRef.current = localRuntime;
   }, [localRuntime]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     explorationStateRef.current = explorationState;
   }, [explorationState]);
 
@@ -1280,16 +1604,6 @@ export function MapViewer() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, []);
-
-  useEffect(() => {
-    if (!explorationReady || !explorationState) return;
-    const frame = window.requestAnimationFrame(() => {
-      setSavedExplorations((items) =>
-        upsertWorkspaceExploration(items, explorationState),
-      );
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [explorationReady, explorationState]);
 
   useEffect(() => {
     if (atlasMode) return;
@@ -1316,7 +1630,7 @@ export function MapViewer() {
         );
         if (index === null) return;
         const next = withVisitedIndex(explorationState, index);
-        setExplorationState(next);
+        commitExplorationProgress(next);
         focusExploration(next, {
           mode: "preserve",
           scale: location.scale ?? scale,
@@ -1328,7 +1642,13 @@ export function MapViewer() {
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, [atlasMode, explorationState, focusExploration, scale]);
+  }, [
+    atlasMode,
+    commitExplorationProgress,
+    explorationState,
+    focusExploration,
+    scale,
+  ]);
 
   useEffect(() => {
     const element = mapRef.current;
@@ -1546,6 +1866,10 @@ export function MapViewer() {
         throw new Error("Los highlights de LuisA no son válidos");
       }
       const singleton = canonical.explorations[0];
+      const scopedHighlights = migrateLegacyHighlightScopes(
+        restoredHighlights,
+        canonical.explorations,
+      );
       const restoredExploration =
         singleton &&
         canonical.activeExplorationId === singleton.id
@@ -1559,9 +1883,26 @@ export function MapViewer() {
       };
       lastSavedWorkspaceRef.current = JSON.stringify(canonical);
       workspaceContentRef.current = canonical;
+      if (!xaeroDefaultScopeAppliedRef.current && singleton) {
+        xaeroDefaultScopeAppliedRef.current = true;
+        chooseXaeroScope({
+          kind: "exploration",
+          explorationId: singleton.id,
+        });
+      } else {
+        reconcileXaeroScope(canonical.explorations);
+      }
       setSavedExplorations([...canonical.explorations]);
-      setHighlights(restoredHighlights);
+      invalidateXaeroPreview();
+      setHighlights(scopedHighlights);
       setCoverageSelection(canonical.coverageSelection);
+      if (canonical.coverageSelection) {
+        setAtlasFocusedCellIndex(
+          canonical.coverageSelection.minRow *
+            OVERWORLD_OVERVIEW_COLUMNS +
+            canonical.coverageSelection.minColumn,
+        );
+      }
       if (restoredExploration) {
         stageExplorationPlan(restoredExploration, "hydrated");
       } else {
@@ -1573,7 +1914,12 @@ export function MapViewer() {
       setPersistenceState(writable ? "saved" : "readonly");
       setPersistenceMessage(message);
     },
-    [stageExplorationPlan],
+    [
+      chooseXaeroScope,
+      invalidateXaeroPreview,
+      reconcileXaeroScope,
+      stageExplorationPlan,
+    ],
   );
 
   const flushWorkspace = useCallback(async (): Promise<boolean> => {
@@ -1685,6 +2031,7 @@ export function MapViewer() {
                 ]),
               ) as LocalAtlasWorkspaceContent;
               workspaceContentRef.current = merged;
+              reconcileXaeroScope(merged.explorations);
               setSavedExplorations([...merged.explorations]);
               pendingWorkspaceWriteRef.current = {
                 content: merged,
@@ -1732,7 +2079,7 @@ export function MapViewer() {
         workspaceSavePromiseRef.current = null;
       }
     }
-  }, [applyWorkspaceSnapshot]);
+  }, [applyWorkspaceSnapshot, reconcileXaeroScope]);
 
   useEffect(() => {
     if (
@@ -1794,8 +2141,9 @@ export function MapViewer() {
           throw new Error("LuisA no devolvió un workspace");
         }
         pendingWorkspaceWriteRef.current = null;
+        const initialDiskWorkspace = diskWorkspace;
         const recoveries = readBrowserWorkspaceRecoveries();
-        const diskContent = localAtlasWorkspaceContent(diskWorkspace);
+        const diskContent = localAtlasWorkspaceContent(initialDiskWorkspace);
         const legacyMigration =
           diskContent.explorations.length > MAX_WORKSPACE_EXPLORATIONS ||
           recoveries.some(
@@ -1803,14 +2151,34 @@ export function MapViewer() {
               recovery.content.explorations.length >
               MAX_WORKSPACE_EXPLORATIONS,
           );
-        const matchingRecovery = recoveries.find(
+        const exactRecovery = recoveries.find(
           (recovery) =>
-            recovery.base?.workspaceId === diskWorkspace.workspaceId &&
-            recovery.base.revision === diskWorkspace.revision,
+            recovery.base?.workspaceId === initialDiskWorkspace.workspaceId &&
+            recovery.base.revision === initialDiskWorkspace.revision,
         );
+        const staleProgressRecovery = exactRecovery
+          ? null
+          : recoveries.find(
+              (recovery) =>
+                recovery.base?.workspaceId ===
+                  initialDiskWorkspace.workspaceId &&
+                recovery.base.revision < initialDiskWorkspace.revision &&
+                mergeMatchingWorkspaceProgress(
+                  diskContent,
+                  recovery.content,
+                ) !== null,
+            ) ?? null;
+        const recoveryCandidate = exactRecovery
+          ? exactRecovery.content
+          : staleProgressRecovery
+            ? mergeMatchingWorkspaceProgress(
+                diskContent,
+                staleProgressRecovery.content,
+              )
+            : null;
         const shouldReplayRecovery =
-          matchingRecovery &&
-          JSON.stringify(matchingRecovery.content) !==
+          recoveryCandidate &&
+          JSON.stringify(recoveryCandidate) !==
             JSON.stringify(diskContent);
 
         if (
@@ -1822,7 +2190,7 @@ export function MapViewer() {
                 ...recoveries.map((recovery) => recovery.content),
                 diskContent,
               ]
-            : [matchingRecovery!.content, diskContent];
+            : [recoveryCandidate!, diskContent];
           const migrationCandidate =
             mergeWorkspaceContentCandidates(candidates);
           try {
@@ -1912,7 +2280,7 @@ export function MapViewer() {
     runtimeChecked,
   ]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (
       !workspaceReady ||
       JSON.stringify(workspaceContent) === lastSavedWorkspaceRef.current
@@ -1942,19 +2310,11 @@ export function MapViewer() {
     ) {
       return;
     }
-    if (workspaceSaveTimerRef.current !== null) {
-      window.clearTimeout(workspaceSaveTimerRef.current);
-    }
-    workspaceSaveTimerRef.current = window.setTimeout(() => {
-      workspaceSaveTimerRef.current = null;
-      void flushWorkspace();
-    }, 300);
-    return () => {
-      if (workspaceSaveTimerRef.current !== null) {
-        window.clearTimeout(workspaceSaveTimerRef.current);
-        workspaceSaveTimerRef.current = null;
-      }
-    };
+    scheduleWorkspaceAutosave(
+      workspaceSaveTimerRef,
+      () => void flushWorkspace(),
+      (callback, delayMs) => window.setTimeout(callback, delayMs),
+    );
   }, [
     flushWorkspace,
     runtimePersistenceConfigured,
@@ -1962,6 +2322,36 @@ export function MapViewer() {
     workspaceContent,
     workspaceReady,
   ]);
+
+  useEffect(() => {
+    const preserveLatestWorkspace = () => {
+      if (!workspacePreconditionRef.current) return;
+      const latest = workspaceContentRef.current;
+      if (
+        latest &&
+        JSON.stringify(latest) !== lastSavedWorkspaceRef.current
+      ) {
+        journalWorkspace(latest);
+        void flushWorkspace();
+      }
+    };
+    const preserveWhenHidden = () => {
+      if (document.visibilityState === "hidden") {
+        preserveLatestWorkspace();
+      }
+    };
+    window.addEventListener("pagehide", preserveLatestWorkspace);
+    document.addEventListener("visibilitychange", preserveWhenHidden);
+    return () => {
+      window.removeEventListener("pagehide", preserveLatestWorkspace);
+      document.removeEventListener("visibilitychange", preserveWhenHidden);
+      preserveLatestWorkspace();
+      cancelWorkspaceAutosave(
+        workspaceSaveTimerRef,
+        (timer) => window.clearTimeout(timer),
+      );
+    };
+  }, [flushWorkspace, journalWorkspace]);
 
   const ensureTile = useCallback(
     (key: TileKey) => {
@@ -2459,37 +2849,28 @@ export function MapViewer() {
             explorationState,
             index,
           );
+          const visual = EXPLORATION_CELL_VISUALS[appearance];
           context.globalAlpha = 1;
-          context.fillStyle =
-            appearance === "current-reviewed"
-              ? "rgba(98, 168, 255, 0.20)"
-              : appearance === "reviewed"
-              ? "rgba(38, 217, 199, 0.12)"
-                : appearance === "current-new"
-                  ? "rgba(0, 0, 0, 0)"
-                  : "rgba(4, 11, 20, 0.05)";
+          context.fillStyle = visual.fill;
           context.fillRect(point.x, point.y, cellSize, cellSize);
+          context.save();
           context.lineWidth = current ? 3 : reviewed ? 1.5 : 1;
-          context.strokeStyle = current
-            ? "rgba(133, 196, 255, 0.95)"
-            : reviewed
-              ? "rgba(38, 217, 199, 0.68)"
-              : "rgba(255, 255, 255, 0.24)";
+          context.strokeStyle = visual.stroke;
           context.setLineDash(current ? [] : reviewed ? [] : [7, 6]);
+          if (visual.glow) {
+            context.shadowColor = visual.glow;
+            context.shadowBlur = 16;
+          }
           context.strokeRect(
             point.x + 0.5,
             point.y + 0.5,
             cellSize - 1,
             cellSize - 1,
           );
-          context.setLineDash([]);
+          context.restore();
           if (cellSize >= 94) {
             const cell = cellForIndex(region, index);
-            context.fillStyle = current
-              ? "rgba(224, 242, 255, 0.98)"
-              : reviewed
-                ? "rgba(180, 255, 245, 0.88)"
-                : "rgba(232, 240, 248, 0.72)";
+            context.fillStyle = visual.label;
             context.fillText(
               `F${cell.row + 1} · C${cell.column + 1}`,
               point.x + 9,
@@ -2501,14 +2882,60 @@ export function MapViewer() {
       context.textBaseline = "alphabetic";
     }
 
-    for (const highlight of highlights) {
+    for (const highlight of renderedHighlights) {
       if (!highlight.visible) continue;
-      const selected = highlight.id === selectedHighlightId;
+      const selected = !atlasMode && highlight.id === selectedHighlightId;
       context.strokeStyle = highlight.color;
       context.fillStyle = highlight.color;
       context.lineWidth = selected ? 3 : 2;
       context.shadowColor = "rgba(0,0,0,.5)";
       context.shadowBlur = 10;
+
+      if (atlasMode) {
+        const point = screenAtWorld(highlight.x, highlight.z);
+        if (
+          point.x < -2 ||
+          point.y < -2 ||
+          point.x > viewSize.width + 2 ||
+          point.y > viewSize.height + 2
+        ) {
+          continue;
+        }
+        context.globalAlpha = 0.92;
+        context.shadowBlur = 0;
+        context.fillStyle = highlight.color;
+        context.fillRect(
+          Math.round(point.x) - 1,
+          Math.round(point.y) - 1,
+          3,
+          3,
+        );
+        context.globalAlpha = 1;
+        continue;
+      }
+
+      if (compactHighlights) {
+        const point = screenAtWorld(highlight.x, highlight.z);
+        const radius = selected ? 3 : 2;
+        context.shadowBlur = 3;
+        context.beginPath();
+        context.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        context.fill();
+        context.shadowBlur = 0;
+        context.strokeStyle = selected
+          ? "rgba(255, 255, 255, 0.98)"
+          : "rgba(255, 255, 255, 0.72)";
+        context.lineWidth = selected ? 2 : 1;
+        context.stroke();
+        if (selected) {
+          context.beginPath();
+          context.arc(point.x, point.y, 5.5, 0, Math.PI * 2);
+          context.strokeStyle = highlight.color;
+          context.lineWidth = 1.5;
+          context.stroke();
+        }
+        continue;
+      }
 
       if (highlight.type === "area" && highlight.bounds) {
         const start = screenAtWorld(
@@ -2595,10 +3022,11 @@ export function MapViewer() {
     atlasProgress,
     atlasStatusFilter,
     camera,
+    compactHighlights,
     ensureTile,
     explorationState,
     gridStep,
-    highlights,
+    renderedHighlights,
     layers,
     lod,
     renderVersion,
@@ -2647,11 +3075,15 @@ export function MapViewer() {
 
   const hitHighlight = useCallback(
     (screenX: number, screenY: number) => {
-      return [...highlights]
+      return [...scopedHighlights]
         .reverse()
         .find((highlight) => {
           if (!highlight.visible) return false;
-          if (highlight.type === "area" && highlight.bounds) {
+          if (
+            !compactHighlights &&
+            highlight.type === "area" &&
+            highlight.bounds
+          ) {
             const start = screenAtWorld(
               Math.min(highlight.bounds.x1, highlight.bounds.x2),
               Math.min(highlight.bounds.z1, highlight.bounds.z2),
@@ -2668,38 +3100,60 @@ export function MapViewer() {
             );
           }
           const point = screenAtWorld(highlight.x, highlight.z);
-          return Math.hypot(point.x - screenX, point.y - screenY) <= 18;
+          return (
+            Math.hypot(point.x - screenX, point.y - screenY) <=
+            (compactHighlights ? 10 : 18)
+          );
         });
     },
-    [highlights, screenAtWorld],
+    [compactHighlights, scopedHighlights, screenAtWorld],
   );
 
   const addPin = useCallback(
-    (point: Camera) => {
+    (
+      point: Camera,
+      options: { title?: string; openEditor?: boolean } = {},
+    ) => {
       if (highlights.length >= MAX_WORKSPACE_HIGHLIGHTS) {
         setMarkMode(null);
         notify("El workspace alcanzó el límite de 10,000 highlights");
         return;
       }
       const id = crypto.randomUUID();
+      const title =
+        (options.title ? normalizeHighlightName(options.title) : null) ??
+        highlightLabel(highlights.length, "pin");
       const highlight: Highlight = {
         id,
         type: "pin",
-        title: highlightLabel(highlights.length, "pin"),
+        title,
         note: "",
         color: COLORS[highlights.length % COLORS.length],
+        regionKey: explorationState
+          ? highlightRegionKey(explorationState.region.bounds)
+          : null,
         x: Math.round(point.x),
         z: Math.round(point.z),
         visible: true,
         createdAt: new Date().toISOString(),
       };
+      invalidateXaeroPreview();
       setHighlights((items) => [...items, highlight]);
-      setSelectedHighlightId(id);
-      setDrawer("highlights");
+      if (options.openEditor === false) {
+        setSelectedHighlightId(null);
+      } else {
+        setSelectedHighlightId(id);
+        setDrawer("highlights");
+      }
       setMarkMode(null);
-      notify("Punto guardado");
+      notify(`${title} guardado`);
     },
-    [highlights.length, notify],
+    [
+      explorationState,
+      highlights.length,
+      invalidateXaeroPreview,
+      notify,
+    ],
   );
 
   const addArea = useCallback(
@@ -2723,12 +3177,16 @@ export function MapViewer() {
         title: highlightLabel(highlights.length, "area"),
         note: "",
         color: COLORS[highlights.length % COLORS.length],
+        regionKey: explorationState
+          ? highlightRegionKey(explorationState.region.bounds)
+          : null,
         x: Math.round((x1 + x2) / 2),
         z: Math.round((z1 + z2) / 2),
         bounds: { x1, z1, x2, z2 },
         visible: true,
         createdAt: new Date().toISOString(),
       };
+      invalidateXaeroPreview();
       setHighlights((items) => [...items, highlight]);
       setSelectedHighlightId(id);
       setDrawer("highlights");
@@ -2737,7 +3195,12 @@ export function MapViewer() {
       setMarkMode(null);
       notify("Área guardada");
     },
-    [highlights.length, notify],
+    [
+      explorationState,
+      highlights.length,
+      invalidateXaeroPreview,
+      notify,
+    ],
   );
 
   const captureRegionBounds = useCallback(
@@ -2781,7 +3244,12 @@ export function MapViewer() {
   );
 
   const commitCoverageSelection = useCallback(
-    (selection: OverworldCoverageSelection) => {
+    (
+      selection: OverworldCoverageSelection,
+      focusedCellIndex =
+        selection.minRow * OVERWORLD_OVERVIEW_COLUMNS +
+        selection.minColumn,
+    ) => {
       const nextKey = boundsKey(selection.bounds);
       setExplorationPlan((current) =>
         current && boundsKey(current.state.region.bounds) === nextKey
@@ -2795,10 +3263,7 @@ export function MapViewer() {
       setCoverageSelection(selection);
       setCoveragePreview(null);
       applyCoverageSelectionToRegion(selection);
-      setAtlasFocusedCellIndex(
-        selection.minRow * OVERWORLD_OVERVIEW_COLUMNS +
-          selection.minColumn,
-      );
+      setAtlasFocusedCellIndex(focusedCellIndex);
       setDrawer(atlasMode ? "atlas" : "exploration");
       notify(
         `${selection.availableCellCount.toLocaleString("es-GT")} sectores con datos seleccionados`,
@@ -2807,9 +3272,28 @@ export function MapViewer() {
     [applyCoverageSelectionToRegion, atlasMode, notify],
   );
 
+  const selectAtlasCell = useCallback(
+    (index: number) => {
+      const selection = coverageSelectionForOverviewCellIndex(index);
+      if (!selection) {
+        setExplorationPlan(null);
+        setRegionStatusSnapshot(null);
+        setRegionStatusError(null);
+        setCoverageSelection(null);
+        setCoveragePreview(null);
+        setAtlasFocusedCellIndex(index);
+        notify("Ese sector no contiene datos publicados del Overworld");
+        return false;
+      }
+      commitCoverageSelection(selection, index);
+      return true;
+    },
+    [commitCoverageSelection, notify],
+  );
+
   const fitAtlasView = useCallback(() => {
     const bounds = OVERWORLD_OVERVIEW_GRID_BOUNDS;
-    const leftInset = 550;
+    const leftInset = 515;
     const rightInset = 28;
     const topInset = 96;
     const bottomInset = 72;
@@ -2848,6 +3332,7 @@ export function MapViewer() {
     if (!atlasMode) {
       atlasReturnViewRef.current = { camera, scale };
     }
+    setTopbarRevealed(false);
     setShowCoverageGrid(true);
     setMarkMode(null);
     setAtlasStatusFilter("all");
@@ -2861,6 +3346,7 @@ export function MapViewer() {
     (nextDrawer: Drawer = null) => {
       const previous = atlasReturnViewRef.current;
       atlasReturnViewRef.current = null;
+      setTopbarRevealed(false);
       setMarkMode(null);
       setCoveragePreview(null);
       setDrawer(nextDrawer);
@@ -2886,19 +3372,35 @@ export function MapViewer() {
   }, [atlasMode, fitAtlasView]);
 
   const startMaxDetailExploration = useCallback(
-    (bounds: WorldBounds, name: string) => {
+    (bounds: WorldBounds, name: string): ExplorationPlan | null => {
       try {
-        const next = createMaxDetailExplorationState({
-          id: `region-${Date.now().toString(36)}`,
-          name: name.trim() || "Región de análisis",
-          bounds,
-        });
-        stageExplorationPlan(next, "new");
+        const selection = resolveExplorationSelection(
+          savedExplorations,
+          {
+            dimension: "overworld",
+            lod: MAX_DETAIL_EXPLORATION_LOD,
+            bounds,
+          },
+          () =>
+            createMaxDetailExplorationState({
+              id: `region-${Date.now().toString(36)}`,
+              name: name.trim() || "Región de análisis",
+              bounds,
+            }),
+        );
+        const plan: ExplorationPlan = {
+          state: selection.state,
+          source: selection.resumed ? "restored" : "new",
+          reveal: true,
+        };
+        stageExplorationPlan(plan.state, plan.source);
         atlasReturnViewRef.current = null;
         notify(
-          `${next.region.cellCount.toLocaleString("es-GT")} celdas · calculando presupuesto regional`,
+          selection.resumed
+            ? `${plan.state.reviewedCount.toLocaleString("es-GT")} celdas conservadas · reanudando ${plan.state.region.name}`
+            : `${plan.state.region.cellCount.toLocaleString("es-GT")} celdas · calculando presupuesto regional`,
         );
-        return next;
+        return plan;
       } catch (error) {
         notify(
           error instanceof Error ? error.message : "La región no es válida",
@@ -2906,7 +3408,7 @@ export function MapViewer() {
         return null;
       }
     },
-    [notify, stageExplorationPlan],
+    [notify, savedExplorations, stageExplorationPlan],
   );
 
   const createMaxDetailVersionOfLegacy = useCallback(() => {
@@ -2953,13 +3455,8 @@ export function MapViewer() {
       coverageSelection.cellCount === 1
         ? `Sector F${coverageSelection.minRow + 1} · C${coverageSelection.minColumn + 1}`
         : `Región ${coverageSelection.rows}×${coverageSelection.columns}`;
-    const next = startMaxDetailExploration(coverageSelection.bounds, name);
-    if (!next) return;
-    const plan: ExplorationPlan = {
-      state: next,
-      source: "new",
-      reveal: true,
-    };
+    const plan = startMaxDetailExploration(coverageSelection.bounds, name);
+    if (!plan) return;
     if (coverageRegionStatus.ready) {
       activateDownloadedExploration(plan, coverageRegionStatus);
     } else {
@@ -2980,6 +3477,7 @@ export function MapViewer() {
   const beginMarkMode = useCallback(
     (mode: Exclude<MarkMode, null>) => {
       if (atlasMode && mode !== "coverage") closeAtlas();
+      setQuickHighlightMenu(null);
       setMarkMode(mode);
       areaPreviewRef.current = undefined;
       setAreaPreview(undefined);
@@ -2991,8 +3489,60 @@ export function MapViewer() {
     [atlasMode, closeAtlas],
   );
 
+  const handleContextMenu = (
+    event: ReactMouseEvent<HTMLCanvasElement>,
+  ) => {
+    if (!isExploring || workspaceMutationsBlocked) return;
+    event.preventDefault();
+    event.currentTarget.focus();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const point = worldAtScreen(
+      event.clientX - rect.left,
+      event.clientY - rect.top,
+    );
+    const menuWidth = 272;
+    const menuHeight = 244;
+    setMarkMode(null);
+    pinStartRef.current = null;
+    areaStartRef.current = null;
+    areaPreviewRef.current = undefined;
+    setAreaPreview(undefined);
+    setQuickHighlightMenu({
+      left: clamp(event.clientX, 12, window.innerWidth - menuWidth - 12),
+      top: clamp(event.clientY, 12, window.innerHeight - menuHeight - 12),
+      point,
+      custom: false,
+      customName: "",
+    });
+  };
+
+  const saveQuickHighlight = (name: string) => {
+    if (!quickHighlightMenu) return;
+    const title = normalizeHighlightName(name);
+    if (!title) {
+      notify("Escribe un nombre de 1 a 200 caracteres");
+      return;
+    }
+    addPin(quickHighlightMenu.point, {
+      title,
+      openEditor: false,
+    });
+    setQuickHighlightMenu(null);
+  };
+
+  const handleShellPointerMove = (
+    event: ReactPointerEvent<HTMLElement>,
+  ) => {
+    if (!isExploring || event.pointerType === "touch") return;
+    setTopbarRevealed((current) => {
+      const next = event.clientY <= (current ? 112 : 92);
+      return next === current ? current : next;
+    });
+  };
+
   const handlePointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (event.pointerType === "mouse" && event.button !== 0) return;
+    setQuickHighlightMenu(null);
     event.currentTarget.focus();
     const rect = event.currentTarget.getBoundingClientRect();
     const screenX = event.clientX - rect.left;
@@ -3258,15 +3808,7 @@ export function MapViewer() {
           );
           const cell = overviewCellAtWorld(point.x, point.z);
           if (cell) {
-            setAtlasFocusedCellIndex(cell.index);
-            commitCoverageSelection(
-              createCoverageSelection(
-                cell.row,
-                cell.column,
-                cell.row + 1,
-                cell.column + 1,
-              ),
-            );
+            selectAtlasCell(cell.index);
           }
         } else if (explorationState) {
           const rect = event.currentTarget.getBoundingClientRect();
@@ -3281,7 +3823,7 @@ export function MapViewer() {
           );
           if (index !== null) {
             const next = withVisitedIndex(explorationState, index);
-            setExplorationState(next);
+            commitExplorationProgress(next);
             focusExploration(next, { mode: "preserve", scale });
           }
         } else {
@@ -3315,6 +3857,7 @@ export function MapViewer() {
 
   const handleWheel = (event: ReactWheelEvent<HTMLCanvasElement>) => {
     event.preventDefault();
+    setQuickHighlightMenu(null);
     const rect = event.currentTarget.getBoundingClientRect();
     zoomAt(
       Math.exp(-event.deltaY * 0.0014),
@@ -3325,7 +3868,7 @@ export function MapViewer() {
 
   const goToSearch = (event: FormEvent) => {
     event.preventDefault();
-    const result = parseLocation(search, highlights);
+    const result = parseLocation(search, scopedHighlights);
     if (!result) {
       setSearchError(true);
       notify("Usa coordenadas X, Z o el nombre de un highlight");
@@ -3338,8 +3881,9 @@ export function MapViewer() {
         notify("La ubicación queda fuera de la huella publicada");
         return;
       }
-      setAtlasFocusedCellIndex(cell.index);
-      notify(`${cell.id} seleccionado en el mapa general`);
+      if (selectAtlasCell(cell.index)) {
+        notify(`${cell.id} seleccionado en el mapa general`);
+      }
       return;
     }
     if (explorationState) {
@@ -3353,7 +3897,7 @@ export function MapViewer() {
         return;
       }
       const next = withVisitedIndex(explorationState, index);
-      setExplorationState(next);
+      commitExplorationProgress(next);
       focusExploration(next, {
         mode: "preserve",
         scale: result.scale ?? scale,
@@ -3370,12 +3914,12 @@ export function MapViewer() {
     (direction: CardinalDirection) => {
       if (!explorationState) return;
       const next = moveCurrentCardinal(explorationState, direction);
-      setExplorationState(next);
       if (next !== explorationState) {
+        commitExplorationProgress(next);
         focusExploration(next, { mode: "preserve", scale });
       }
     },
-    [explorationState, focusExploration, scale],
+    [commitExplorationProgress, explorationState, focusExploration, scale],
   );
 
   const moveAtlasFocusCardinal = useCallback(
@@ -3393,17 +3937,22 @@ export function MapViewer() {
         0,
         OVERWORLD_OVERVIEW_COLUMNS - 1,
       );
-      setAtlasFocusedCellIndex(
+      selectAtlasCell(
         nextRow * OVERWORLD_OVERVIEW_COLUMNS + nextColumn,
       );
     },
-    [atlasFocusedCellIndex],
+    [atlasFocusedCellIndex, selectAtlasCell],
   );
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (workspaceMutationsBlocked) return;
       if (event.defaultPrevented) return;
+      if (event.key === "Escape" && quickHighlightMenu) {
+        event.preventDefault();
+        setQuickHighlightMenu(null);
+        return;
+      }
+      if (workspaceMutationsBlocked) return;
       const target =
         event.target instanceof HTMLElement ? event.target : null;
       const interactiveTarget = target?.closest(
@@ -3434,6 +3983,7 @@ export function MapViewer() {
       } else if (event.key === "-") {
         zoomAt(1 / 1.5);
       } else if (event.key === "Escape") {
+        setTopbarRevealed(false);
         pinStartRef.current = null;
         areaStartRef.current = null;
         coverageStartRef.current = null;
@@ -3445,15 +3995,7 @@ export function MapViewer() {
         else setDrawer(null);
       } else if (atlasMode && event.key === "Enter") {
         event.preventDefault();
-        const focused = overviewCellForIndex(atlasFocusedCellIndex);
-        commitCoverageSelection(
-          createCoverageSelection(
-            focused.row,
-            focused.column,
-            focused.row + 1,
-            focused.column + 1,
-          ),
-        );
+        selectAtlasCell(atlasFocusedCellIndex);
       } else if (event.key.startsWith("Arrow")) {
         if (atlasMode) {
           event.preventDefault();
@@ -3480,7 +4022,6 @@ export function MapViewer() {
           );
           const nextIndex =
             nextRow * OVERWORLD_OVERVIEW_COLUMNS + nextColumn;
-          setAtlasFocusedCellIndex(nextIndex);
           if (event.shiftKey) {
             const anchor = coverageSelection
               ? overviewCellForIndex(
@@ -3492,8 +4033,9 @@ export function MapViewer() {
               anchor,
               overviewCellForIndex(nextIndex),
             );
-            setCoverageSelection(selection);
-            applyCoverageSelectionToRegion(selection);
+            commitCoverageSelection(selection, nextIndex);
+          } else {
+            selectAtlasCell(nextIndex);
           }
           return;
         }
@@ -3532,7 +4074,6 @@ export function MapViewer() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
-    applyCoverageSelectionToRegion,
     atlasFocusedCellIndex,
     atlasMode,
     beginMarkMode,
@@ -3541,7 +4082,9 @@ export function MapViewer() {
     coverageSelection,
     explorationState,
     moveExplorationCardinal,
+    quickHighlightMenu,
     scale,
+    selectAtlasCell,
     viewFullCoverage,
     workspaceMutationsBlocked,
     zoomAt,
@@ -3558,6 +4101,7 @@ export function MapViewer() {
 
   const updateSelectedHighlight = (patch: Partial<Highlight>) => {
     if (!selectedHighlightId) return;
+    invalidateXaeroPreview();
     setHighlights((items) =>
       items.map((highlight) =>
         highlight.id === selectedHighlightId
@@ -3569,6 +4113,7 @@ export function MapViewer() {
 
   const deleteSelectedHighlight = () => {
     if (!selectedHighlightId) return;
+    invalidateXaeroPreview();
     setHighlights((items) =>
       items.filter((highlight) => highlight.id !== selectedHighlightId),
     );
@@ -3733,23 +4278,6 @@ export function MapViewer() {
     }
   };
 
-  const deleteSavedExploration = (
-    exploration: LocalAtlasWorkspaceExploration,
-  ) => {
-    if (explorationState?.region.id === exploration.id) return;
-    if (
-      !window.confirm(
-        `¿Eliminar “${exploration.state.region.name}” del workspace? Exporta la sesión primero si quieres conservar otra copia.`,
-      )
-    ) {
-      return;
-    }
-    setSavedExplorations((items) =>
-      items.filter((item) => item.id !== exploration.id),
-    );
-    notify(`Sesión “${exploration.state.region.name}” eliminada`);
-  };
-
   const continueExplorationPlan = () => {
     if (!explorationPlan || !regionStatus || regionStatusLoading) return;
     if (regionStatus.ready) {
@@ -3812,7 +4340,108 @@ export function MapViewer() {
     anchor.download = "obsidian-atlas-highlights.json";
     anchor.click();
     URL.revokeObjectURL(url);
-    notify("Highlights exportados");
+    notify("Copia JSON de highlights descargada");
+  };
+
+  const prepareXaeroOperation = async () => {
+    if (!localRuntime) {
+      setXaeroError("El runtime local todavía no está disponible");
+      return;
+    }
+    if (xaeroScope.kind === "exploration" && !selectedXaeroRegion) {
+      setXaeroError(
+        "La región elegida ya no está disponible; selecciona otro alcance",
+      );
+      return;
+    }
+    const request: LocalAtlasXaeroRequest = {
+      operation: xaeroOperation,
+      scope: xaeroScope,
+    };
+    setXaeroBusy("preview");
+    setXaeroError(null);
+    setXaeroResult(null);
+    setXaeroRemoveConfirmed(false);
+    setXaeroExpanded(true);
+    try {
+      if (!(await flushWorkspace())) {
+        throw new Error(
+          "No se pudo asegurar la versión más reciente en LuisA",
+        );
+      }
+      const preview = await readLocalAtlasXaeroPreview(request);
+      setXaeroPreview(preview);
+      if (preview.minecraftOpen) {
+        notify(
+          `Cierra Minecraft para ${
+            preview.operation === "remove" ? "retirar" : "exportar"
+          } los highlights`,
+        );
+      } else if (!preview.hasChanges) {
+        notify(
+          preview.operation === "remove"
+            ? "No hay marcadores Atlas que retirar en este alcance"
+            : "Xaero ya está sincronizado con este alcance",
+        );
+      } else {
+        notify(
+          preview.operation === "remove"
+            ? "Vista previa de retirada lista"
+            : "Vista previa de exportación lista",
+        );
+      }
+    } catch (error) {
+      setXaeroPreview(null);
+      setXaeroError(
+        error instanceof Error
+          ? error.message
+          : "No se pudo comprobar Xaero",
+      );
+    } finally {
+      setXaeroBusy(null);
+    }
+  };
+
+  const commitXaeroOperation = async () => {
+    if (!localRuntime || !xaeroPreview) return;
+    if (xaeroPreview.operation === "remove" && !xaeroRemoveConfirmed) {
+      setXaeroError(
+        "Confirma que deseas retirar los marcadores administrados por Atlas",
+      );
+      return;
+    }
+    const operation = xaeroPreview.operation;
+    setXaeroBusy(operation);
+    setXaeroError(null);
+    try {
+      if (!(await flushWorkspace())) {
+        throw new Error(
+          "No se pudo asegurar la versión más reciente en LuisA",
+        );
+      }
+      const result = await applyLocalAtlasXaeroPreview(
+        localRuntime,
+        xaeroPreview,
+      );
+      setXaeroResult(result);
+      setXaeroPreview(result);
+      setXaeroRemoveConfirmed(false);
+      notify(
+        operation === "remove"
+          ? "Marcadores Atlas retirados de Overworld y Nether"
+          : "Highlights exportados a Overworld y Nether",
+      );
+    } catch (error) {
+      setXaeroError(
+        error instanceof Error
+          ? error.message
+          : operation === "remove"
+            ? "No se pudieron retirar los marcadores Atlas"
+            : "No se pudo exportar a Xaero",
+      );
+    } finally {
+      setXaeroBusy(null);
+    }
   };
 
   const importHighlights = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -3833,6 +4462,21 @@ export function MapViewer() {
           "JSON inválido: revisa áreas, coordenadas e identificadores duplicados",
         );
       }
+      const importRegionBounds =
+        explorationState?.region.bounds ??
+        orderedSavedExplorations[0]?.state.region.bounds ??
+        null;
+      const scopedImport = valid.map((highlight) =>
+        highlight.regionKey === undefined
+          ? highlightWithRegionKey(
+              highlight,
+              inferLegacyHighlightRegionKey(
+                highlight,
+                importRegionBounds ? [importRegionBounds] : [],
+              ),
+            )
+          : highlight,
+      );
       if (
         highlights.length > 0 &&
         !window.confirm(
@@ -3841,9 +4485,10 @@ export function MapViewer() {
       ) {
         return;
       }
-      setHighlights(valid);
+      invalidateXaeroPreview();
+      setHighlights(scopedImport);
       setSelectedHighlightId(null);
-      notify(`${valid.length} highlights importados`);
+      notify(`${scopedImport.length} highlights importados`);
     } catch (error) {
       notify(error instanceof Error ? error.message : "JSON inválido");
     }
@@ -3876,21 +4521,40 @@ export function MapViewer() {
 
   return (
     <main
-      className={`atlas-shell ${drawer ? "has-drawer" : ""} ${atlasMode ? "is-atlas-mode" : ""} ${markMode ? "is-marking" : ""}`}
+      className={`atlas-shell ${drawer ? "has-drawer" : ""} ${atlasMode ? "is-atlas-mode" : ""} ${isExploring ? "is-exploring" : ""} ${topbarRevealed ? "is-topbar-revealed" : ""} ${markMode ? "is-marking" : ""}`}
       aria-busy={workspaceMutationsBlocked}
+      onPointerMoveCapture={handleShellPointerMove}
+      onPointerLeave={() => setTopbarRevealed(false)}
     >
+      <section
+        className="desktop-viewport-gate"
+        role="alert"
+        aria-label="Atlas requiere una ventana de escritorio"
+      >
+        <div>
+          <span className="desktop-viewport-gate-icon">
+            <Maximize2 size={24} />
+          </span>
+          <span>
+            <strong>Atlas requiere una ventana de escritorio</strong>
+            <small>
+              Amplía la ventana a 1024 × 640 px o más. La interfaz móvil está
+              deshabilitada para mantener legibles el mapa y sus controles.
+            </small>
+          </span>
+          <code>1024 × 640</code>
+        </div>
+      </section>
+
       {workspaceMutationsBlocked ? (
-        <div className="workspace-hydration-shield" role="status">
+        <div
+          className="workspace-hydration-shield"
+          role={workspaceShieldNeedsAction ? "alert" : "status"}
+        >
           <HardDrive size={19} />
           <div>
-            <strong>
-              {pauseBusy ? "Guardando sesión" : "Sincronizando workspace"}
-            </strong>
-            <span>
-              {pauseBusy
-                ? "Asegurando una copia antes de pausar…"
-                : "Protegiendo el progreso antes de habilitar cambios…"}
-            </span>
+            <strong>{workspaceShieldTitle}</strong>
+            <span>{workspaceShieldMessage}</span>
           </div>
         </div>
       ) : null}
@@ -3906,7 +4570,9 @@ export function MapViewer() {
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerCancel}
           onWheel={handleWheel}
+          onContextMenu={handleContextMenu}
           onDoubleClick={(event) => {
+            setQuickHighlightMenu(null);
             const rect = event.currentTarget.getBoundingClientRect();
             zoomAt(
               1.8,
@@ -3922,7 +4588,22 @@ export function MapViewer() {
         </div>
       </div>
 
-      <header className="topbar">
+      <button
+        type="button"
+        className="topbar-touch-toggle glass-card"
+        aria-label={
+          topbarRevealed
+            ? "Ocultar cabecera de exploración"
+            : "Mostrar cabecera de exploración"
+        }
+        aria-controls="atlas-topbar"
+        aria-expanded={topbarRevealed}
+        onClick={() => setTopbarRevealed((visible) => !visible)}
+      >
+        {topbarRevealed ? <EyeOff size={17} /> : <Eye size={17} />}
+      </button>
+
+      <header className="topbar" id="atlas-topbar">
         <div className="brand-card glass-card">
           <div className="brand-mark" aria-hidden="true">
             <Sparkles size={17} />
@@ -3994,6 +4675,119 @@ export function MapViewer() {
         </section>
       </header>
 
+      {quickHighlightMenu && isExploring && !workspaceMutationsBlocked ? (
+        <div
+          className="highlight-quick-menu glass-card"
+          role="menu"
+          aria-label="Agregar highlight rápido"
+          style={{
+            left: quickHighlightMenu.left,
+            top: quickHighlightMenu.top,
+          }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <div className="highlight-quick-heading">
+            <span className="highlight-quick-icon">
+              <MapPin size={17} />
+            </span>
+            <span>
+              <strong>Agregar highlight</strong>
+              <small>
+                X {formatCoordinate(quickHighlightMenu.point.x)} · Z{" "}
+                {formatCoordinate(quickHighlightMenu.point.z)}
+              </small>
+            </span>
+            <button
+              type="button"
+              className="highlight-quick-close"
+              aria-label="Cerrar menú rápido"
+              onClick={() => setQuickHighlightMenu(null)}
+            >
+              <X size={15} />
+            </button>
+          </div>
+          {quickHighlightMenu.custom ? (
+            <form
+              className="highlight-quick-custom"
+              onSubmit={(event) => {
+                event.preventDefault();
+                saveQuickHighlight(quickHighlightMenu.customName);
+              }}
+            >
+              <label htmlFor="quick-highlight-name">Nombre personalizado</label>
+              <input
+                id="quick-highlight-name"
+                autoFocus
+                maxLength={200}
+                value={quickHighlightMenu.customName}
+                placeholder="Escribe el nombre…"
+                onChange={(event) =>
+                  setQuickHighlightMenu((current) =>
+                    current
+                      ? { ...current, customName: event.target.value }
+                      : current,
+                  )
+                }
+              />
+              <div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setQuickHighlightMenu((current) =>
+                      current
+                        ? { ...current, custom: false, customName: "" }
+                        : current,
+                    )
+                  }
+                >
+                  Volver
+                </button>
+                <button
+                  type="submit"
+                  className="is-primary"
+                  disabled={
+                    normalizeHighlightName(quickHighlightMenu.customName) ===
+                    null
+                  }
+                >
+                  <Plus size={14} />
+                  Guardar
+                </button>
+              </div>
+            </form>
+          ) : (
+            <div className="highlight-quick-options">
+              {quickHighlightPresetNames.map(({ preset, title }, index) => (
+                <button
+                  key={preset}
+                  type="button"
+                  role="menuitem"
+                  autoFocus={index === 0}
+                  onClick={() => saveQuickHighlight(title)}
+                >
+                  <MapPin size={15} />
+                  {title}
+                </button>
+              ))}
+              <button
+                type="button"
+                role="menuitem"
+                className="is-custom"
+                onClick={() =>
+                  setQuickHighlightMenu((current) =>
+                    current ? { ...current, custom: true } : current,
+                  )
+                }
+              >
+                <Plus size={15} />
+                Otro nombre…
+              </button>
+            </div>
+          )}
+          <p>Solo se guardará en {explorationState?.region.name}.</p>
+        </div>
+      ) : null}
+
       <nav className="left-dock glass-card" aria-label="Herramientas del mapa">
         <DockButton
           active={atlasMode}
@@ -4020,7 +4814,7 @@ export function MapViewer() {
         <DockButton
           active={drawer === "highlights"}
           label="Highlights"
-          badge={highlights.length || undefined}
+          badge={scopedHighlights.length || undefined}
           onClick={() => toggleDrawer("highlights")}
         >
           <MapPin />
@@ -4288,18 +5082,7 @@ export function MapViewer() {
                     className="atlas-next-pending"
                     onClick={() => {
                       setAtlasStatusFilter("all");
-                      setAtlasFocusedCellIndex(atlasNextPending.index);
-                      const cell = overviewCellForIndex(
-                        atlasNextPending.index,
-                      );
-                      commitCoverageSelection(
-                        createCoverageSelection(
-                          cell.row,
-                          cell.column,
-                          cell.row + 1,
-                          cell.column + 1,
-                        ),
-                      );
+                      selectAtlasCell(atlasNextPending.index);
                     }}
                   >
                     <Navigation size={15} />
@@ -4459,7 +5242,7 @@ export function MapViewer() {
                   <button
                     type="button"
                     onClick={() =>
-                      setAtlasFocusedCellIndex(
+                      selectAtlasCell(
                         (atlasFocusedCellIndex - 1 +
                           OVERWORLD_OVERVIEW_CELL_COUNT) %
                           OVERWORLD_OVERVIEW_CELL_COUNT,
@@ -4472,7 +5255,7 @@ export function MapViewer() {
                   <button
                     type="button"
                     onClick={() =>
-                      setAtlasFocusedCellIndex(
+                      selectAtlasCell(
                         (atlasFocusedCellIndex + 1) %
                           OVERWORLD_OVERVIEW_CELL_COUNT,
                       )
@@ -4483,16 +5266,7 @@ export function MapViewer() {
                   </button>
                   <button
                     type="button"
-                    onClick={() =>
-                      commitCoverageSelection(
-                        createCoverageSelection(
-                          atlasFocusedCell.row,
-                          atlasFocusedCell.column,
-                          atlasFocusedCell.row + 1,
-                          atlasFocusedCell.column + 1,
-                        ),
-                      )
-                    }
+                    onClick={() => selectAtlasCell(atlasFocusedCellIndex)}
                   >
                     <SquareMousePointer size={15} />
                     Elegir sector
@@ -4642,7 +5416,13 @@ export function MapViewer() {
                     <span>REGIÓN SELECCIONADA</span>
                     <strong>
                       {coverageSelection
-                        ? `${coverageSelection.rows} filas × ${coverageSelection.columns} columnas`
+                        ? `${coverageSelection.rows} ${
+                            coverageSelection.rows === 1 ? "fila" : "filas"
+                          } × ${coverageSelection.columns} ${
+                            coverageSelection.columns === 1
+                              ? "columna"
+                              : "columnas"
+                          }`
                         : "Todavía no has elegido una región"}
                     </strong>
                   </div>
@@ -4766,7 +5546,7 @@ export function MapViewer() {
                   <summary className="saved-session-picker-heading">
                     <HardDrive size={18} />
                     <div>
-                      <span>SESIÓN ÚNICA · LUISA</span>
+                      <span>SESIÓN ACTUAL · LUISA</span>
                       <strong>
                         {orderedSavedExplorations[0]?.state.region.name ??
                           "Sin sesión guardada"}
@@ -4783,7 +5563,7 @@ export function MapViewer() {
                   <p className="saved-session-persistence-copy">
                     {persistenceMessage}
                     {" · "}
-                    LuisA es la única fuente de verdad.
+                    LuisA conserva esta única sesión entre ejecuciones.
                   </p>
                 <div className="saved-session-actions">
                   <button
@@ -4803,8 +5583,6 @@ export function MapViewer() {
                 {orderedSavedExplorations.length > 0 ? (
                   <div className="saved-session-list">
                     {orderedSavedExplorations.map((exploration) => {
-                      const active =
-                        explorationState?.region.id === exploration.id;
                       const savedState =
                         explorationStateFromWorkspace(exploration);
                       const savedReviewableCount =
@@ -4818,9 +5596,7 @@ export function MapViewer() {
                             100;
                       return (
                         <article
-                          className={`saved-session-item ${
-                            active ? "is-active" : ""
-                          }`}
+                          className="saved-session-item"
                           key={exploration.id}
                         >
                           <div className="saved-session-item-main">
@@ -4856,28 +5632,11 @@ export function MapViewer() {
                           <div className="saved-session-item-actions">
                             <button
                               type="button"
-                              disabled={active}
                               onClick={() =>
                                 resumeSavedExploration(exploration)
                               }
                             >
-                              {active ? "Activa" : "Abrir"}
-                            </button>
-                            <button
-                              type="button"
-                              className="danger"
-                              disabled={active}
-                              aria-label={`Eliminar ${exploration.state.region.name}`}
-                              title={
-                                active
-                                  ? "Pausa la sesión antes de eliminarla"
-                                  : "Eliminar del workspace"
-                              }
-                              onClick={() =>
-                                deleteSavedExploration(exploration)
-                              }
-                            >
-                              <Trash2 size={13} />
+                              Continuar
                             </button>
                           </div>
                         </article>
@@ -4886,8 +5645,8 @@ export function MapViewer() {
                   </div>
                 ) : (
                   <p className="saved-session-empty">
-                    La primera región guardada se convertirá en tu sesión
-                    única y permanecerá en LuisA.
+                    La región que elijas se convertirá en tu sesión actual y
+                    permanecerá en LuisA.
                   </p>
                 )}
                 </details>
@@ -4930,23 +5689,15 @@ export function MapViewer() {
                     {localRuntime ? (
                       <div className="capacity-metrics">
                         <span>
-                          Libre
+                          Libres en LuisA
                           <strong>
                             {formatBytes(localRuntime.capacity.freeBytes)}
                           </strong>
                         </span>
                         <span>
-                          Atlas en disco
+                          Regiones en disco
                           <strong>
                             {formatBytes(localRuntime.capacity.archiveBytes)}
-                          </strong>
-                        </span>
-                        <span>
-                          Disponible
-                          <strong>
-                            {formatBytes(
-                              localRuntime.capacity.availableForAtlasBytes,
-                            )}
                           </strong>
                         </span>
                       </div>
@@ -5007,41 +5758,6 @@ export function MapViewer() {
                                 ? "La región está completa en LuisA y ya puede explorarse."
                                 : "Guarda las tres capas de esta zona para explorarla; el resultado persistirá entre ejecuciones."}
                       </p>
-                      <div className="region-download-budget">
-                        <span className="region-download-budget-title">
-                          PRESUPUESTO DE ESTA REGIÓN
-                        </span>
-                        <div className="region-download-budget-grid">
-                          <span>
-                            Celdas L0
-                            <strong>
-                              {explorationPlan.state.region.cellCount.toLocaleString(
-                                "es-GT",
-                              )}
-                            </strong>
-                          </span>
-                          <span>
-                            Capas
-                            <strong>
-                              {REGIONAL_DOWNLOAD_LAYERS.length}
-                            </strong>
-                          </span>
-                          <span>
-                            Archivos
-                            <strong>
-                              {plannedRegionFileBudget.toLocaleString("es-GT")}
-                            </strong>
-                          </span>
-                          <span>
-                            Pendientes
-                            <strong>
-                              {plannedRegionPendingFiles.toLocaleString(
-                                "es-GT",
-                              )}
-                            </strong>
-                          </span>
-                        </div>
-                      </div>
                       <div
                         className="region-download-progress"
                         role="progressbar"
@@ -5086,198 +5802,10 @@ export function MapViewer() {
                           </span>
                         </div>
                       ) : null}
-                      {activeDownloadProgress ? (
-                        <details className="region-download-technical">
-                          <summary>Detalles técnicos de la descarga</summary>
-                          <div
-                            className="region-download-metrics"
-                            aria-label="Métricas de descarga por red"
-                          >
-                          <span>
-                            Velocidad de red
-                            <strong>
-                              {activeDownloadProgress.networkTilesPerSecond ===
-                              undefined
-                                ? "—"
-                                : `${activeDownloadProgress.networkTilesPerSecond.toFixed(2)} tiles/s`}
-                            </strong>
-                          </span>
-                          <span>
-                            RPS logrado
-                            <strong>
-                              {activeDownloadProgress.achievedRps === undefined
-                                ? "—"
-                                : `${activeDownloadProgress.achievedRps.toFixed(2)} req/s`}
-                            </strong>
-                          </span>
-                          <span>
-                            Setpoint / objetivo
-                            <strong>
-                              {activeDownloadProgress.effectiveRps ===
-                                undefined ||
-                              activeDownloadProgress.targetRps === undefined
-                                ? "—"
-                                : `${activeDownloadProgress.effectiveRps.toFixed(1)}/${activeDownloadProgress.targetRps.toFixed(0)} req/s`}
-                            </strong>
-                          </span>
-                          <span>
-                            Resolución total
-                            <strong>
-                              {activeDownloadProgress.resolvedPerSecond ===
-                              undefined
-                                ? "—"
-                                : `${activeDownloadProgress.resolvedPerSecond.toFixed(2)} tiles/s`}
-                            </strong>
-                          </span>
-                          <span>
-                            Transferencia
-                            <strong>
-                              {activeDownloadProgress.bytesPerSecond ===
-                              undefined
-                                ? "—"
-                                : `${formatBytes(activeDownloadProgress.bytesPerSecond)}/s`}
-                            </strong>
-                          </span>
-                          <span>
-                            ETA de red
-                            <strong>
-                              {formatEta(activeDownloadProgress.etaSeconds)}
-                            </strong>
-                          </span>
-                          <span>
-                            Tiles de red
-                            <strong>
-                              {activeDownloadProgress.networkProcessed ===
-                              undefined
-                                ? "—"
-                                : activeDownloadProgress.networkRequested ===
-                                      undefined ||
-                                    activeDownloadProgress.networkRequested ===
-                                      null
-                                  ? activeDownloadProgress.networkProcessed.toLocaleString(
-                                      "es-GT",
-                                    )
-                                  : `${activeDownloadProgress.networkProcessed.toLocaleString("es-GT")}/${activeDownloadProgress.networkRequested.toLocaleString("es-GT")}`}
-                            </strong>
-                          </span>
-                          <span>
-                            Descargado
-                            <strong>
-                              {formatBytes(activeDownloadProgress.downloadedBytes)}
-                            </strong>
-                          </span>
-                          <span>
-                            Intentos HTTP
-                            <strong>
-                              {activeDownloadProgress.requestAttempts ===
-                              undefined
-                                ? "—"
-                                : activeDownloadProgress.requestAttempts.toLocaleString(
-                                    "es-GT",
-                                  )}
-                            </strong>
-                          </span>
-                          <span>
-                            Faltantes
-                            <strong>
-                              {regionStatus?.missingCount.toLocaleString(
-                                "es-GT",
-                              ) ?? "—"}
-                            </strong>
-                          </span>
-                          <span>
-                            Sin imagen
-                            <strong>
-                              {regionStatus?.absentCount.toLocaleString(
-                                "es-GT",
-                              ) ?? "—"}
-                            </strong>
-                          </span>
-                          </div>
-                        </details>
-                      ) : null}
-                      {downloadCooldownSeconds > 0 ? (
-                        <p className="region-download-warning" role="status">
-                          <AlertTriangle size={14} />
-                          Pausa indicada por el servidor ·{" "}
-                          {formatEta(downloadCooldownSeconds)}
-                        </p>
-                      ) : null}
-                      {(regionStatus?.failedCount ?? 0) > 0 ? (
-                        <p className="region-download-warning" role="alert">
-                          <AlertTriangle size={14} />
-                          {regionStatus?.failedCount.toLocaleString("es-GT")}{" "}
-                          archivos fallaron; reanuda para volver a intentarlos.
-                        </p>
-                      ) : null}
-                      <div className="region-persistence-note">
-                        <HardDrive size={16} />
-                        <span>
-                          <strong>
-                            {localRuntime?.capacity.configured
-                              ? "Región persistente en LuisA"
-                              : "LuisA no está disponible"}
-                          </strong>
-                          <small>
-                            {localRuntime?.capacity.configured
-                              ? "Puedes cerrar el Atlas y continuar después sin repetir archivos válidos."
-                              : "Monta la biblioteca APFS antes de iniciar o reanudar la descarga."}
-                          </small>
-                        </span>
-                        <span
-                          className="persistence-badge"
-                          data-state={
-                            localRuntime?.capacity.configured
-                              ? "saved"
-                              : "offline"
-                          }
-                          title="Estado de la biblioteca regional"
-                        >
-                          <strong>
-                            {localRuntime?.capacity.configured
-                              ? "En disco"
-                              : "Sin disco"}
-                          </strong>
-                        </span>
-                      </div>
-                      <label className="region-download-rate">
-                        <span>Velocidad para esta región</span>
-                        <select
-                          value={effectiveRegionalRequestRate}
-                          disabled={
-                            matchingRegionDownloadRunning ||
-                            anotherRegionDownloadRunning ||
-                            regionStatus?.ready
-                          }
-                          onChange={(event) =>
-                            setRequestsPerSecond(Number(event.target.value))
-                          }
-                        >
-                          <option value="0.25">
-                            Mínimo · 0.25 req/s
-                          </option>
-                          <option value="0.5">
-                            Suave · 0.5 req/s
-                          </option>
-                          <option value="2">
-                            Normal · 2 req/s
-                          </option>
-                          <option value="8">
-                            Rápido · 8 req/s
-                          </option>
-                          <option value="16">
-                            Máximo · 16 req/s · recomendado
-                          </option>
-                        </select>
-                        <small className="region-download-rate-note">
-                          Los {regionalRateLimit} req/s están dedicados a esta
-                          región. Puedes reducirlos manualmente si lo necesitas.
-                        </small>
-                      </label>
                       {matchingRegionDownloadRunning ? (
                         <button
                           type="button"
-                          className="stop-job-button"
+                          className="stop-job-button region-download-primary-action"
                           disabled={runtimeBusy}
                           onClick={stopCurrentJob}
                         >
@@ -5287,7 +5815,7 @@ export function MapViewer() {
                       ) : (
                         <button
                           type="button"
-                          className="primary-button region-download-primary"
+                          className="primary-button region-download-primary region-download-primary-action"
                           disabled={
                             runtimeBusy ||
                             regionStatusLoading ||
@@ -5311,6 +5839,224 @@ export function MapViewer() {
                                 : "Guardar región en LuisA"}
                         </button>
                       )}
+                      {!regionStatus?.ready ? (
+                        <div
+                          className="region-download-rate-fixed"
+                          aria-label="Velocidad objetivo: hasta 16 solicitudes por segundo, con ajuste adaptativo"
+                        >
+                          <Sparkles size={16} />
+                          <span>
+                            <small>VELOCIDAD OBJETIVO</small>
+                            <strong>
+                              Máximo · {REGIONAL_REQUESTS_PER_SECOND} req/s
+                            </strong>
+                          </span>
+                          <span>ADAPTATIVA</span>
+                        </div>
+                      ) : null}
+                      {downloadCooldownSeconds > 0 ? (
+                        <p className="region-download-warning" role="status">
+                          <AlertTriangle size={14} />
+                          Pausa indicada por el servidor ·{" "}
+                          {formatEta(downloadCooldownSeconds)}
+                        </p>
+                      ) : null}
+                      {(regionStatus?.failedCount ?? 0) > 0 ? (
+                        <p className="region-download-warning" role="alert">
+                          <AlertTriangle size={14} />
+                          {regionStatus?.failedCount.toLocaleString("es-GT")}{" "}
+                          archivos fallaron; reanuda para volver a intentarlos.
+                        </p>
+                      ) : null}
+                      <details className="region-download-details">
+                        <summary>
+                          <span>
+                            <strong>Detalles de esta región</strong>
+                            <small>
+                              Presupuesto, persistencia y métricas de red
+                            </small>
+                          </span>
+                        </summary>
+                        <div className="region-download-details-content">
+                          <div className="region-download-budget">
+                            <span className="region-download-budget-title">
+                              PRESUPUESTO DE ESTA REGIÓN
+                            </span>
+                            <div className="region-download-budget-grid">
+                              <span>
+                                Celdas L0
+                                <strong>
+                                  {explorationPlan.state.region.cellCount.toLocaleString(
+                                    "es-GT",
+                                  )}
+                                </strong>
+                              </span>
+                              <span>
+                                Capas
+                                <strong>
+                                  {REGIONAL_DOWNLOAD_LAYERS.length}
+                                </strong>
+                              </span>
+                              <span>
+                                Archivos
+                                <strong>
+                                  {plannedRegionFileBudget.toLocaleString(
+                                    "es-GT",
+                                  )}
+                                </strong>
+                              </span>
+                              <span>
+                                Pendientes
+                                <strong>
+                                  {plannedRegionPendingFiles.toLocaleString(
+                                    "es-GT",
+                                  )}
+                                </strong>
+                              </span>
+                            </div>
+                          </div>
+                          <div className="region-persistence-note">
+                            <HardDrive size={16} />
+                            <span>
+                              <strong>
+                                {localRuntime?.capacity.configured
+                                  ? "Región persistente en LuisA"
+                                  : "LuisA no está disponible"}
+                              </strong>
+                              <small>
+                                {localRuntime?.capacity.configured
+                                  ? "Puedes cerrar el Atlas y continuar después sin repetir archivos válidos."
+                                  : "Monta la biblioteca APFS antes de iniciar o reanudar la descarga."}
+                              </small>
+                            </span>
+                            <span
+                              className="persistence-badge"
+                              data-state={
+                                localRuntime?.capacity.configured
+                                  ? "saved"
+                                  : "offline"
+                              }
+                              title="Estado de la biblioteca regional"
+                            >
+                              <strong>
+                                {localRuntime?.capacity.configured
+                                  ? "En disco"
+                                  : "Sin disco"}
+                              </strong>
+                            </span>
+                          </div>
+                          {activeDownloadProgress ? (
+                            <div
+                              className="region-download-metrics region-download-network-metrics"
+                              aria-label="Métricas técnicas de descarga por red"
+                            >
+                              <span>
+                                Velocidad de red
+                                <strong>
+                                  {activeDownloadProgress.networkTilesPerSecond ===
+                                  undefined
+                                    ? "—"
+                                    : `${activeDownloadProgress.networkTilesPerSecond.toFixed(2)} tiles/s`}
+                                </strong>
+                              </span>
+                              <span>
+                                RPS logrado
+                                <strong>
+                                  {activeDownloadProgress.achievedRps ===
+                                  undefined
+                                    ? "—"
+                                    : `${activeDownloadProgress.achievedRps.toFixed(2)} req/s`}
+                                </strong>
+                              </span>
+                              <span>
+                                Setpoint / objetivo
+                                <strong>
+                                  {activeDownloadProgress.effectiveRps ===
+                                    undefined ||
+                                  activeDownloadProgress.targetRps === undefined
+                                    ? "—"
+                                    : `${activeDownloadProgress.effectiveRps.toFixed(1)}/${activeDownloadProgress.targetRps.toFixed(0)} req/s`}
+                                </strong>
+                              </span>
+                              <span>
+                                Resolución total
+                                <strong>
+                                  {activeDownloadProgress.resolvedPerSecond ===
+                                  undefined
+                                    ? "—"
+                                    : `${activeDownloadProgress.resolvedPerSecond.toFixed(2)} tiles/s`}
+                                </strong>
+                              </span>
+                              <span>
+                                Transferencia
+                                <strong>
+                                  {activeDownloadProgress.bytesPerSecond ===
+                                  undefined
+                                    ? "—"
+                                    : `${formatBytes(activeDownloadProgress.bytesPerSecond)}/s`}
+                                </strong>
+                              </span>
+                              <span>
+                                ETA de red
+                                <strong>
+                                  {formatEta(activeDownloadProgress.etaSeconds)}
+                                </strong>
+                              </span>
+                              <span>
+                                Tiles de red
+                                <strong>
+                                  {activeDownloadProgress.networkProcessed ===
+                                  undefined
+                                    ? "—"
+                                    : activeDownloadProgress.networkRequested ===
+                                          undefined ||
+                                        activeDownloadProgress.networkRequested ===
+                                          null
+                                      ? activeDownloadProgress.networkProcessed.toLocaleString(
+                                          "es-GT",
+                                        )
+                                      : `${activeDownloadProgress.networkProcessed.toLocaleString("es-GT")}/${activeDownloadProgress.networkRequested.toLocaleString("es-GT")}`}
+                                </strong>
+                              </span>
+                              <span>
+                                Descargado
+                                <strong>
+                                  {formatBytes(
+                                    activeDownloadProgress.downloadedBytes,
+                                  )}
+                                </strong>
+                              </span>
+                              <span>
+                                Intentos HTTP
+                                <strong>
+                                  {activeDownloadProgress.requestAttempts ===
+                                  undefined
+                                    ? "—"
+                                    : activeDownloadProgress.requestAttempts.toLocaleString(
+                                        "es-GT",
+                                      )}
+                                </strong>
+                              </span>
+                              <span>
+                                Faltantes
+                                <strong>
+                                  {regionStatus?.missingCount.toLocaleString(
+                                    "es-GT",
+                                  ) ?? "—"}
+                                </strong>
+                              </span>
+                              <span>
+                                Sin imagen
+                                <strong>
+                                  {regionStatus?.absentCount.toLocaleString(
+                                    "es-GT",
+                                  ) ?? "—"}
+                                </strong>
+                              </span>
+                            </div>
+                          ) : null}
+                        </div>
+                      </details>
                       <button
                         type="button"
                         className="region-download-cancel"
@@ -5525,78 +6271,6 @@ export function MapViewer() {
                           Crear versión en LOD 0
                         </button>
                       ) : null}
-                      <div
-                        className="direction-pad direction-pad-inline"
-                        aria-label="Mover a una celda vecina"
-                      >
-                        <button
-                          type="button"
-                          className="north"
-                          aria-label="Mover arriba"
-                          disabled={
-                            cardinalNeighbor(
-                              explorationState.region,
-                              explorationState.currentIndex,
-                              "north",
-                            ) === null
-                          }
-                          onClick={() => moveExplorationCardinal("north")}
-                        >
-                          <ArrowUp />
-                        </button>
-                        <button
-                          type="button"
-                          className="west"
-                          aria-label="Mover a la izquierda"
-                          disabled={
-                            cardinalNeighbor(
-                              explorationState.region,
-                              explorationState.currentIndex,
-                              "west",
-                            ) === null
-                          }
-                          onClick={() => moveExplorationCardinal("west")}
-                        >
-                          <ArrowLeft />
-                        </button>
-                        <span className="center-label" aria-hidden="true">
-                          <Navigation />
-                        </span>
-                        <button
-                          type="button"
-                          className="east"
-                          aria-label="Mover a la derecha"
-                          disabled={
-                            cardinalNeighbor(
-                              explorationState.region,
-                              explorationState.currentIndex,
-                              "east",
-                            ) === null
-                          }
-                          onClick={() => moveExplorationCardinal("east")}
-                        >
-                          <ArrowRight />
-                        </button>
-                        <button
-                          type="button"
-                          className="south"
-                          aria-label="Mover abajo"
-                          disabled={
-                            cardinalNeighbor(
-                              explorationState.region,
-                              explorationState.currentIndex,
-                              "south",
-                            ) === null
-                          }
-                          onClick={() => moveExplorationCardinal("south")}
-                        >
-                          <ArrowDown />
-                        </button>
-                      </div>
-                      <small className="direction-pad-hint">
-                        Flechas del teclado o controles para moverte por la
-                        región.
-                      </small>
                     </section>
                   )}
 
@@ -5708,6 +6382,483 @@ export function MapViewer() {
 
           {drawer === "highlights" && (
             <div className="drawer-content highlight-panel">
+              <section
+                className={`xaero-export-card ${xaeroExpanded ? "expanded" : ""}`}
+                aria-busy={xaeroBusy !== null}
+              >
+                <button
+                  type="button"
+                  className="xaero-export-launch"
+                  aria-expanded={xaeroExpanded}
+                  aria-controls="xaero-export-preview"
+                  onClick={() => {
+                    if (xaeroExpanded) {
+                      setXaeroExpanded(false);
+                    } else if (xaeroPreview) {
+                      setXaeroExpanded(true);
+                    } else {
+                      void prepareXaeroOperation();
+                    }
+                  }}
+                  disabled={xaeroBusy !== null || workspaceMutationsBlocked}
+                >
+                  <Navigation size={18} />
+                  <span>
+                    <strong>Sincronizar con Xaero 2b2t</strong>
+                    <small>
+                      Exportar o retirar por región · Overworld + Nether
+                    </small>
+                  </span>
+                  {xaeroBusy === "preview" ? (
+                    <RotateCcw className="spin" size={16} />
+                  ) : xaeroResult ? (
+                    <CheckCircle2 size={16} />
+                  ) : (
+                    <ChevronLeft className="xaero-chevron" size={16} />
+                  )}
+                </button>
+
+                {xaeroExpanded && (
+                  <div
+                    className="xaero-export-preview"
+                    id="xaero-export-preview"
+                  >
+                    <fieldset
+                      className="xaero-operation-picker"
+                      disabled={xaeroBusy !== null}
+                    >
+                      <legend>ACCIÓN</legend>
+                      <button
+                        type="button"
+                        aria-pressed={xaeroOperation === "export"}
+                        className={
+                          xaeroOperation === "export" ? "active" : ""
+                        }
+                        onClick={() => {
+                          if (xaeroOperation === "export") return;
+                          setXaeroOperation("export");
+                          invalidateXaeroPreview();
+                        }}
+                      >
+                        <Download size={14} />
+                        Exportar
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={xaeroOperation === "remove"}
+                        className={
+                          xaeroOperation === "remove" ? "active danger" : ""
+                        }
+                        onClick={() => {
+                          if (xaeroOperation === "remove") return;
+                          setXaeroOperation("remove");
+                          invalidateXaeroPreview();
+                        }}
+                      >
+                        <Trash2 size={14} />
+                        Retirar
+                      </button>
+                    </fieldset>
+
+                    <label
+                      className="xaero-scope-picker"
+                      htmlFor="xaero-scope"
+                    >
+                      <span>ALCANCE</span>
+                      <select
+                        id="xaero-scope"
+                        value={
+                          xaeroScope.kind === "all"
+                            ? "__all__"
+                            : xaeroScope.explorationId
+                        }
+                        disabled={xaeroBusy !== null}
+                        aria-describedby="xaero-scope-help"
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          xaeroDefaultScopeAppliedRef.current = true;
+                          chooseXaeroScope(
+                            value === "__all__"
+                              ? { kind: "all" }
+                              : {
+                                  kind: "exploration",
+                                  explorationId: value,
+                                },
+                          );
+                          invalidateXaeroPreview();
+                        }}
+                      >
+                        <option value="__all__">
+                          Todo el Atlas ·{" "}
+                          {
+                            highlights.filter(
+                              (highlight) => highlight.type === "pin",
+                            ).length
+                          }{" "}
+                          puntos
+                        </option>
+                        {xaeroRegionOptions.map((region) => (
+                          <option key={region.id} value={region.id}>
+                            {region.name} · {region.pinCount}{" "}
+                            {region.pinCount === 1 ? "punto" : "puntos"}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <p id="xaero-scope-help" className="xaero-scope-help">
+                      {xaeroScope.kind === "all"
+                        ? xaeroOperation === "remove"
+                          ? "Incluye todos los marcadores que Atlas administra, incluso si el highlight original cambió."
+                          : "Incluye todos los puntos guardados en el workspace."
+                        : xaeroOperation === "remove"
+                          ? "Usa la posición Overworld registrada al exportar; también encuentra highlights movidos o eliminados."
+                          : "Incluye puntos cuya coordenada actual está dentro de los límites guardados de la región."}
+                    </p>
+                    <div className="xaero-scope-summary" aria-live="polite">
+                      <MapPin size={13} />
+                      <span>{xaeroSelectionLabel}</span>
+                    </div>
+
+                    {xaeroBusy === "preview" && !xaeroPreview ? (
+                      <p className="xaero-checking">
+                        Preparando vista previa en ambos mapas…
+                      </p>
+                    ) : null}
+
+                    {xaeroError ? (
+                      <div className="xaero-message error" role="alert">
+                        <AlertTriangle size={16} />
+                        <span>{xaeroError}</span>
+                      </div>
+                    ) : null}
+
+                    {!xaeroPreview && xaeroBusy !== "preview" ? (
+                      <button
+                        type="button"
+                        className="secondary-button xaero-preview-button"
+                        onClick={() => void prepareXaeroOperation()}
+                        disabled={
+                          xaeroBusy !== null || workspaceMutationsBlocked
+                        }
+                      >
+                        <Eye size={15} />
+                        {xaeroOperation === "remove"
+                          ? "Previsualizar retirada"
+                          : "Previsualizar exportación"}
+                      </button>
+                    ) : null}
+
+                    {xaeroPreview ? (
+                      <>
+                        <div className="xaero-preview-heading">
+                          <span>
+                            {xaeroPreview.scope === "exploration"
+                              ? xaeroPreview.regionName
+                              : "Todo el Atlas"}
+                          </span>
+                          <strong>
+                            {xaeroPreview.operation === "remove"
+                              ? xaeroPreview.managedHighlights.toLocaleString(
+                                  "es-GT",
+                                )
+                              : xaeroPreview.selectedHighlights.toLocaleString(
+                                  "es-GT",
+                                )}{" "}
+                            {xaeroPreview.operation === "remove"
+                              ? xaeroPreview.managedHighlights === 1
+                                ? "marcador exportado administrado"
+                                : "marcadores exportados administrados"
+                              : xaeroPreview.selectedHighlights === 1
+                                ? "highlight seleccionado"
+                                : "highlights seleccionados"}
+                          </strong>
+                          {xaeroPreview.operation === "remove" ? (
+                            <small>
+                              {xaeroPreview.selectedHighlights.toLocaleString(
+                                "es-GT",
+                              )}{" "}
+                              highlights actuales en el alcance ·{" "}
+                              {xaeroPreview.removableHighlights.toLocaleString(
+                                "es-GT",
+                              )}{" "}
+                              con filas retirables
+                            </small>
+                          ) : null}
+                        </div>
+                        <div className="xaero-dimension-grid">
+                          <div>
+                            <span>OVERWORLD</span>
+                            {xaeroPreview.operation === "remove" ? (
+                              <>
+                                <strong>
+                                  −{xaeroPreview.overworld.removed}{" "}
+                                  {xaeroPreview.overworld.removed === 1
+                                    ? "retirada"
+                                    : "retiradas"}
+                                </strong>
+                                <small>
+                                  {xaeroPreview.overworld.alreadyAbsent} ya{" "}
+                                  {xaeroPreview.overworld.alreadyAbsent === 1
+                                    ? "ausente"
+                                    : "ausentes"}{" "}
+                                  · {xaeroPreview.overworld.conflicts} en
+                                  conflicto
+                                </small>
+                              </>
+                            ) : (
+                              <>
+                                <strong>
+                                  +{xaeroPreview.overworld.added}{" "}
+                                  {xaeroPreview.overworld.added === 1
+                                    ? "nueva"
+                                    : "nuevas"}
+                                </strong>
+                                <small>
+                                  {xaeroPreview.overworld.existing}{" "}
+                                  {xaeroPreview.overworld.existing === 1
+                                    ? "existente"
+                                    : "existentes"}{" "}
+                                  · {xaeroPreview.overworld.updated}{" "}
+                                  {xaeroPreview.overworld.updated === 1
+                                    ? "actualizada"
+                                    : "actualizadas"}
+                                </small>
+                              </>
+                            )}
+                          </div>
+                          <div>
+                            <span>NETHER · 1:8</span>
+                            {xaeroPreview.operation === "remove" ? (
+                              <>
+                                <strong>
+                                  −{xaeroPreview.nether.removed}{" "}
+                                  {xaeroPreview.nether.removed === 1
+                                    ? "retirada"
+                                    : "retiradas"}
+                                </strong>
+                                <small>
+                                  {xaeroPreview.nether.alreadyAbsent} ya{" "}
+                                  {xaeroPreview.nether.alreadyAbsent === 1
+                                    ? "ausente"
+                                    : "ausentes"}{" "}
+                                  · {xaeroPreview.nether.conflicts} en conflicto
+                                </small>
+                              </>
+                            ) : (
+                              <>
+                                <strong>
+                                  +{xaeroPreview.nether.added}{" "}
+                                  {xaeroPreview.nether.added === 1
+                                    ? "nueva"
+                                    : "nuevas"}
+                                </strong>
+                                <small>
+                                  {xaeroPreview.nether.existing}{" "}
+                                  {xaeroPreview.nether.existing === 1
+                                    ? "existente"
+                                    : "existentes"}{" "}
+                                  · {xaeroPreview.nether.updated}{" "}
+                                  {xaeroPreview.nether.updated === 1
+                                    ? "actualizada"
+                                    : "actualizadas"}
+                                </small>
+                              </>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="xaero-preservation-note">
+                          <HardDrive size={15} />
+                          {xaeroPreview.operation === "remove" ? (
+                            <span>
+                              Solo se retiran filas intactas administradas por
+                              Atlas en este alcance. No se borran highlights de
+                              Atlas ni marcadores ajenos; los cambios manuales
+                              se preservan. Se crea un respaldo en LuisA.
+                            </span>
+                          ) : (
+                            <span>
+                              Los marcadores existentes se preservan. Cada
+                              nombre termina en <strong> - Atlas</strong> y se
+                              crea un respaldo en LuisA.
+                            </span>
+                          )}
+                        </div>
+
+                        {xaeroPreview.minecraftOpen ? (
+                          <div className="xaero-message warning" role="status">
+                            <LockKeyhole size={16} />
+                            <span>
+                              Minecraft está abierto. La previsualización es
+                              segura, pero debes cerrarlo antes de escribir.
+                            </span>
+                          </div>
+                        ) : null}
+
+                        {xaeroPreview.conflicts > 0 ? (
+                          <div className="xaero-message warning">
+                            <AlertTriangle size={16} />
+                            <span>
+                              {xaeroPreview.conflicts}{" "}
+                              {xaeroPreview.conflicts === 1
+                                ? "highlight tiene"
+                                : "highlights tienen"}{" "}
+                              {xaeroPreview.operation === "remove"
+                                ? "filas modificadas o duplicadas; "
+                                : "cambios manuales o duplicados; "}
+                              {xaeroPreview.conflicts === 1
+                                ? "se preservará."
+                                : "se preservarán."}
+                            </span>
+                          </div>
+                        ) : null}
+
+                        {xaeroPreview.skippedAreas > 0 ||
+                        xaeroPreview.notesNotExported > 0 ? (
+                          <p className="xaero-caveat">
+                            {xaeroPreview.skippedAreas > 0
+                              ? xaeroPreview.skippedAreas === 1
+                                ? "1 área omitida; Xaero solo admite puntos. "
+                                : `${xaeroPreview.skippedAreas} áreas omitidas; Xaero solo admite puntos. `
+                              : ""}
+                            {xaeroPreview.notesNotExported > 0
+                              ? xaeroPreview.notesNotExported === 1
+                                ? "1 nota permanece únicamente en Atlas."
+                                : `${xaeroPreview.notesNotExported} notas permanecen únicamente en Atlas.`
+                              : ""}
+                          </p>
+                        ) : null}
+
+                        {xaeroResult ? (
+                          <div className="xaero-message success" role="status">
+                            <CheckCircle2 size={16} />
+                            <span>
+                              {xaeroResult.operation === "remove"
+                                ? "Retirada terminada y verificada en ambas dimensiones."
+                                : "Exportación terminada y verificada en ambas dimensiones."}{" "}
+                              Respaldo guardado en LuisA.
+                            </span>
+                          </div>
+                        ) : null}
+
+                        {xaeroPreview.operation === "remove" &&
+                        xaeroPreview.hasChanges &&
+                        !xaeroResult ? (
+                          <div
+                            className="xaero-remove-confirmation"
+                            role="group"
+                            aria-labelledby="xaero-remove-confirmation-title"
+                          >
+                            <div>
+                              <Trash2 size={16} />
+                              <span>
+                                <strong id="xaero-remove-confirmation-title">
+                                  Confirmación necesaria
+                                </strong>
+                                Se procesarán{" "}
+                                {xaeroPreview.managedHighlights.toLocaleString(
+                                  "es-GT",
+                                )}{" "}
+                                marcadores administrados y se retirarán hasta{" "}
+                                {(
+                                  xaeroPreview.overworld.removed +
+                                  xaeroPreview.nether.removed
+                                ).toLocaleString("es-GT")}{" "}
+                                filas Atlas de Overworld y Nether. Las
+                                referencias de filas ya ausentes se limpiarán.
+                                {" "}
+                                Los highlights seguirán guardados en Atlas.
+                              </span>
+                            </div>
+                            <label>
+                              <input
+                                type="checkbox"
+                                checked={xaeroRemoveConfirmed}
+                                onChange={(event) =>
+                                  setXaeroRemoveConfirmed(event.target.checked)
+                                }
+                              />
+                              <span>
+                                Confirmo que quiero aplicar esta retirada en
+                                Xaero
+                              </span>
+                            </label>
+                          </div>
+                        ) : null}
+
+                        <div className="xaero-actions">
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => void prepareXaeroOperation()}
+                            disabled={xaeroBusy !== null}
+                          >
+                            <RotateCcw size={15} />
+                            Actualizar vista
+                          </button>
+                          <button
+                            type="button"
+                            className={
+                              xaeroPreview.operation === "remove"
+                                ? "danger-button"
+                                : "primary-button"
+                            }
+                            onClick={() => void commitXaeroOperation()}
+                            disabled={
+                              xaeroBusy !== null ||
+                              !xaeroPreview.canExport ||
+                              (xaeroPreview.operation === "remove" &&
+                                !xaeroRemoveConfirmed)
+                            }
+                          >
+                            {xaeroPreview.operation === "remove" ? (
+                              <Trash2 size={16} />
+                            ) : (
+                              <Download size={16} />
+                            )}
+                            {xaeroBusy === "export"
+                              ? "Exportando…"
+                              : xaeroBusy === "remove"
+                                ? "Retirando…"
+                                : xaeroPreview.minecraftOpen
+                                  ? "Minecraft abierto"
+                                  : xaeroPreview.operation === "remove"
+                                    ? xaeroPreview.hasChanges
+                                      ? "Retirar de ambas"
+                                      : "Nada que retirar"
+                                    : xaeroPreview.hasChanges
+                                      ? "Exportar ambas"
+                                      : "Xaero está al día"}
+                          </button>
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+                )}
+              </section>
+
+              <section className="highlight-scope-card" aria-live="polite">
+                <span className="highlight-scope-icon">
+                  <Grid3X3 size={16} />
+                </span>
+                <span>
+                  <small>
+                    {explorationState ? "REGIÓN ACTIVA" : "SIN REGIÓN ACTIVA"}
+                  </small>
+                  <strong>
+                    {explorationState?.region.name ?? "Highlights generales"}
+                  </strong>
+                  <em>
+                    {scopedHighlights.length.toLocaleString("es-GT")} visible
+                    {scopedHighlights.length === 1 ? "" : "s"} en este
+                    cuadrante
+                    {highlights.length > scopedHighlights.length
+                      ? ` · ${(highlights.length - scopedHighlights.length).toLocaleString("es-GT")} de otras regiones ocultos`
+                      : ""}
+                  </em>
+                </span>
+              </section>
+
               <div className="highlight-tools">
                 <button
                   type="button"
@@ -5746,14 +6897,17 @@ export function MapViewer() {
                   <kbd>R</kbd>
                 </button>
               </div>
+              <div className="highlight-transfer-label">
+                Copia y recuperación
+              </div>
               <div className="highlight-transfer">
                 <button type="button" onClick={exportHighlights}>
                   <Download size={15} />
-                  Exportar
+                  Descargar JSON
                 </button>
                 <button type="button" onClick={() => importRef.current?.click()}>
                   <Upload size={15} />
-                  Importar
+                  Importar JSON
                 </button>
                 <input
                   ref={importRef}
@@ -5796,6 +6950,28 @@ export function MapViewer() {
                       }
                     />
                   </label>
+                  <fieldset className="highlight-name-presets">
+                    <legend>Nombre rápido</legend>
+                    {selectedHighlightPresetNames.map(
+                      ({ preset, title }) => (
+                        <button
+                          key={preset}
+                          type="button"
+                          className={
+                            selectedHighlight.title === title
+                              ? "selected"
+                              : ""
+                          }
+                          onClick={() =>
+                            updateSelectedHighlight({ title })
+                          }
+                        >
+                          {title}
+                        </button>
+                      ),
+                    )}
+                    <span>o escribe el nombre que desees arriba</span>
+                  </fieldset>
                   <label>
                     <span>Notas</span>
                     <textarea
@@ -5876,13 +7052,15 @@ export function MapViewer() {
                     Eliminar highlight
                   </button>
                 </div>
-              ) : highlights.length ? (
+              ) : scopedHighlights.length ? (
                 <div className="highlight-list">
                   <div className="list-heading">
-                    <span>{highlights.length} guardados</span>
+                    <span>
+                      {scopedHighlights.length} guardados en esta región
+                    </span>
                     <ListFilter size={15} />
                   </div>
-                  {highlights.map((highlight) => (
+                  {scopedHighlights.map((highlight) => (
                     <button
                       type="button"
                       className="highlight-list-item"
@@ -5924,8 +7102,9 @@ export function MapViewer() {
                   </div>
                   <h3>Tu mapa, tus referencias</h3>
                   <p>
-                    Marca un punto o arrastra un área. Se guardan
-                    automáticamente en LuisA y mantienen una copia local.
+                    Haz clic derecho para guardar Base, Base D o Mapa al
+                    instante. También puedes marcar un punto, un área o usar
+                    el nombre que desees.
                   </p>
                   <button type="button" onClick={() => beginMarkMode("pin")}>
                     <Plus size={16} />
@@ -6093,14 +7272,6 @@ export function MapViewer() {
           </div>
         </section>
       )}
-
-      <div className="dimension-pill glass-card">
-        <button type="button" className="active" aria-pressed="true">
-          <span className="dimension-orb" />
-          Overworld
-        </button>
-        <span className="coming-soon">Nether y End próximamente</span>
-      </div>
 
       <div className="zoom-stack glass-card">
         <button

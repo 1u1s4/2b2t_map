@@ -40,6 +40,7 @@ import {
 import {
   consolidateSingleWorkspaceContent,
   consolidateWorkspaceExplorations,
+  mergeMatchingWorkspaceProgress,
 } from "../app/lib/single-workspace-session.ts";
 
 const NOW = "2026-07-25T12:00:00.000Z";
@@ -84,6 +85,7 @@ function content(overrides = {}) {
         title: "Base",
         note: "Entrada norte",
         color: "#FF5F57",
+        regionKey: "-1024:0:1024:1024",
         x: -512,
         z: 256,
         bounds: {
@@ -99,6 +101,22 @@ function content(overrides = {}) {
     coverageSelection: createCoverageSelection(10, 10, 12, 13),
     ...overrides,
   };
+}
+
+function contentForExploration(id, overrides = {}) {
+  const state = explorationState(id);
+  return content({
+    activeExplorationId: id,
+    explorations: [
+      {
+        id,
+        createdAt: NOW,
+        updatedAt: NOW,
+        state,
+      },
+    ],
+    ...overrides,
+  });
 }
 
 async function withTemporaryBacking(operation) {
@@ -129,6 +147,7 @@ test("workspace parser canonicalizes nested state, coverage, and highlights", ()
   assert.equal(parsed.explorations[0].state.reviewedCount, 2);
   assert.equal(parsed.explorations[0].state.skippedCount, 1);
   assert.equal(parsed.highlights[0].color, "#ff5f57");
+  assert.equal(parsed.highlights[0].regionKey, "-1024:0:1024:1024");
   assert.equal(parsed.coverageSelection?.cellCount, 6);
 
   assert.throws(
@@ -150,12 +169,36 @@ test("workspace parser canonicalizes nested state, coverage, and highlights", ()
       }),
     /ids de highlight duplicados/,
   );
+  assert.throws(
+    () =>
+      parseAtlasWorkspaceContent({
+        ...content(),
+        highlights: [
+          {
+            ...content().highlights[0],
+            regionKey: "region-id-inestable",
+          },
+        ],
+      }),
+    /región del highlight no es válida/,
+  );
   const tampered = content();
   tampered.explorations[0].state.reviewedCount = 99;
   assert.throws(
     () => parseAtlasWorkspaceContent(tampered),
     /sesión de exploración no es válida/,
   );
+});
+
+test("workspace v1 accepts legacy highlights without a region scope", () => {
+  const legacy = content();
+  delete legacy.highlights[0].regionKey;
+
+  const diskParsed = parseAtlasWorkspaceContent(legacy);
+  const clientParsed = parseLocalAtlasWorkspaceContent(legacy);
+
+  assert.equal("regionKey" in diskParsed.highlights[0], false);
+  assert.equal("regionKey" in clientParsed.highlights[0], false);
 });
 
 test("single-session consolidation preserves the richest overlapping review progress", () => {
@@ -237,6 +280,71 @@ test("single-session consolidation preserves the richest overlapping review prog
     }).activeExplorationId,
     null,
   );
+});
+
+test("a stale journal merges only progress for the same spatial region", () => {
+  const current = contentForExploration("region-current");
+  let recoveredState = createExplorationState({
+    id: "region-recovery",
+    name: "Copia inmediata",
+    bounds: current.explorations[0].state.region.bounds,
+    lod: 0,
+    scale: 1,
+  });
+  recoveredState = withCellReviewed(recoveredState, 2);
+  recoveredState = withCellReviewed(recoveredState, 4);
+  const recovery = contentForExploration("region-recovery", {
+    explorations: [
+      {
+        id: "region-recovery",
+        createdAt: NOW,
+        updatedAt: "2026-07-25T12:01:00.000Z",
+        state: JSON.parse(serializeExplorationState(recoveredState)),
+      },
+    ],
+    highlights: [],
+    coverageSelection: null,
+  });
+
+  const merged = mergeMatchingWorkspaceProgress(current, recovery);
+
+  assert.ok(merged);
+  assert.equal(merged.activeExplorationId, "region-current");
+  assert.equal(merged.explorations[0].id, "region-current");
+  assert.equal(
+    deserializeExplorationState(
+      JSON.stringify(merged.explorations[0].state),
+    ).reviewedCount,
+    4,
+  );
+  assert.deepEqual(merged.highlights, current.highlights);
+  assert.deepEqual(merged.coverageSelection, current.coverageSelection);
+
+  const adjacent = contentForExploration("region-adjacent", {
+    explorations: [
+      {
+        ...recovery.explorations[0],
+        id: "region-adjacent",
+        state: {
+          ...recovery.explorations[0].state,
+          region: {
+            ...recovery.explorations[0].state.region,
+            id: "region-adjacent",
+            bounds: {
+              ...recovery.explorations[0].state.region.bounds,
+              minX:
+                recovery.explorations[0].state.region.bounds
+                  .maxXExclusive,
+              maxXExclusive:
+                recovery.explorations[0].state.region.bounds
+                  .maxXExclusive + 2048,
+            },
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(mergeMatchingWorkspaceProgress(current, adjacent), null);
 });
 
 test("workspace ETags are strong, canonical, and bounded", () => {
@@ -387,6 +495,192 @@ test("legacy multi-session write archives the source and commits one canonical s
       (
         await readdir(store.migrationBackupDirectory)
       ).filter((name) => name.startsWith("single-session-")).length,
+      1,
+    );
+  });
+});
+
+test("replacing the canonical session archives the previous workspace", async () => {
+  await withTemporaryBacking(async (backingRoot) => {
+    const store = new LocalAtlasWorkspaceStore(backingRoot);
+    const empty = await store.read();
+    const first = await store.write(
+      contentForExploration("region-a"),
+      empty.workspace,
+      randomUUID(),
+    );
+    const replacementWriteId = randomUUID();
+    const candidate = contentForExploration("region-b");
+
+    const replaced = await store.write(
+      candidate,
+      first.workspace,
+      replacementWriteId,
+    );
+
+    assert.equal(replaced.workspace.activeExplorationId, "region-b");
+    const archiveNames = await readdir(store.replacementBackupDirectory);
+    assert.equal(archiveNames.length, 1);
+    const archiveDirectory = join(
+      store.replacementBackupDirectory,
+      archiveNames[0],
+    );
+    const before = JSON.parse(
+      await readFile(
+        join(archiveDirectory, "workspace-before.json"),
+        "utf8",
+      ),
+    );
+    const archivedCandidate = JSON.parse(
+      await readFile(
+        join(archiveDirectory, "workspace-candidate.json"),
+        "utf8",
+      ),
+    );
+    const manifest = JSON.parse(
+      await readFile(join(archiveDirectory, "manifest.json"), "utf8"),
+    );
+    assert.equal(before.activeExplorationId, "region-a");
+    assert.equal(archivedCandidate.activeExplorationId, "region-b");
+    assert.equal(manifest.reason, "single-session-replacement");
+    assert.equal(manifest.currentSessionId, "region-a");
+    assert.equal(manifest.candidateSessionId, "region-b");
+    assert.equal(manifest.writeId, replacementWriteId);
+  });
+});
+
+test("the store rejects a poorer replacement for the same spatial region", async () => {
+  await withTemporaryBacking(async (backingRoot) => {
+    const store = new LocalAtlasWorkspaceStore(backingRoot);
+    const empty = await store.read();
+    const first = await store.write(
+      contentForExploration("region-rich"),
+      empty.workspace,
+      randomUUID(),
+    );
+    let poorerState = createExplorationState({
+      id: "region-poor",
+      name: "Región reiniciada",
+      bounds: first.workspace.explorations[0].state.region.bounds,
+      lod: 0,
+      scale: 1,
+    });
+    poorerState = withCellReviewed(poorerState, 0);
+    const poorerSerialized = JSON.parse(
+      serializeExplorationState(poorerState),
+    );
+    const candidate = contentForExploration("region-poor", {
+      explorations: [
+        {
+          id: "region-poor",
+          createdAt: NOW,
+          updatedAt: NOW,
+          state: poorerSerialized,
+        },
+      ],
+    });
+
+    await assert.rejects(
+      store.write(candidate, first.workspace, randomUUID()),
+      (error) =>
+        error instanceof AtlasWorkspaceError &&
+        error.code === "WORKSPACE_CONFLICT" &&
+        error.current?.revision === first.workspace.revision,
+    );
+
+    let disjointState = createExplorationState({
+      id: "region-disjoint",
+      name: "Región con conteo equivalente",
+      bounds: first.workspace.explorations[0].state.region.bounds,
+      lod: 0,
+      scale: 1,
+    });
+    disjointState = withCellReviewed(disjointState, 2);
+    disjointState = withCellReviewed(disjointState, 4);
+    const disjointCandidate = contentForExploration(
+      "region-disjoint",
+      {
+        explorations: [
+          {
+            id: "region-disjoint",
+            createdAt: NOW,
+            updatedAt: NOW,
+            state: JSON.parse(
+              serializeExplorationState(disjointState),
+            ),
+          },
+        ],
+      },
+    );
+    await assert.rejects(
+      store.write(disjointCandidate, first.workspace, randomUUID()),
+      (error) =>
+        error instanceof AtlasWorkspaceError &&
+        error.code === "WORKSPACE_CONFLICT",
+    );
+
+    const reread = await store.read();
+    assert.equal(reread.workspace.activeExplorationId, "region-rich");
+    assert.equal(
+      reread.workspace.explorations[0].state.reviewedCount,
+      first.workspace.explorations[0].state.reviewedCount,
+    );
+    await assert.rejects(
+      readdir(store.replacementBackupDirectory),
+      (error) => error.code === "ENOENT",
+    );
+  });
+});
+
+test("updating the same canonical session does not create a replacement archive", async () => {
+  await withTemporaryBacking(async (backingRoot) => {
+    const store = new LocalAtlasWorkspaceStore(backingRoot);
+    const empty = await store.read();
+    const first = await store.write(
+      contentForExploration("region-a"),
+      empty.workspace,
+      randomUUID(),
+    );
+
+    await store.write(
+      contentForExploration("region-a", { highlights: [] }),
+      first.workspace,
+      randomUUID(),
+    );
+
+    await assert.rejects(
+      readdir(store.replacementBackupDirectory),
+      (error) => error.code === "ENOENT",
+    );
+  });
+});
+
+test("an idempotent replacement retry does not duplicate its archive", async () => {
+  await withTemporaryBacking(async (backingRoot) => {
+    const store = new LocalAtlasWorkspaceStore(backingRoot);
+    const empty = await store.read();
+    const first = await store.write(
+      contentForExploration("region-a"),
+      empty.workspace,
+      randomUUID(),
+    );
+    const candidate = contentForExploration("region-b");
+    const replacementWriteId = randomUUID();
+    const replaced = await store.write(
+      candidate,
+      first.workspace,
+      replacementWriteId,
+    );
+
+    const retried = await store.write(
+      candidate,
+      first.workspace,
+      replacementWriteId,
+    );
+
+    assert.deepEqual(retried.workspace, replaced.workspace);
+    assert.equal(
+      (await readdir(store.replacementBackupDirectory)).length,
       1,
     );
   });

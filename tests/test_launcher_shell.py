@@ -136,7 +136,9 @@ class LocalAtlasLauncherContractTests(unittest.TestCase):
             self.assertNotIn("sparsebundle", function_body)
             self.assertNotIn("ensure_external_tile_volume", function_body)
 
-    def test_readiness_requires_local_atlas_capacity_contract(self) -> None:
+    def test_readiness_requires_api_capacity_and_rendered_html_shell(
+        self,
+    ) -> None:
         endpoint = self.position(
             '"${viewer_url}/api/local-atlas/status"'
         )
@@ -159,6 +161,93 @@ class LocalAtlasLauncherContractTests(unittest.TestCase):
         self.assertIn(
             'response.headers.get("Cache-Control") != "no-store"',
             self.source,
+        )
+        ui_probe = self.position("bridge_ui_is_ready() {")
+        ui_endpoint = self.position('"${viewer_url}/"')
+        html_type = self.position(
+            'response.headers.get_content_type() != "text/html"'
+        )
+        product_marker = self.position(
+            'b"OBSIDIAN ATLAS" not in body.upper()'
+        )
+        combined_probe = self.position("bridge_is_ready() {")
+        combined_contract = self.position(
+            "bridge_api_is_ready && bridge_ui_is_ready"
+        )
+        self.assertLess(endpoint, ui_probe)
+        self.assertLess(ui_probe, ui_endpoint)
+        self.assertLess(ui_endpoint, html_type)
+        self.assertLess(html_type, product_marker)
+        self.assertLess(product_marker, combined_probe)
+        self.assertLess(combined_probe, combined_contract)
+
+    def test_supervisor_restarts_split_brain_dev_runtime(self) -> None:
+        serve_start = self.position("serve_loop() {")
+        serve_end = self.position("\nstart_viewer() {")
+        serve_body = self.source[serve_start:serve_end]
+        api_probe = serve_body.index("if bridge_api_is_ready; then")
+        ui_probe = serve_body.index("if bridge_ui_is_ready; then")
+        threshold = serve_body.index(
+            "health_failures >= health_failure_threshold"
+        )
+        termination = serve_body.index(
+            'kill -TERM "${child_pid}"',
+            threshold,
+        )
+        wait_child = serve_body.index('wait "${child_pid}"', termination)
+        self.assertLess(api_probe, ui_probe)
+        self.assertLess(ui_probe, threshold)
+        self.assertLess(threshold, termination)
+        self.assertLess(termination, wait_child)
+        self.assertIn("health_startup_grace_seconds=60", self.source)
+        self.assertIn("health_failure_threshold=3", self.source)
+        self.assertIn(
+            'health_failures=0\n    health_failure_reason=""',
+            serve_body,
+        )
+        self.assertIn(
+            'health_failures=0\n          health_failure_reason=""',
+            serve_body,
+        )
+        self.assertIn(
+            'health_failure_reason="El API local no respondió"',
+            serve_body,
+        )
+        self.assertIn(
+            "fallos persistentes de salud",
+            serve_body,
+        )
+
+    def test_startup_uses_a_real_cold_compile_deadline(self) -> None:
+        start = self.position("start_viewer() {")
+        end = self.position("\nshow_status() {")
+        body = self.source[start:end]
+        deadline = body.index(
+            "startup_deadline=$((SECONDS + startup_timeout_seconds))"
+        )
+        loop = body.index("while (( SECONDS < startup_deadline )); do")
+        timeout_message = body.index(
+            "no respondió en ${startup_timeout_seconds} segundos"
+        )
+        self.assertLess(deadline, loop)
+        self.assertLess(loop, timeout_message)
+        self.assertIn("startup_timeout_seconds=120", self.source)
+        self.assertNotIn("attempt < 45", body)
+
+    def test_stop_requires_both_api_and_ui_to_be_gone(self) -> None:
+        start = self.position("stop_viewer() {")
+        body = self.source[start:]
+        self.assertGreaterEqual(
+            body.count("! bridge_api_is_ready &&"),
+            2,
+        )
+        self.assertGreaterEqual(
+            body.count("! bridge_ui_is_ready; then"),
+            2,
+        )
+        self.assertIn(
+            "if bridge_api_is_ready || bridge_ui_is_ready; then",
+            body,
         )
 
     def test_legacy_full_download_progress_contract_is_absent(self) -> None:

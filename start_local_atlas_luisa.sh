@@ -19,12 +19,17 @@ backing_root="/Volumes/LuisA"
 if [[ -n "${OBSIDIAN_ATLAS_BACKING_ROOT:-}" ]]; then
   backing_root="${OBSIDIAN_ATLAS_BACKING_ROOT}"
 fi
+minecraft_root="${OBSIDIAN_ATLAS_MINECRAFT_ROOT:-/Users/luisalvarado/Library/Application Support/minecraft}"
 runtime_dir="/Users/luisalvarado/Library/Application Support/ObsidianAtlas"
 log_file="${runtime_dir}/local_atlas.log"
 lock_file="${runtime_dir}/.local_atlas.lock"
 lock_guard="${lock_file}.guard"
 session_name="obsidian_atlas_local"
 viewer_port="${OBSIDIAN_ATLAS_VIEWER_PORT:-3001}"
+health_poll_seconds=15
+health_startup_grace_seconds=60
+health_failure_threshold=3
+startup_timeout_seconds=120
 python_bin="${PYTHON_BIN:-}"
 if [[ -z "${python_bin}" ]]; then
   python_bin=$(command -v python3 || true)
@@ -75,7 +80,7 @@ supervisor_pid() {
   esac
 }
 
-bridge_is_ready() {
+bridge_api_is_ready() {
   "${python_bin}" - "${viewer_url}/api/local-atlas/status" <<'PY' >/dev/null 2>&1
 import json
 import math
@@ -120,6 +125,33 @@ if any(
 if not isinstance(capacity.get("fits"), bool):
     raise SystemExit(1)
 PY
+}
+
+bridge_ui_is_ready() {
+  "${python_bin}" - "${viewer_url}/" <<'PY' >/dev/null 2>&1
+import sys
+import urllib.request
+
+request = urllib.request.Request(
+    sys.argv[1],
+    headers={"Accept": "text/html"},
+)
+with urllib.request.urlopen(request, timeout=5) as response:
+    if response.status != 200:
+        raise SystemExit(1)
+    if response.headers.get_content_type() != "text/html":
+        raise SystemExit(1)
+    body = response.read(2 * 1024 * 1024 + 1)
+
+if len(body) > 2 * 1024 * 1024:
+    raise SystemExit(1)
+if b"OBSIDIAN ATLAS" not in body.upper():
+    raise SystemExit(1)
+PY
+}
+
+bridge_is_ready() {
+  bridge_api_is_ready && bridge_ui_is_ready
 }
 
 validate_commands() {
@@ -195,6 +227,10 @@ validate_environment() {
   fi
   if [[ ! -d "${backing_root}" || ! -r "${backing_root}" ]]; then
     echo "La unidad LuisA no está disponible: ${backing_root}" >&2
+    exit 1
+  fi
+  if [[ ! -d "${minecraft_root}" || ! -r "${minecraft_root}" ]]; then
+    echo "La carpeta de Minecraft no está disponible: ${minecraft_root}" >&2
     exit 1
   fi
   if [[ "${regional_tile_root}" == "${tile_root}" ]]; then
@@ -294,6 +330,8 @@ serve_loop() {
   local started_at=0
   local runtime=0
   local stop_requested=0
+  local health_failures=0
+  local health_failure_reason=""
 
   exec >>"${log_file}" 2>&1
   acquire_lock
@@ -330,12 +368,50 @@ serve_loop() {
       export OBSIDIAN_ATLAS_TILE_ROOT="${tile_root}"
       export OBSIDIAN_ATLAS_REGIONAL_TILE_ROOT="${regional_tile_root}"
       export OBSIDIAN_ATLAS_BACKING_ROOT="${backing_root}"
+      export OBSIDIAN_ATLAS_MINECRAFT_ROOT="${minecraft_root}"
       export OBSIDIAN_ATLAS_PYTHON="${python_bin}"
       exec npm run dev -- \
         --hostname localhost \
         --port "${viewer_port}"
     ) &
     child_pid=$!
+
+    health_failures=0
+    health_failure_reason=""
+    while kill -0 "${child_pid}" 2>/dev/null; do
+      sleep "${health_poll_seconds}"
+      if (( stop_requested != 0 )); then
+        break
+      fi
+      runtime=$(( $(date +%s) - started_at ))
+      if (( runtime < health_startup_grace_seconds )); then
+        continue
+      fi
+      if bridge_api_is_ready; then
+        if bridge_ui_is_ready; then
+          health_failures=0
+          health_failure_reason=""
+        else
+          health_failure_reason="API local activa, pero la interfaz falló"
+        fi
+      else
+        health_failure_reason="El API local no respondió"
+      fi
+      if [[ -n "${health_failure_reason}" ]]; then
+        health_failures=$((health_failures + 1))
+        printf '%s %s (%s/%s).\n' \
+          "$(date '+%Y-%m-%d %H:%M:%S')" \
+          "${health_failure_reason}" \
+          "${health_failures}" \
+          "${health_failure_threshold}"
+      fi
+      if (( health_failures >= health_failure_threshold )); then
+        printf '%s Reiniciando el visor tras fallos persistentes de salud.\n' \
+          "$(date '+%Y-%m-%d %H:%M:%S')"
+        kill -TERM "${child_pid}" 2>/dev/null || true
+        break
+      fi
+    done
 
     set +e
     wait "${child_pid}"
@@ -370,6 +446,7 @@ start_viewer() {
   local attempt=0
   local session_seen=0
   local owner_pid=""
+  local startup_deadline=0
 
   validate_environment
   if bridge_is_ready; then
@@ -391,7 +468,8 @@ start_viewer() {
     echo "Iniciando Obsidian Atlas en segundo plano…"
   fi
 
-  while (( attempt < 45 )); do
+  startup_deadline=$((SECONDS + startup_timeout_seconds))
+  while (( SECONDS < startup_deadline )); do
     owner_pid=$(supervisor_pid || true)
     if [[ -n "${owner_pid}" ]] && screen_has_session && bridge_is_ready; then
       echo "Obsidian Atlas está disponible en ${viewer_url}"
@@ -409,7 +487,7 @@ start_viewer() {
     attempt=$((attempt + 1))
   done
 
-  echo "El visor no respondió en 45 segundos; revisa ${log_file}." >&2
+  echo "El visor no respondió en ${startup_timeout_seconds} segundos; revisa ${log_file}." >&2
   return 1
 }
 
@@ -446,7 +524,8 @@ stop_viewer() {
   if [[ -z "${owner_pid}" ]] &&
     [[ ! -e "${lock_file}" ]] &&
     ! screen_has_session &&
-    ! bridge_is_ready; then
+    ! bridge_api_is_ready &&
+    ! bridge_ui_is_ready; then
     echo "Obsidian Atlas ya está detenido."
     return 0
   fi
@@ -472,7 +551,8 @@ stop_viewer() {
     if ! screen_has_session &&
       [[ ! -e "${lock_file}" ]] &&
       [[ -z "$(supervisor_pid || true)" ]] &&
-      ! bridge_is_ready; then
+      ! bridge_api_is_ready &&
+      ! bridge_ui_is_ready; then
       echo "Obsidian Atlas detenido."
       return 0
     fi
@@ -480,7 +560,7 @@ stop_viewer() {
     attempt=$((attempt + 1))
   done
 
-  if bridge_is_ready; then
+  if bridge_api_is_ready || bridge_ui_is_ready; then
     echo "El servidor del visor sigue respondiendo tras detenerlo." >&2
   elif screen_has_session; then
     echo "La sesión ${session_name} no terminó limpiamente." >&2

@@ -7,6 +7,7 @@ import {
   parseCoverageSelection,
   type OverworldCoverageSelection,
 } from "./overworld-coverage.ts";
+import { isHighlightRegionKey } from "./highlights.ts";
 
 export const LOCAL_ATLAS_WORKSPACE_SCHEMA_VERSION = 1 as const;
 const MAX_REGION_REQUESTS_PER_SECOND = 16;
@@ -154,6 +155,62 @@ export interface LocalAtlasRuntime {
   readonly job: LocalRegionJob | null;
 }
 
+export interface LocalAtlasXaeroDimensionSummary {
+  readonly existing: number;
+  readonly added: number;
+  readonly updated: number;
+  readonly unchanged: number;
+  readonly removed: number;
+  readonly alreadyAbsent: number;
+  readonly conflicts: number;
+  readonly final: number;
+}
+
+export type LocalAtlasXaeroOperation = "export" | "remove";
+
+export type LocalAtlasXaeroScope =
+  | { readonly kind: "all" }
+  | {
+      readonly kind: "exploration";
+      readonly explorationId: string;
+    };
+
+export interface LocalAtlasXaeroRequest {
+  readonly operation: LocalAtlasXaeroOperation;
+  readonly scope: LocalAtlasXaeroScope;
+}
+
+export interface LocalAtlasXaeroPreview {
+  readonly version: 1;
+  readonly previewId: string;
+  readonly workspaceId: string;
+  readonly workspaceRevision: number;
+  readonly operation: LocalAtlasXaeroOperation;
+  readonly scope: LocalAtlasXaeroScope["kind"];
+  readonly explorationId: string | null;
+  readonly regionName: string | null;
+  readonly minecraftOpen: boolean;
+  readonly canExport: boolean;
+  readonly hasChanges: boolean;
+  readonly sourceHighlights: number;
+  readonly exportableHighlights: number;
+  readonly selectedHighlights: number;
+  readonly managedHighlights: number;
+  readonly removableHighlights: number;
+  readonly skippedAreas: number;
+  readonly notesNotExported: number;
+  readonly duplicateNames: number;
+  readonly conflicts: number;
+  readonly overworld: LocalAtlasXaeroDimensionSummary;
+  readonly nether: LocalAtlasXaeroDimensionSummary;
+}
+
+export interface LocalAtlasXaeroResult extends LocalAtlasXaeroPreview {
+  readonly committed: true;
+  readonly exportedAt: string;
+  readonly backupId: string;
+}
+
 export function isCompletedBaseCellRequest(
   job: LocalRegionJob | null,
   bounds: WorldBounds,
@@ -236,6 +293,7 @@ export interface LocalAtlasWorkspaceHighlight {
   readonly title: string;
   readonly note: string;
   readonly color: string;
+  readonly regionKey?: string | null;
   readonly x: number;
   readonly z: number;
   readonly bounds?: {
@@ -376,6 +434,11 @@ function readWorkspaceHighlight(
     value.note.length > 20_000 ||
     typeof value.color !== "string" ||
     !/^#[0-9a-f]{6}$/i.test(value.color) ||
+    !(
+      value.regionKey === undefined ||
+      value.regionKey === null ||
+      isHighlightRegionKey(value.regionKey)
+    ) ||
     !safeMapCoordinate(value.x) ||
     !safeMapCoordinate(value.z) ||
     typeof value.visible !== "boolean" ||
@@ -409,6 +472,9 @@ function readWorkspaceHighlight(
     title: value.title,
     note: value.note,
     color: value.color.toLowerCase(),
+    ...(value.regionKey !== undefined
+      ? { regionKey: value.regionKey as string | null }
+      : {}),
     x: value.x,
     z: value.z,
     ...(bounds ? { bounds } : {}),
@@ -507,6 +573,7 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
       "tilesPerSecond",
       "bytesPerSecond",
     ] as const;
+    const rawProgress = value.progress as Record<string, unknown>;
     const effectiveRps = value.progress.effectiveRps;
     const targetRps = value.progress.targetRps;
     const cooldownSeconds = value.progress.cooldownSeconds;
@@ -520,7 +587,7 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
       (value.progress.requestAttempts !== undefined &&
         !nonNegativeSafeInteger(value.progress.requestAttempts)) ||
       optionalFiniteMetrics.some((key) => {
-        const metric = value.progress[key];
+        const metric = rawProgress[key];
         return (
           metric !== undefined &&
           (typeof metric !== "number" ||
@@ -571,17 +638,17 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
             metric < 0 ||
             metric > Number.MAX_SAFE_INTEGER),
       ) ||
-      (value.progress.tilesPerSecond !== undefined &&
-        resolvedPerSecond !== undefined &&
+      (typeof value.progress.tilesPerSecond === "number" &&
+        typeof resolvedPerSecond === "number" &&
         Math.abs(
           value.progress.tilesPerSecond - resolvedPerSecond,
         ) > RATE_METRIC_TOLERANCE) ||
-      (resolvedPerSecond !== undefined &&
-        networkTilesPerSecond !== undefined &&
+      (typeof resolvedPerSecond === "number" &&
+        typeof networkTilesPerSecond === "number" &&
         networkTilesPerSecond >
           resolvedPerSecond + RATE_METRIC_TOLERANCE) ||
-      (achievedRps !== undefined &&
-        networkTilesPerSecond !== undefined &&
+      (typeof achievedRps === "number" &&
+        typeof networkTilesPerSecond === "number" &&
         networkTilesPerSecond > achievedRps + RATE_METRIC_TOLERANCE) ||
       (value.progress.etaSeconds !== undefined &&
         value.progress.etaSeconds !== null &&
@@ -591,58 +658,60 @@ function readJob(value: unknown): LocalRegionJob | null | undefined {
     ) {
       return undefined;
     }
+    const parsedProgress =
+      value.progress as unknown as LocalRegionJobProgress;
     progress = {
-      requested: value.progress.requested,
-      processed: value.progress.processed,
-      complete: value.progress.complete,
-      absent: value.progress.absent,
-      failed: value.progress.failed,
-      reused: value.progress.reused,
-      reusedAbsent: value.progress.reusedAbsent,
-      downloadedBytes: value.progress.downloadedBytes,
-      percent: value.progress.percent,
-      status: value.progress.status,
-      ...(value.progress.requestAttempts !== undefined
-        ? { requestAttempts: value.progress.requestAttempts }
+      requested: parsedProgress.requested,
+      processed: parsedProgress.processed,
+      complete: parsedProgress.complete,
+      absent: parsedProgress.absent,
+      failed: parsedProgress.failed,
+      reused: parsedProgress.reused,
+      reusedAbsent: parsedProgress.reusedAbsent,
+      downloadedBytes: parsedProgress.downloadedBytes,
+      percent: parsedProgress.percent,
+      status: parsedProgress.status,
+      ...(parsedProgress.requestAttempts !== undefined
+        ? { requestAttempts: parsedProgress.requestAttempts }
         : {}),
-      ...(value.progress.elapsedSeconds !== undefined
-        ? { elapsedSeconds: value.progress.elapsedSeconds }
+      ...(parsedProgress.elapsedSeconds !== undefined
+        ? { elapsedSeconds: parsedProgress.elapsedSeconds }
         : {}),
-      ...(value.progress.tilesPerSecond !== undefined
-        ? { tilesPerSecond: value.progress.tilesPerSecond }
+      ...(parsedProgress.tilesPerSecond !== undefined
+        ? { tilesPerSecond: parsedProgress.tilesPerSecond }
         : {}),
-      ...(value.progress.bytesPerSecond !== undefined
-        ? { bytesPerSecond: value.progress.bytesPerSecond }
+      ...(parsedProgress.bytesPerSecond !== undefined
+        ? { bytesPerSecond: parsedProgress.bytesPerSecond }
         : {}),
-      ...(value.progress.etaSeconds !== undefined
-        ? { etaSeconds: value.progress.etaSeconds }
+      ...(parsedProgress.etaSeconds !== undefined
+        ? { etaSeconds: parsedProgress.etaSeconds }
         : {}),
-      ...(value.progress.effectiveRps !== undefined
-        ? { effectiveRps: value.progress.effectiveRps }
+      ...(parsedProgress.effectiveRps !== undefined
+        ? { effectiveRps: parsedProgress.effectiveRps }
         : {}),
-      ...(value.progress.targetRps !== undefined
-        ? { targetRps: value.progress.targetRps }
+      ...(parsedProgress.targetRps !== undefined
+        ? { targetRps: parsedProgress.targetRps }
         : {}),
-      ...(value.progress.cooldownSeconds !== undefined
-        ? { cooldownSeconds: value.progress.cooldownSeconds }
+      ...(parsedProgress.cooldownSeconds !== undefined
+        ? { cooldownSeconds: parsedProgress.cooldownSeconds }
         : {}),
-      ...(value.progress.cooldownUntil !== undefined
-        ? { cooldownUntil: value.progress.cooldownUntil }
+      ...(parsedProgress.cooldownUntil !== undefined
+        ? { cooldownUntil: parsedProgress.cooldownUntil }
         : {}),
-      ...(value.progress.networkRequested !== undefined
-        ? { networkRequested: value.progress.networkRequested }
+      ...(parsedProgress.networkRequested !== undefined
+        ? { networkRequested: parsedProgress.networkRequested }
         : {}),
-      ...(value.progress.networkProcessed !== undefined
-        ? { networkProcessed: value.progress.networkProcessed }
+      ...(parsedProgress.networkProcessed !== undefined
+        ? { networkProcessed: parsedProgress.networkProcessed }
         : {}),
-      ...(value.progress.resolvedPerSecond !== undefined
-        ? { resolvedPerSecond: value.progress.resolvedPerSecond }
+      ...(parsedProgress.resolvedPerSecond !== undefined
+        ? { resolvedPerSecond: parsedProgress.resolvedPerSecond }
         : {}),
-      ...(value.progress.networkTilesPerSecond !== undefined
-        ? { networkTilesPerSecond: value.progress.networkTilesPerSecond }
+      ...(parsedProgress.networkTilesPerSecond !== undefined
+        ? { networkTilesPerSecond: parsedProgress.networkTilesPerSecond }
         : {}),
-      ...(value.progress.achievedRps !== undefined
-        ? { achievedRps: value.progress.achievedRps }
+      ...(parsedProgress.achievedRps !== undefined
+        ? { achievedRps: parsedProgress.achievedRps }
         : {}),
     };
   }
@@ -834,6 +903,195 @@ export function parseLocalAtlasRuntime(
           },
     globalDownload,
     job,
+  };
+}
+
+function readXaeroDimensionSummary(
+  value: unknown,
+): LocalAtlasXaeroDimensionSummary | null {
+  if (!isRecord(value)) return null;
+  const fields = [
+    "existing",
+    "added",
+    "updated",
+    "unchanged",
+    "removed",
+    "alreadyAbsent",
+    "conflicts",
+    "final",
+  ] as const;
+  if (
+    fields.some(
+      (field) =>
+        typeof value[field] !== "number" ||
+        !Number.isSafeInteger(value[field]) ||
+        Number(value[field]) < 0,
+    )
+  ) {
+    return null;
+  }
+  const summary = {
+    existing: value.existing as number,
+    added: value.added as number,
+    updated: value.updated as number,
+    unchanged: value.unchanged as number,
+    removed: value.removed as number,
+    alreadyAbsent: value.alreadyAbsent as number,
+    conflicts: value.conflicts as number,
+    final: value.final as number,
+  };
+  if (
+    summary.removed > summary.existing ||
+    summary.final !== summary.existing + summary.added - summary.removed
+  ) {
+    return null;
+  }
+  return summary;
+}
+
+export function parseLocalAtlasXaeroPreview(
+  value: unknown,
+): LocalAtlasXaeroPreview | null {
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    typeof value.previewId !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.previewId) ||
+    typeof value.workspaceId !== "string" ||
+    !LOCAL_ATLAS_UUID_PATTERN.test(value.workspaceId) ||
+    typeof value.workspaceRevision !== "number" ||
+    !Number.isSafeInteger(value.workspaceRevision) ||
+    value.workspaceRevision < 0 ||
+    (value.operation !== "export" && value.operation !== "remove") ||
+    (value.scope !== "all" && value.scope !== "exploration") ||
+    typeof value.minecraftOpen !== "boolean" ||
+    typeof value.canExport !== "boolean" ||
+    typeof value.hasChanges !== "boolean"
+  ) {
+    return null;
+  }
+  const countFields = [
+    "sourceHighlights",
+    "exportableHighlights",
+    "selectedHighlights",
+    "managedHighlights",
+    "removableHighlights",
+    "skippedAreas",
+    "notesNotExported",
+    "duplicateNames",
+    "conflicts",
+  ] as const;
+  if (
+    countFields.some(
+      (field) =>
+        typeof value[field] !== "number" ||
+        !Number.isSafeInteger(value[field]) ||
+        Number(value[field]) < 0,
+    )
+  ) {
+    return null;
+  }
+  const sourceHighlights = value.sourceHighlights as number;
+  const exportableHighlights = value.exportableHighlights as number;
+  const selectedHighlights = value.selectedHighlights as number;
+  const managedHighlights = value.managedHighlights as number;
+  const removableHighlights = value.removableHighlights as number;
+  const skippedAreas = value.skippedAreas as number;
+  const notesNotExported = value.notesNotExported as number;
+  const duplicateNames = value.duplicateNames as number;
+  const conflicts = value.conflicts as number;
+  const overworld = readXaeroDimensionSummary(value.overworld);
+  const nether = readXaeroDimensionSummary(value.nether);
+  const operation = value.operation as LocalAtlasXaeroOperation;
+  const scope = value.scope as LocalAtlasXaeroScope["kind"];
+  const validScopeMetadata =
+    scope === "all"
+      ? value.explorationId === null && value.regionName === null
+      : typeof value.explorationId === "string" &&
+        value.explorationId.length > 0 &&
+        value.explorationId.length <= 200 &&
+        typeof value.regionName === "string" &&
+        value.regionName.trim().length > 0 &&
+        value.regionName.length <= 200;
+  if (
+    !overworld ||
+    !nether ||
+    !validScopeMetadata ||
+    conflicts < Math.max(overworld.conflicts, nether.conflicts) ||
+    conflicts > overworld.conflicts + nether.conflicts ||
+    removableHighlights > managedHighlights ||
+    (operation === "export" &&
+      (selectedHighlights > sourceHighlights ||
+        managedHighlights > selectedHighlights ||
+        overworld.removed !== 0 ||
+        nether.removed !== 0 ||
+        overworld.alreadyAbsent !== 0 ||
+        nether.alreadyAbsent !== 0 ||
+        overworld.added + overworld.updated + overworld.unchanged !==
+          exportableHighlights ||
+        nether.added + nether.updated + nether.unchanged !==
+          exportableHighlights)) ||
+    (operation === "remove" &&
+      (overworld.added !== 0 ||
+        nether.added !== 0 ||
+        overworld.removed > managedHighlights ||
+        nether.removed > managedHighlights ||
+        overworld.alreadyAbsent > managedHighlights ||
+        nether.alreadyAbsent > managedHighlights)) ||
+    notesNotExported > sourceHighlights ||
+    duplicateNames > sourceHighlights ||
+    (value.minecraftOpen && value.canExport) ||
+    (!value.hasChanges && value.canExport)
+  ) {
+    return null;
+  }
+  return {
+    version: 1,
+    previewId: value.previewId,
+    workspaceId: value.workspaceId,
+    workspaceRevision: value.workspaceRevision,
+    operation,
+    scope,
+    explorationId:
+      scope === "exploration" ? (value.explorationId as string) : null,
+    regionName: scope === "exploration" ? (value.regionName as string) : null,
+    minecraftOpen: value.minecraftOpen,
+    canExport: value.canExport,
+    hasChanges: value.hasChanges,
+    sourceHighlights,
+    exportableHighlights,
+    selectedHighlights,
+    managedHighlights,
+    removableHighlights,
+    skippedAreas,
+    notesNotExported,
+    duplicateNames,
+    conflicts,
+    overworld,
+    nether,
+  };
+}
+
+export function parseLocalAtlasXaeroResult(
+  value: unknown,
+): LocalAtlasXaeroResult | null {
+  const preview = parseLocalAtlasXaeroPreview(value);
+  if (
+    !preview ||
+    !isRecord(value) ||
+    value.committed !== true ||
+    !canonicalTimestamp(value.exportedAt) ||
+    typeof value.backupId !== "string" ||
+    value.backupId.length < 36 ||
+    value.backupId.length > 100
+  ) {
+    return null;
+  }
+  return {
+    ...preview,
+    committed: true,
+    exportedAt: value.exportedAt,
+    backupId: value.backupId,
   };
 }
 
@@ -1220,6 +1478,138 @@ export async function readLocalAtlasWorkspace(
     throw new Error("La revisión del workspace no coincide con su ETag");
   }
   return workspace;
+}
+
+export async function readLocalAtlasXaeroPreview(
+  request: LocalAtlasXaeroRequest = {
+    operation: "export",
+    scope: { kind: "all" },
+  },
+  signal?: AbortSignal,
+): Promise<LocalAtlasXaeroPreview> {
+  const query = new URLSearchParams({
+    operation: request.operation,
+    scope: request.scope.kind,
+  });
+  if (request.scope.kind === "exploration") {
+    query.set("explorationId", request.scope.explorationId);
+  }
+  const response = await fetch(
+    `/api/local-atlas/xaero-export/preview?${query}`,
+    {
+      cache: "no-store",
+      signal,
+    },
+  );
+  const payload = (await response.json().catch(() => null)) as unknown;
+  if (!response.ok) {
+    throw new Error(
+      isRecord(payload) && typeof payload.error === "string"
+        ? payload.error
+        : "No se pudo previsualizar la exportación a Xaero",
+    );
+  }
+  const preview = parseLocalAtlasXaeroPreview(payload);
+  if (!preview) {
+    throw new Error("El runtime devolvió una previsualización Xaero inválida");
+  }
+  if (
+    response.headers.get("ETag") !==
+    `"atlas-${preview.workspaceId}-${preview.workspaceRevision}"`
+  ) {
+    throw new Error(
+      "La previsualización Xaero no coincide con la revisión de LuisA",
+    );
+  }
+  if (
+    preview.operation !== request.operation ||
+    preview.scope !== request.scope.kind ||
+    (request.scope.kind === "exploration" &&
+      preview.explorationId !== request.scope.explorationId)
+  ) {
+    throw new Error(
+      "La previsualización Xaero no coincide con el alcance solicitado",
+    );
+  }
+  return preview;
+}
+
+export async function applyLocalAtlasXaeroPreview(
+  runtime: LocalAtlasRuntime,
+  preview: LocalAtlasXaeroPreview,
+  signal?: AbortSignal,
+): Promise<LocalAtlasXaeroResult> {
+  const writeId = crypto.randomUUID();
+  const send = () =>
+    fetch("/api/local-atlas/xaero-export", {
+      method: "POST",
+      cache: "no-store",
+      signal,
+      headers: {
+        "Content-Type": "application/json",
+        "If-Match": `"atlas-${preview.workspaceId}-${preview.workspaceRevision}"`,
+        "X-Atlas-Token": runtime.mutationToken,
+        "X-Atlas-Write-Id": writeId,
+      },
+      body: JSON.stringify({
+        previewId: preview.previewId,
+        operation: preview.operation,
+        scope: preview.scope,
+        ...(preview.explorationId
+          ? { explorationId: preview.explorationId }
+          : {}),
+      }),
+    });
+  let response: Response;
+  try {
+    response = await send();
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    // A lost HTTP response must not make a second click duplicate waypoints.
+    // The server persists this write ID with the committed manifest.
+    response = await send();
+  }
+  const payload = (await response.json().catch(() => null)) as unknown;
+  if (!response.ok) {
+    throw new Error(
+      isRecord(payload) && typeof payload.error === "string"
+        ? payload.error
+        : preview.operation === "remove"
+          ? "No se pudieron retirar los marcadores Atlas de Xaero"
+          : "No se pudo exportar a Xaero",
+    );
+  }
+  const result = parseLocalAtlasXaeroResult(payload);
+  if (!result) {
+    throw new Error("El runtime devolvió un resultado Xaero inválido");
+  }
+  if (
+    response.headers.get("ETag") !==
+    `"atlas-${result.workspaceId}-${result.workspaceRevision}"`
+  ) {
+    throw new Error("El resultado Xaero no coincide con la revisión de LuisA");
+  }
+  if (
+    result.operation !== preview.operation ||
+    result.scope !== preview.scope ||
+    result.explorationId !== preview.explorationId
+  ) {
+    throw new Error(
+      "El resultado Xaero no coincide con la operación previsualizada",
+    );
+  }
+  return result;
+}
+
+export async function exportLocalAtlasHighlightsToXaero(
+  runtime: LocalAtlasRuntime,
+  preview: LocalAtlasXaeroPreview,
+  signal?: AbortSignal,
+): Promise<LocalAtlasXaeroResult> {
+  if (preview.operation !== "export") {
+    throw new Error("La previsualización no corresponde a una exportación");
+  }
+  return applyLocalAtlasXaeroPreview(runtime, preview, signal);
 }
 
 export async function writeLocalAtlasWorkspace(

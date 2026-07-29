@@ -24,6 +24,7 @@ import {
   parseCoverageSelection,
   type OverworldCoverageSelection,
 } from "../app/lib/overworld-coverage.ts";
+import { isHighlightRegionKey } from "../app/lib/highlights.ts";
 import { consolidateSingleWorkspaceContent } from "../app/lib/single-workspace-session.ts";
 
 export const ATLAS_WORKSPACE_SCHEMA_VERSION = 1 as const;
@@ -89,6 +90,7 @@ export interface AtlasWorkspaceHighlight {
   readonly title: string;
   readonly note: string;
   readonly color: string;
+  readonly regionKey?: string | null;
   readonly x: number;
   readonly z: number;
   readonly bounds?: {
@@ -356,6 +358,18 @@ function canonicalHighlight(value: unknown): AtlasWorkspaceHighlight {
       "INVALID_WORKSPACE",
     );
   }
+  if (
+    !(
+      value.regionKey === undefined ||
+      value.regionKey === null ||
+      isHighlightRegionKey(value.regionKey)
+    )
+  ) {
+    throw new AtlasWorkspaceError(
+      "La región del highlight no es válida",
+      "INVALID_WORKSPACE",
+    );
+  }
   if (typeof value.visible !== "boolean") {
     throw new AtlasWorkspaceError(
       "La visibilidad de highlight no es válida",
@@ -383,6 +397,9 @@ function canonicalHighlight(value: unknown): AtlasWorkspaceHighlight {
       { allowNewlines: true },
     ),
     color: value.color.toLowerCase(),
+    ...(value.regionKey !== undefined
+      ? { regionKey: value.regionKey as string | null }
+      : {}),
     x: safeMapCoordinate(value.x, "highlight.x"),
     z: safeMapCoordinate(value.z, "highlight.z"),
     visible: value.visible,
@@ -585,6 +602,46 @@ function documentContent(
   };
 }
 
+function sameExplorationRegion(
+  left: AtlasWorkspaceExploration,
+  right: AtlasWorkspaceExploration,
+): boolean {
+  const leftBounds = left.state.region.bounds;
+  const rightBounds = right.state.region.bounds;
+  return (
+    left.state.dimension === right.state.dimension &&
+    left.state.region.lod === right.state.region.lod &&
+    leftBounds.minX === rightBounds.minX &&
+    leftBounds.minZ === rightBounds.minZ &&
+    leftBounds.maxXExclusive === rightBounds.maxXExclusive &&
+    leftBounds.maxZExclusive === rightBounds.maxZExclusive
+  );
+}
+
+function reviewProgressWouldRegress(
+  current: AtlasWorkspaceDocument,
+  candidate: AtlasWorkspaceContent,
+): boolean {
+  const currentExploration = current.explorations[0];
+  const candidateExploration = candidate.explorations[0];
+  if (
+    !currentExploration ||
+    !candidateExploration ||
+    !sameExplorationRegion(currentExploration, candidateExploration)
+  ) {
+    return false;
+  }
+  const currentState = deserializeExplorationState(
+    JSON.stringify(currentExploration.state),
+  );
+  const candidateState = deserializeExplorationState(
+    JSON.stringify(candidateExploration.state),
+  );
+  return currentState.reviewed.some(
+    (byte, index) => (byte & ~candidateState.reviewed[index]) !== 0,
+  );
+}
+
 function pathIsInside(parent: string, child: string): boolean {
   const childRelative = relative(parent, child);
   return (
@@ -603,6 +660,7 @@ export class LocalAtlasWorkspaceStore {
   readonly backingRoot: string;
   readonly stateDirectory: string;
   readonly migrationBackupDirectory: string;
+  readonly replacementBackupDirectory: string;
   readonly workspacePath: string;
   readonly backupPath: string;
   readonly lockPath: string;
@@ -629,6 +687,10 @@ export class LocalAtlasWorkspaceStore {
       this.backingRoot,
       ...ATLAS_WORKSPACE_BACKUP_RELATIVE_DIRECTORY,
     );
+    this.replacementBackupDirectory = resolve(
+      this.migrationBackupDirectory,
+      "workspace-replacements",
+    );
     if (!pathIsInside(this.backingRoot, this.stateDirectory)) {
       throw new AtlasWorkspaceError(
         "La ruta de estado sale de LuisA",
@@ -638,6 +700,17 @@ export class LocalAtlasWorkspaceStore {
     if (!pathIsInside(this.backingRoot, this.migrationBackupDirectory)) {
       throw new AtlasWorkspaceError(
         "La ruta de respaldos sale de LuisA",
+        "UNSAFE_WORKSPACE_PATH",
+      );
+    }
+    if (
+      !pathIsInside(
+        this.migrationBackupDirectory,
+        this.replacementBackupDirectory,
+      )
+    ) {
+      throw new AtlasWorkspaceError(
+        "La ruta de reemplazos sale de los respaldos",
         "UNSAFE_WORKSPACE_PATH",
       );
     }
@@ -756,6 +829,13 @@ export class LocalAtlasWorkspaceStore {
             { current },
           );
         }
+        if (reviewProgressWouldRegress(current, canonicalContent)) {
+          throw new AtlasWorkspaceError(
+            "La escritura intentó reducir el avance de la misma región; reanuda la sesión guardada",
+            "WORKSPACE_CONFLICT",
+            { current },
+          );
+        }
 
         if (
           current.explorations.length >
@@ -767,6 +847,27 @@ export class LocalAtlasWorkspaceStore {
             current,
             legacyContent,
             canonicalContent,
+          );
+        }
+        const currentSessionId =
+          current.explorations.length === 1
+            ? current.explorations[0].id
+            : null;
+        const candidateSessionId =
+          canonicalContent.explorations.length === 1
+            ? canonicalContent.explorations[0].id
+            : null;
+        if (
+          currentSessionId !== null &&
+          candidateSessionId !== null &&
+          currentSessionId !== candidateSessionId
+        ) {
+          await this.archiveWorkspaceReplacement(
+            current,
+            legacyContent,
+            currentSessionId,
+            candidateSessionId,
+            writeId,
           );
         }
 
@@ -887,6 +988,38 @@ export class LocalAtlasWorkspaceStore {
     }
   }
 
+  private async ensureReplacementBackupDirectory(): Promise<void> {
+    await this.ensureMigrationBackupDirectory();
+    try {
+      const metadata = await lstat(this.replacementBackupDirectory);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        throw new AtlasWorkspaceError(
+          "La ruta de reemplazos contiene un enlace o archivo inseguro",
+          "UNSAFE_WORKSPACE_PATH",
+        );
+      }
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+      try {
+        await mkdir(this.replacementBackupDirectory, { mode: 0o700 });
+      } catch (mkdirError) {
+        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") {
+          throw mkdirError;
+        }
+      }
+    }
+    const backupRealPath = await realpath(this.migrationBackupDirectory);
+    const replacementRealPath = await realpath(
+      this.replacementBackupDirectory,
+    );
+    if (!pathIsInside(backupRealPath, replacementRealPath)) {
+      throw new AtlasWorkspaceError(
+        "La ruta de reemplazos no pertenece a los respaldos",
+        "UNSAFE_WORKSPACE_PATH",
+      );
+    }
+  }
+
   private async writeMigrationArchiveFile(
     directory: string,
     name: string,
@@ -905,6 +1038,61 @@ export class LocalAtlasWorkspaceStore {
       await handle.sync();
     } finally {
       await handle.close();
+    }
+  }
+
+  private async writeWorkspaceReplacementArchiveFile(
+    directory: string,
+    name: string,
+    value: unknown,
+  ): Promise<void> {
+    const serialized = `${JSON.stringify(value, null, 2)}\n`;
+    try {
+      await this.writeMigrationArchiveFile(directory, name, value);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const path = resolve(directory, name);
+    const metadata = await lstat(path);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new AtlasWorkspaceError(
+        "El respaldo de reemplazo contiene un destino inseguro",
+        "UNSAFE_WORKSPACE_PATH",
+      );
+    }
+    if ((await readFile(path, "utf8")) !== serialized) {
+      throw new AtlasWorkspaceError(
+        "El respaldo de reemplazo existente no coincide con la operación",
+        "WORKSPACE_UNAVAILABLE",
+      );
+    }
+  }
+
+  private async ensureWorkspaceReplacementArchiveDirectory(
+    directory: string,
+  ): Promise<void> {
+    try {
+      await mkdir(directory, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const metadata = await lstat(directory);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        throw new AtlasWorkspaceError(
+          "El respaldo de reemplazo contiene un destino inseguro",
+          "UNSAFE_WORKSPACE_PATH",
+        );
+      }
+    }
+    const replacementRealPath = await realpath(
+      this.replacementBackupDirectory,
+    );
+    const archiveRealPath = await realpath(directory);
+    if (!pathIsInside(replacementRealPath, archiveRealPath)) {
+      throw new AtlasWorkspaceError(
+        "El respaldo de reemplazo sale de su directorio",
+        "UNSAFE_WORKSPACE_PATH",
+      );
     }
   }
 
@@ -963,6 +1151,100 @@ export class LocalAtlasWorkspaceStore {
       if (error instanceof AtlasWorkspaceError) throw error;
       throw new AtlasWorkspaceError(
         "No se pudo respaldar el workspace antes de sanearlo",
+        "WORKSPACE_UNAVAILABLE",
+        { cause: error },
+      );
+    }
+  }
+
+  private async archiveWorkspaceReplacement(
+    current: AtlasWorkspaceDocument,
+    incoming: AtlasWorkspaceContent,
+    currentSessionId: string,
+    candidateSessionId: string,
+    writeId: string,
+  ): Promise<void> {
+    try {
+      await this.ensureReplacementBackupDirectory();
+      const archiveDirectory = resolve(
+        this.replacementBackupDirectory,
+        `replacement-${writeId}`,
+      );
+      if (
+        !pathIsInside(this.replacementBackupDirectory, archiveDirectory)
+      ) {
+        throw new AtlasWorkspaceError(
+          "La ruta del respaldo de reemplazo no es segura",
+          "UNSAFE_WORKSPACE_PATH",
+        );
+      }
+      await this.ensureWorkspaceReplacementArchiveDirectory(
+        archiveDirectory,
+      );
+      await this.writeWorkspaceReplacementArchiveFile(
+        archiveDirectory,
+        "workspace-before.json",
+        current,
+      );
+      await this.writeWorkspaceReplacementArchiveFile(
+        archiveDirectory,
+        "workspace-candidate.json",
+        incoming,
+      );
+      const manifestCore = {
+        version: 1,
+        reason: "single-session-replacement",
+        workspaceId: current.workspaceId,
+        revision: current.revision,
+        writeId,
+        currentSessionId,
+        candidateSessionId,
+      };
+      try {
+        await this.writeMigrationArchiveFile(
+          archiveDirectory,
+          "manifest.json",
+          {
+            ...manifestCore,
+            createdAt: new Date().toISOString(),
+          },
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const manifestPath = resolve(archiveDirectory, "manifest.json");
+        const metadata = await lstat(manifestPath);
+        if (metadata.isSymbolicLink() || !metadata.isFile()) {
+          throw new AtlasWorkspaceError(
+            "El manifiesto de reemplazo contiene un destino inseguro",
+            "UNSAFE_WORKSPACE_PATH",
+          );
+        }
+        const existingManifest = JSON.parse(
+          await readFile(manifestPath, "utf8"),
+        ) as unknown;
+        if (
+          !isRecord(existingManifest) ||
+          !isCanonicalTimestamp(existingManifest.createdAt) ||
+          Object.entries(manifestCore).some(
+            ([key, value]) => existingManifest[key] !== value,
+          )
+        ) {
+          throw new AtlasWorkspaceError(
+            "El manifiesto de reemplazo existente no coincide con la operación",
+            "WORKSPACE_UNAVAILABLE",
+          );
+        }
+      }
+      const directoryHandle = await open(archiveDirectory, "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+    } catch (error) {
+      if (error instanceof AtlasWorkspaceError) throw error;
+      throw new AtlasWorkspaceError(
+        "No se pudo respaldar el workspace antes de reemplazarlo",
         "WORKSPACE_UNAVAILABLE",
         { cause: error },
       );

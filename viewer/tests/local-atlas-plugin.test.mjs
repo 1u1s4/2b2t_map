@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -27,6 +28,49 @@ import {
   parseLocalAtlasCoverage,
   parseLocalAtlasRuntime,
 } from "../app/lib/local-atlas-runtime.ts";
+
+test("regional speed copy describes the adaptive 16 req/s target truthfully", async () => {
+  const viewerSource = await readFile(
+    new URL("../app/map-viewer.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(viewerSource, /VELOCIDAD OBJETIVO/);
+  assert.match(
+    viewerSource,
+    /Máximo · \{REGIONAL_REQUESTS_PER_SECOND\} req\/s/,
+  );
+  assert.match(viewerSource, />ADAPTATIVA</);
+  assert.doesNotMatch(viewerSource, />FIJA</);
+});
+
+test("Xaero controls expose scoped export and confirmed Atlas-only removal", async () => {
+  const viewerSource = await readFile(
+    new URL("../app/map-viewer.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(viewerSource, /Sincronizar con Xaero 2b2t/);
+  assert.match(viewerSource, /Exportar o retirar por región/);
+  assert.match(viewerSource, /Todo el Atlas/);
+  assert.match(viewerSource, /Previsualizar retirada/);
+  assert.match(
+    viewerSource,
+    /Solo se retiran filas intactas administradas por\s+Atlas en este alcance/,
+  );
+  assert.match(
+    viewerSource,
+    /No se borran highlights de\s+Atlas ni marcadores ajenos/,
+  );
+  assert.match(
+    viewerSource,
+    /Usa la posición Overworld registrada al exportar/,
+  );
+  assert.match(
+    viewerSource,
+    /Confirmo que quiero aplicar esta retirada en\s+Xaero/,
+  );
+  assert.match(viewerSource, /xaeroRemoveConfirmed/);
+  assert.match(viewerSource, /alreadyAbsent/);
+});
 
 test("local atlas accepts an aligned regional LOD 0 inventory and a bounded rate", () => {
   assert.deepEqual(
@@ -494,6 +538,115 @@ test("capacity reads archive bytes from running and terminal global progress", a
   runtime.close();
   assert.equal(terminal.status, 200);
   assert.equal(terminal.json.capacity.archiveBytes, 67_890);
+});
+
+test("status sums complete regional bytes and caches them by catalog fingerprint", async (context) => {
+  const tileRoot = await mkdtemp(join(tmpdir(), "atlas-capacity-catalog-"));
+  context.after(async () => {
+    await rm(tileRoot, { recursive: true, force: true });
+  });
+  const databasePath = join(tileRoot, "tiles.sqlite3");
+  seedTileDatabase(databasePath, [
+    ["overworld", "base", 0, 0, 0, "complete", "a.webp", 120, 200, "a".repeat(64)],
+    ["overworld", "overlay", 0, 0, 0, "complete", "b.webp", 80, 200, "b".repeat(64)],
+    ["overworld", "newchunks", 0, 0, 0, "complete", "c.webp", null, 200, "c".repeat(64)],
+    ["overworld", "base", 0, 1, 0, "absent", "", 500, 404, null],
+    ["overworld", "base", 0, 2, 0, "pending", "", 700, null, null],
+  ]);
+  await writeFile(
+    join(tileRoot, "progress.json"),
+    JSON.stringify({ space_used_bytes: 99_999 }),
+    "utf8",
+  );
+  const queryCountPath = join(tileRoot, "archive-query-count.txt");
+  const pythonWrapperPath = join(tileRoot, "counting-python");
+  await writeFile(
+    pythonWrapperPath,
+    `#!/usr/bin/env python3
+import os
+import sys
+with open(${JSON.stringify(queryCountPath)}, "a", encoding="utf-8") as counter:
+    counter.write("1")
+os.execvp("python3", ["python3", *sys.argv[1:]])
+`,
+    "utf8",
+  );
+  await chmod(pythonWrapperPath, 0o700);
+  const runtime = createLocalAtlasMiddleware({
+    tileRoot,
+    backingRoot: tileRoot,
+    pythonBin: pythonWrapperPath,
+    overworldRequirementBytes: 1,
+  });
+
+  const first = await invokeLocalMiddleware(runtime, "/api/local-atlas/status");
+  const second = await invokeLocalMiddleware(runtime, "/api/local-atlas/status");
+  assert.equal(first.status, 200);
+  assert.equal(first.json.capacity.archiveBytes, 200);
+  assert.equal(second.json.capacity.archiveBytes, 200);
+  assert.equal(await readFile(queryCountPath, "utf8"), "1");
+
+  await delay(20);
+  execFileSync(
+    "python3",
+    [
+      "-c",
+      `
+import sqlite3
+import sys
+connection = sqlite3.connect(sys.argv[1])
+connection.execute(
+    """
+    INSERT INTO tiles(
+      dimension, layer, lod, tile_x, tile_z, status, relative_path, size_bytes,
+      http_code, sha256
+    ) VALUES ('overworld', 'base', 0, 3, 0, 'complete', 'd.webp', 50, 200, ?)
+    """,
+    ("d" * 64,),
+)
+connection.commit()
+connection.close()
+`,
+      databasePath,
+    ],
+    { stdio: "pipe" },
+  );
+  const changed = await invokeLocalMiddleware(
+    runtime,
+    "/api/local-atlas/status",
+  );
+  runtime.close();
+
+  assert.equal(changed.status, 200);
+  assert.equal(changed.json.capacity.archiveBytes, 250);
+  assert.equal(await readFile(queryCountPath, "utf8"), "11");
+});
+
+test("status falls back to legacy archive bytes when the regional catalog is unreadable", async (context) => {
+  const tileRoot = await mkdtemp(join(tmpdir(), "atlas-capacity-fallback-"));
+  context.after(async () => {
+    await rm(tileRoot, { recursive: true, force: true });
+  });
+  await writeFile(join(tileRoot, "tiles.sqlite3"), "not sqlite", "utf8");
+  await writeFile(
+    join(tileRoot, "progress.json"),
+    JSON.stringify({ space_used_bytes: 4_567 }),
+    "utf8",
+  );
+  const runtime = createLocalAtlasMiddleware({
+    tileRoot,
+    backingRoot: tileRoot,
+    overworldRequirementBytes: 1,
+  });
+
+  const response = await invokeLocalMiddleware(
+    runtime,
+    "/api/local-atlas/status",
+  );
+  runtime.close();
+
+  assert.equal(response.status, 200);
+  assert.equal(response.json.capacity.archiveBytes, 4_567);
 });
 
 test("status ignores legacy global progress in on-demand mode", async (context) => {

@@ -171,8 +171,8 @@ export interface ExplorationState {
   /**
    * Whether the current cell had already been reviewed before it became the
    * current selection. A first visit can therefore count toward progress
-   * without obscuring the map; returning to that cell restores its reviewed
-   * fill.
+   * without obscuring the map; returning preserves its verified history while
+   * allowing the active map image to remain unobscured.
    */
   readonly currentCellPreviouslyReviewed: boolean;
   /**
