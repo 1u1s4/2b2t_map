@@ -219,39 +219,47 @@ ensure_external_tile_volume() {
 
 validate_environment() {
   validate_commands
-  ensure_external_tile_volume
+  if ! ensure_external_tile_volume; then
+    return 1
+  fi
   if [[ ! -d "${tile_root}" || ! -r "${tile_root}" ||
     ! -w "${tile_root}" ]]; then
     echo "La biblioteca local no está disponible: ${tile_root}" >&2
-    exit 1
+    return 1
   fi
   if [[ ! -d "${backing_root}" || ! -r "${backing_root}" ]]; then
     echo "La unidad LuisA no está disponible: ${backing_root}" >&2
-    exit 1
+    return 1
   fi
   if [[ ! -d "${minecraft_root}" || ! -r "${minecraft_root}" ]]; then
     echo "La carpeta de Minecraft no está disponible: ${minecraft_root}" >&2
-    exit 1
+    return 1
   fi
   if [[ "${regional_tile_root}" == "${tile_root}" ]]; then
     echo "La biblioteca regional debe estar separada de la global." >&2
-    exit 1
+    return 1
   fi
-  /usr/bin/install -d -m 700 "${regional_tile_root}"
+  if ! /usr/bin/install -d -m 700 "${regional_tile_root}"; then
+    echo "No se pudo preparar la biblioteca regional: ${regional_tile_root}" >&2
+    return 1
+  fi
   if [[ ! -d "${regional_tile_root}" || ! -r "${regional_tile_root}" ||
     ! -w "${regional_tile_root}" ]]; then
     echo "La biblioteca regional no está disponible: ${regional_tile_root}" >&2
-    exit 1
+    return 1
   fi
   if [[ ! -f "${viewer_dir}/package.json" ]]; then
     echo "No existe el proyecto del visor en ${viewer_dir}." >&2
-    exit 1
+    return 1
   fi
   if [[ ! -d "${viewer_dir}/node_modules" ]]; then
     echo "Faltan dependencias del visor. Ejecuta: cd viewer && npm ci" >&2
-    exit 1
+    return 1
   fi
-  /usr/bin/install -d -m 700 "${runtime_dir}"
+  if ! /usr/bin/install -d -m 700 "${runtime_dir}"; then
+    echo "No se pudo preparar el directorio del runtime: ${runtime_dir}" >&2
+    return 1
+  fi
 }
 
 acquire_lock_for_pid() {
@@ -332,6 +340,7 @@ serve_loop() {
   local stop_requested=0
   local health_failures=0
   local health_failure_reason=""
+  local storage_ready=0
 
   exec >>"${log_file}" 2>&1
   acquire_lock
@@ -359,6 +368,17 @@ serve_loop() {
 
   while (( stop_requested == 0 )); do
     rotate_log_if_needed
+    if ! validate_environment; then
+      failures=$((failures + 1))
+      restart_delay=$((failures * 5))
+      if (( restart_delay > 30 )); then
+        restart_delay=30
+      fi
+      printf '%s El almacenamiento local no está disponible; reintento en %ss.\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${restart_delay}"
+      sleep "${restart_delay}"
+      continue
+    fi
     started_at=$(date +%s)
     printf '%s Iniciando Obsidian Atlas en %s\n' \
       "$(date '+%Y-%m-%d %H:%M:%S')" "${viewer_url}"
@@ -383,11 +403,17 @@ serve_loop() {
       if (( stop_requested != 0 )); then
         break
       fi
+      storage_ready=1
+      if ! ensure_external_tile_volume; then
+        storage_ready=0
+      fi
       runtime=$(( $(date +%s) - started_at ))
       if (( runtime < health_startup_grace_seconds )); then
         continue
       fi
-      if bridge_api_is_ready; then
+      if (( storage_ready == 0 )); then
+        health_failure_reason="La biblioteca local no está montada"
+      elif bridge_api_is_ready; then
         if bridge_ui_is_ready; then
           health_failures=0
           health_failure_reason=""

@@ -3,7 +3,13 @@ import test from "node:test";
 
 import {
   HIGHLIGHT_NAME_PRESETS,
+  highlightIsInsideRegionScope,
+  highlightRegionBounds,
+  highlightRegionDisplayName,
   highlightRegionKey,
+  highlightRegionKeyForScope,
+  highlightRegionKeyFromScopeId,
+  highlightRegionScopeId,
   highlightsForRegion,
   inferLegacyHighlightRegionKey,
   isHighlightRegionKey,
@@ -33,6 +39,56 @@ test("region keys depend on geographic bounds rather than session ids", () => {
   assert.notEqual(highlightRegionKey(regionA), highlightRegionKey(regionB));
   assert.equal(isHighlightRegionKey("-1024:0:1024:512"), true);
   assert.equal(isHighlightRegionKey("region-session-id"), false);
+});
+
+test("Xaero region scopes survive archived sessions and recover legacy sectors", () => {
+  const sectorKey = "-114688:147456:-81920:180224";
+  const neighboringKey = "-81920:147456:-49152:180224";
+  const scopeId = highlightRegionScopeId(sectorKey);
+
+  assert.deepEqual(highlightRegionBounds(sectorKey), {
+    minX: -114688,
+    minZ: 147456,
+    maxXExclusive: -81920,
+    maxZExclusive: 180224,
+  });
+  assert.equal(highlightRegionDisplayName(sectorKey), "Sector F22 · C14");
+  assert.equal(highlightRegionKeyFromScopeId(scopeId), sectorKey);
+  assert.equal(highlightRegionKeyFromScopeId("region-session-id"), null);
+  assert.equal(
+    highlightRegionKeyForScope({
+      x: -100000,
+      z: 160000,
+      regionKey: null,
+    }),
+    sectorKey,
+  );
+  assert.equal(
+    highlightRegionKeyForScope({
+      x: -100000,
+      z: 160000,
+      regionKey: neighboringKey,
+    }),
+    neighboringKey,
+  );
+  assert.equal(
+    highlightIsInsideRegionScope(
+      { x: -100000, z: 160000, regionKey: null },
+      sectorKey,
+    ),
+    true,
+  );
+  assert.equal(
+    highlightIsInsideRegionScope(
+      { x: -100000, z: 160000, regionKey: neighboringKey },
+      sectorKey,
+    ),
+    false,
+  );
+  assert.throws(
+    () => highlightRegionScopeId("region-session-id"),
+    /no es válida/,
+  );
 });
 
 test("highlights stay isolated even when scoped points overlap", () => {

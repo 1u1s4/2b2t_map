@@ -1,8 +1,10 @@
 import type { WorldBounds } from "./exploration-grid.ts";
+import { overviewCellAtWorld } from "./overworld-coverage.ts";
 
 export const HIGHLIGHT_NAME_PRESETS = ["Base", "Base D", "Mapa"] as const;
 export const MAX_HIGHLIGHT_NAME_LENGTH = 200;
 export type HighlightNamePreset = (typeof HIGHLIGHT_NAME_PRESETS)[number];
+const HIGHLIGHT_REGION_SCOPE_PREFIX = "highlight-region:";
 
 export interface RegionScopedHighlight {
   readonly regionKey?: string | null;
@@ -59,14 +61,14 @@ export function highlightRegionKey(bounds: WorldBounds): string {
   ].join(":");
 }
 
-export function isHighlightRegionKey(value: unknown): value is string {
+export function highlightRegionBounds(value: unknown): WorldBounds | null {
   if (typeof value !== "string" || value.length === 0 || value.length > 160) {
-    return false;
+    return null;
   }
   const coordinates = value.split(":");
-  if (coordinates.length !== 4) return false;
+  if (coordinates.length !== 4) return null;
   const [minX, minZ, maxXExclusive, maxZExclusive] = coordinates.map(Number);
-  return (
+  if (
     coordinates.every((coordinate) => /^-?\d+$/.test(coordinate)) &&
     [minX, minZ, maxXExclusive, maxZExclusive].every(
       (coordinate) =>
@@ -75,7 +77,68 @@ export function isHighlightRegionKey(value: unknown): value is string {
     ) &&
     maxXExclusive > minX &&
     maxZExclusive > minZ
-  );
+  ) {
+    return { minX, minZ, maxXExclusive, maxZExclusive };
+  }
+  return null;
+}
+
+export function isHighlightRegionKey(value: unknown): value is string {
+  return highlightRegionBounds(value) !== null;
+}
+
+export function highlightRegionDisplayName(regionKey: string): string {
+  const bounds = highlightRegionBounds(regionKey);
+  if (!bounds) throw new TypeError("La región del highlight no es válida");
+  const cell = overviewCellAtWorld(bounds.minX, bounds.minZ);
+  if (
+    cell &&
+    highlightRegionKey(cell.bounds) === regionKey
+  ) {
+    return `Sector F${cell.row + 1} · C${cell.column + 1}`;
+  }
+  return `Región X ${bounds.minX}…${bounds.maxXExclusive} · Z ${bounds.minZ}…${bounds.maxZExclusive}`;
+}
+
+export function highlightRegionScopeId(regionKey: string): string {
+  if (!isHighlightRegionKey(regionKey)) {
+    throw new TypeError("La región del highlight no es válida");
+  }
+  return `${HIGHLIGHT_REGION_SCOPE_PREFIX}${regionKey}`;
+}
+
+export function highlightRegionKeyFromScopeId(value: unknown): string | null {
+  if (
+    typeof value !== "string" ||
+    !value.startsWith(HIGHLIGHT_REGION_SCOPE_PREFIX)
+  ) {
+    return null;
+  }
+  const regionKey = value.slice(HIGHLIGHT_REGION_SCOPE_PREFIX.length);
+  return isHighlightRegionKey(regionKey) ? regionKey : null;
+}
+
+/**
+ * Regional Xaero scopes survive after their exploration session is archived.
+ * Explicit scopes win; legacy/global points fall back to their overview sector.
+ */
+export function highlightRegionKeyForScope(
+  highlight: RegionScopedHighlight,
+): string | null {
+  if (typeof highlight.regionKey === "string") return highlight.regionKey;
+  const cell = overviewCellAtWorld(highlight.x, highlight.z);
+  return cell ? highlightRegionKey(cell.bounds) : null;
+}
+
+export function highlightIsInsideRegionScope(
+  highlight: RegionScopedHighlight,
+  regionKey: string,
+): boolean {
+  const bounds = highlightRegionBounds(regionKey);
+  if (!bounds) return false;
+  return typeof highlight.regionKey === "string"
+    ? highlight.regionKey === regionKey
+    : pointIsInsideBounds(highlight, bounds);
 }
 
 export function pointIsInsideBounds(

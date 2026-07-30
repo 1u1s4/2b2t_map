@@ -20,7 +20,13 @@ import type {
   AtlasWorkspaceDocument,
   AtlasWorkspaceHighlight,
 } from "./local-atlas-workspace.ts";
-import { highlightRegionKey } from "../app/lib/highlights.ts";
+import {
+  highlightIsInsideRegionScope,
+  highlightRegionBounds,
+  highlightRegionDisplayName,
+  highlightRegionKey,
+  highlightRegionKeyFromScopeId,
+} from "../app/lib/highlights.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -297,17 +303,26 @@ function resolveExportSelection(
   const exploration = workspace.explorations.find(
     (candidate) => candidate.id === explorationId,
   );
-  if (!exploration) {
-    throw new TypeError(
-      "La región elegida ya no existe en el workspace",
-    );
+  if (exploration) {
+    return {
+      operation,
+      scope,
+      explorationId,
+      regionName: exploration.state.region.name,
+      bounds: exploration.state.region.bounds,
+    };
+  }
+  const regionKey = highlightRegionKeyFromScopeId(explorationId);
+  const bounds = regionKey ? highlightRegionBounds(regionKey) : null;
+  if (!regionKey || !bounds) {
+    throw new TypeError("La región elegida ya no existe en el workspace");
   }
   return {
     operation,
     scope,
     explorationId,
-    regionName: exploration.state.region.name,
-    bounds: exploration.state.region.bounds,
+    regionName: highlightRegionDisplayName(regionKey),
+    bounds,
   };
 }
 
@@ -331,12 +346,10 @@ function highlightIsInsideSelection(
   selection: ResolvedXaeroExportSelection,
 ): boolean {
   if (selection.bounds === null) return true;
-  if (highlight.regionKey !== undefined) {
-    return (
-      highlight.regionKey === highlightRegionKey(selection.bounds)
-    );
-  }
-  return pointIsInsideSelection(highlight.x, highlight.z, selection);
+  return highlightIsInsideRegionScope(
+    highlight,
+    highlightRegionKey(selection.bounds),
+  );
 }
 
 function manifestOverworldPoint(

@@ -122,11 +122,10 @@ class LocalAtlasLauncherContractTests(unittest.TestCase):
         validate_start = self.position("validate_environment() {")
         validate_end = self.source.index("\n}\n", validate_start)
         validate_body = self.source[validate_start:validate_end]
-        self.assertEqual(
-            self.source.count("\n  ensure_external_tile_volume\n"),
-            1,
+        self.assertIn(
+            "if ! ensure_external_tile_volume; then",
+            validate_body,
         )
-        self.assertIn("\n  ensure_external_tile_volume\n", validate_body)
 
         for function_name in ("show_status", "stop_viewer"):
             function_start = self.position(f"{function_name}() {{")
@@ -185,6 +184,18 @@ class LocalAtlasLauncherContractTests(unittest.TestCase):
         serve_start = self.position("serve_loop() {")
         serve_end = self.position("\nstart_viewer() {")
         serve_body = self.source[serve_start:serve_end]
+        runtime_validation = serve_body.index(
+            "if ! validate_environment; then"
+        )
+        child_launch = serve_body.index("exec npm run dev")
+        remount = serve_body.index(
+            "if ! ensure_external_tile_volume; then",
+            child_launch,
+        )
+        startup_grace = serve_body.index(
+            "runtime < health_startup_grace_seconds",
+            remount,
+        )
         api_probe = serve_body.index("if bridge_api_is_ready; then")
         ui_probe = serve_body.index("if bridge_ui_is_ready; then")
         threshold = serve_body.index(
@@ -195,6 +206,10 @@ class LocalAtlasLauncherContractTests(unittest.TestCase):
             threshold,
         )
         wait_child = serve_body.index('wait "${child_pid}"', termination)
+        self.assertLess(runtime_validation, child_launch)
+        self.assertLess(child_launch, remount)
+        self.assertLess(remount, startup_grace)
+        self.assertLess(startup_grace, api_probe)
         self.assertLess(api_probe, ui_probe)
         self.assertLess(ui_probe, threshold)
         self.assertLess(threshold, termination)
@@ -211,6 +226,14 @@ class LocalAtlasLauncherContractTests(unittest.TestCase):
         )
         self.assertIn(
             'health_failure_reason="El API local no respondió"',
+            serve_body,
+        )
+        self.assertIn(
+            'health_failure_reason="La biblioteca local no está montada"',
+            serve_body,
+        )
+        self.assertIn(
+            "El almacenamiento local no está disponible; reintento",
             serve_body,
         )
         self.assertIn(

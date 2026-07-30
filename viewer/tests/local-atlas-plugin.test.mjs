@@ -51,6 +51,18 @@ test("Xaero controls expose scoped export and confirmed Atlas-only removal", asy
   assert.match(viewerSource, /Sincronizar con Xaero 2b2t/);
   assert.match(viewerSource, /Exportar o retirar por región/);
   assert.match(viewerSource, /Todo el Atlas/);
+  assert.match(
+    viewerSource,
+    /highlightRegionKeyForScope\(highlight\)/,
+  );
+  assert.match(
+    viewerSource,
+    /highlightRegionScopeId\(regionKey\)/,
+  );
+  assert.match(
+    viewerSource,
+    /highlightIsInsideRegionScope\(\s*highlight,\s*option\.regionKey/,
+  );
   assert.match(viewerSource, /Previsualizar retirada/);
   assert.match(
     viewerSource,

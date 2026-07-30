@@ -23,6 +23,10 @@ import {
   parseLocalAtlasXaeroPreview,
   parseLocalAtlasXaeroResult,
 } from "../app/lib/local-atlas-runtime.ts";
+import {
+  highlightRegionKey,
+  highlightRegionScopeId,
+} from "../app/lib/highlights.ts";
 
 const HEADER = [
   "#",
@@ -159,6 +163,63 @@ test("Xaero format adds the suffix once and floors Nether coordinates", () => {
     () => xaeroWaypointLine(pin({ title: "Token §§ literal" }), "overworld"),
     /token reservado/,
   );
+});
+
+test("archived highlight sectors remain selectable without a saved session", async () => {
+  const setup = await fixture();
+  try {
+    const bounds = {
+      minX: -114688,
+      minZ: 147456,
+      maxXExclusive: -81920,
+      maxZExclusive: 180224,
+    };
+    const regionKey = highlightRegionKey(bounds);
+    const neighboringKey = highlightRegionKey({
+      ...bounds,
+      minX: -81920,
+      maxXExclusive: -49152,
+    });
+    const selected = workspace([
+      pin({
+        id: "legacy-in-sector",
+        x: -100000,
+        z: 160000,
+        regionKey: null,
+      }),
+      pin({
+        id: "scoped-in-sector",
+        x: -95000,
+        z: 165000,
+        regionKey,
+      }),
+      pin({
+        id: "scoped-elsewhere",
+        x: -95000,
+        z: 165000,
+        regionKey: neighboringKey,
+      }),
+      pin({
+        id: "legacy-elsewhere",
+        x: -70000,
+        z: 165000,
+        regionKey: null,
+      }),
+    ]);
+    const preview = await setup.exporter.preview(selected, {
+      operation: "export",
+      scope: "exploration",
+      explorationId: highlightRegionScopeId(regionKey),
+    });
+
+    assert.equal(preview.regionName, "Sector F22 · C14");
+    assert.equal(preview.selectedHighlights, 2);
+    assert.equal(preview.exportableHighlights, 2);
+    assert.equal(preview.overworld.added, 2);
+    assert.equal(preview.nether.added, 2);
+  } finally {
+    await setup.cleanup();
+  }
 });
 
 test("browser parser accepts only canonical dual-dimension previews", () => {

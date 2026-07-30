@@ -64,13 +64,18 @@ import {
 import { resolveExplorationSelection } from "./lib/exploration-session-selection";
 import {
   HIGHLIGHT_NAME_PRESETS,
+  highlightIsInsideRegionScope,
+  highlightRegionBounds,
+  highlightRegionDisplayName,
   highlightRegionKey,
+  highlightRegionKeyForScope,
+  highlightRegionKeyFromScopeId,
+  highlightRegionScopeId,
   highlightsForRegion,
   inferLegacyHighlightRegionKey,
   isHighlightRegionKey,
   nextHighlightPresetName,
   normalizeHighlightName,
-  pointIsInsideBounds,
 } from "./lib/highlights";
 import {
   createHighlightRouteExport,
@@ -575,18 +580,6 @@ function lodForScale(scale: number) {
 function adaptiveGridStep(scale: number) {
   const targetBlocks = 150 / scale;
   return 2 ** clamp(Math.round(Math.log2(targetBlocks)), 4, 20);
-}
-
-function pinIsInsideExploration(
-  highlight: Highlight,
-  exploration: LocalAtlasWorkspaceExploration,
-) {
-  if (highlight.type !== "pin") return false;
-  const bounds = exploration.state.region.bounds;
-  if (highlight.regionKey !== undefined) {
-    return highlight.regionKey === highlightRegionKey(bounds);
-  }
-  return pointIsInsideBounds(highlight, bounds);
 }
 
 function parseLocation(
@@ -1713,14 +1706,57 @@ export function MapViewer() {
     [savedExplorations],
   );
   const xaeroRegionOptions = useMemo(
-    () =>
-      orderedSavedExplorations.map((exploration) => ({
-        id: exploration.id,
-        name: exploration.state.region.name,
-        pinCount: highlights.filter((highlight) =>
-          pinIsInsideExploration(highlight, exploration),
-        ).length,
-      })),
+    () => {
+      const optionsByRegionKey = new Map<
+        string,
+        {
+          readonly id: string;
+          readonly name: string;
+          readonly regionKey: string;
+        }
+      >();
+      for (const exploration of orderedSavedExplorations) {
+        const regionKey = highlightRegionKey(
+          exploration.state.region.bounds,
+        );
+        optionsByRegionKey.set(regionKey, {
+          id: exploration.id,
+          name: exploration.state.region.name,
+          regionKey,
+        });
+      }
+      for (const highlight of highlights) {
+        if (highlight.type !== "pin") continue;
+        const regionKey = highlightRegionKeyForScope(highlight);
+        if (!regionKey || optionsByRegionKey.has(regionKey)) continue;
+        optionsByRegionKey.set(regionKey, {
+          id: highlightRegionScopeId(regionKey),
+          name: highlightRegionDisplayName(regionKey),
+          regionKey,
+        });
+      }
+      return [...optionsByRegionKey.values()]
+        .map((option) => ({
+          ...option,
+          pinCount: highlights.filter(
+            (highlight) =>
+              highlight.type === "pin" &&
+              highlightIsInsideRegionScope(
+                highlight,
+                option.regionKey,
+              ),
+          ).length,
+        }))
+        .sort((left, right) => {
+          const leftBounds = highlightRegionBounds(left.regionKey);
+          const rightBounds = highlightRegionBounds(right.regionKey);
+          if (!leftBounds || !rightBounds) return 0;
+          return (
+            leftBounds.minZ - rightBounds.minZ ||
+            leftBounds.minX - rightBounds.minX
+          );
+        });
+    },
     [highlights, orderedSavedExplorations],
   );
   const selectedXaeroRegion =
@@ -1899,6 +1935,7 @@ export function MapViewer() {
       const current = xaeroScopeRef.current;
       if (
         current.kind === "all" ||
+        highlightRegionKeyFromScopeId(current.explorationId) !== null ||
         explorations.some(
           (exploration) => exploration.id === current.explorationId,
         )
