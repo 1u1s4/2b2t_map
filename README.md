@@ -210,12 +210,13 @@ LOD de datos de toda región nueva = 0
 celda = 512 × 512 bloques
 ```
 
-El zoom del canvas no selecciona otra resolución durante una sesión: rueda,
-pellizco, doble clic, `+`, `-` y arrastre solo cambian la vista. La escala mínima
-mantiene como máximo 8×6 tiles dentro del viewport antes del margen de render y
-la cámara no puede perder la región seleccionada. El modelo admite hasta
-1,048,576 celdas por sesión y avisa antes de iniciar una selección que supere
-ese límite.
+En el detalle, rueda, pellizco, doble clic, `+`, `-` y arrastre mantienen LOD 0
+y una escala mínima de seguridad de 8×6 tiles antes del margen de render. El
+botón **Encuadrar región activa** abre un panorama temporal en LOD 10 para
+mostrar en una sola vista los límites, la ruta inteligente y todos los
+highlights; al volver a una celda se restaura LOD 0. La cámara no puede perder
+la región seleccionada. El modelo admite hasta 1,048,576 celdas por sesión y
+avisa antes de iniciar una selección que supere ese límite.
 
 Las sesiones creadas por versiones anteriores pueden importarse conservando su
 LOD, escala, celda actual y progreso. Antes de reemplazar la sesión canónica por
@@ -452,7 +453,10 @@ con mejora 2-opt. El inicio predeterminado es el highlight más cercano a
 El planificador corre en segundo plano y puede cancelarse sin bloquear el mapa. El mapa
 superpone segmentos y etiquetas `A…Z`, `a…z`, `A1…`. **JSON** crea
 `obsidian-atlas-ruta-highlights.json` con puntos, distancias y orden completo;
-**PNG vista** captura el canvas visible con la ruta superpuesta.
+**PNG vista** captura el canvas visible con la ruta superpuesta. Desde la misma
+tarjeta, **Exportar nombres a Xaero** usa los títulos actuales de los puntos,
+limita el alcance a la región activa y abre la vista previa antes de modificar
+los waypoints de Minecraft.
 
 ## Variables locales
 

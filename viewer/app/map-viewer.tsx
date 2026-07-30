@@ -963,6 +963,10 @@ export function MapViewer() {
   const pendingMagnifierPositionRef =
     useRef<MagnifierPosition | null>(null);
   const mapRef = useRef<HTMLDivElement>(null);
+  const observedViewSizeRef = useRef<{
+    readonly width: number;
+    readonly height: number;
+  } | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const importRef = useRef<HTMLInputElement>(null);
   const explorationImportRef = useRef<HTMLInputElement>(null);
@@ -1013,6 +1017,7 @@ export function MapViewer() {
   const lastSavedWorkspaceRef = useRef<string | null>(null);
   const xaeroDefaultScopeAppliedRef = useRef(false);
   const xaeroScopeRef = useRef<LocalAtlasXaeroScope>({ kind: "all" });
+  const xaeroCardRef = useRef<HTMLElement>(null);
   const pendingWorkspaceWriteRef = useRef<{
     readonly content: LocalAtlasWorkspaceContent;
     readonly expected: LocalAtlasWorkspacePrecondition;
@@ -1105,6 +1110,7 @@ export function MapViewer() {
   const [highlightsReady, setHighlightsReady] = useState(false);
   const [explorationState, setExplorationState] =
     useState<ExplorationState | null>(null);
+  const [explorationOverview, setExplorationOverview] = useState(false);
   const [explorationPlan, setExplorationPlan] =
     useState<ExplorationPlan | null>(null);
   const [regionStatusSnapshot, setRegionStatusSnapshot] =
@@ -1231,6 +1237,25 @@ export function MapViewer() {
 
   const atlasMode = drawer === "atlas";
   const isExploring = explorationState !== null && !atlasMode;
+  const explorationMinimumScale =
+    explorationState && !atlasMode
+      ? minimumSafeExplorationScale(explorationState.region.tileSpan, viewSize)
+      : MIN_SCALE;
+  const explorationOverviewScale =
+    explorationState && !atlasMode
+      ? resolveExplorationFocusView(
+          explorationState,
+          viewSize,
+          { mode: "overview" },
+        ).scale
+      : MIN_SCALE;
+  const explorationInteractionMinimumScale = explorationOverview
+    ? explorationOverviewScale
+    : explorationMinimumScale;
+  const explorationUsesOverviewTiles =
+    explorationOverview &&
+    isExploring &&
+    scale < explorationMinimumScale;
   const magnifierRenderScale = Math.min(
     MAGNIFIER_MAX_RENDER_SCALE,
     Math.max(MAGNIFIER_MIN_RENDER_SCALE, scale * MAGNIFIER_SCALE_FACTOR),
@@ -1246,7 +1271,9 @@ export function MapViewer() {
         : "loading";
   const lod =
     explorationState && !atlasMode
-      ? explorationState.region.lod
+      ? explorationUsesOverviewTiles
+        ? MAX_TILE_LOD
+        : explorationState.region.lod
       : lodForScale(scale);
   const blocksPerPixel = blocksPerPixelAtLod(lod);
   const gridStep = adaptiveGridStep(scale);
@@ -1534,10 +1561,6 @@ export function MapViewer() {
     loadedTileKeys.has(currentDetailKey);
   const activeExplorationIsMaxDetail =
     explorationState?.region.lod === MAX_DETAIL_EXPLORATION_LOD;
-  const explorationMinimumScale =
-    explorationState && !atlasMode
-      ? minimumSafeExplorationScale(explorationState.region.tileSpan, viewSize)
-      : MIN_SCALE;
   const currentCellSkipped =
     explorationState !== null &&
     isCellSkipped(explorationState, explorationState.currentIndex);
@@ -1765,6 +1788,12 @@ export function MapViewer() {
           (region) => region.id === xaeroScope.explorationId,
         ) ?? null
       : null;
+  const activeXaeroRegion =
+    activeHighlightRegionKey === null
+      ? null
+      : xaeroRegionOptions.find(
+          (region) => region.regionKey === activeHighlightRegionKey,
+        ) ?? null;
   const xaeroSelectionLabel =
     xaeroScope.kind === "all"
       ? `Todo el Atlas · ${highlights.filter((highlight) => highlight.type === "pin").length.toLocaleString("es-GT")} puntos actuales`
@@ -1974,11 +2003,24 @@ export function MapViewer() {
         viewSize,
         request,
       );
+      setExplorationOverview(request.mode === "overview");
       setCamera(next.camera);
       setScale(next.scale);
     },
     [viewSize],
   );
+
+  const fitActiveExploration = useCallback(() => {
+    if (!explorationState) return;
+    setDrawer(null);
+    setMarkMode(null);
+    setQuickHighlightMenu(null);
+    setMagnifierEnabled(false);
+    hideMagnifier();
+    focusExploration(explorationState, { mode: "overview" });
+    window.requestAnimationFrame(() => canvasRef.current?.focus());
+    notify("Región completa encuadrada · ruta y highlights visibles");
+  }, [explorationState, focusExploration, hideMagnifier, notify]);
 
   const constrainActiveExplorationCamera = useCallback(
     (nextCamera: Camera, nextScale: number) => {
@@ -2217,8 +2259,26 @@ export function MapViewer() {
         width: Math.max(1, Math.round(entry.contentRect.width)),
         height: Math.max(1, Math.round(entry.contentRect.height)),
       };
+      const previousViewSize = observedViewSizeRef.current;
+      if (
+        previousViewSize?.width === nextViewSize.width &&
+        previousViewSize.height === nextViewSize.height
+      ) {
+        return;
+      }
+      observedViewSizeRef.current = nextViewSize;
       setViewSize(nextViewSize);
       if (explorationState && !atlasMode) {
+        if (explorationOverview) {
+          const next = resolveExplorationFocusView(
+            explorationState,
+            nextViewSize,
+            { mode: "overview" },
+          );
+          setScale(next.scale);
+          setCamera(next.camera);
+          return;
+        }
         const nextScale = clamp(
           scale,
           minimumSafeExplorationScale(
@@ -2242,7 +2302,7 @@ export function MapViewer() {
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, [atlasMode, explorationState, scale]);
+  }, [atlasMode, explorationOverview, explorationState, scale]);
 
   useEffect(() => {
     const cache = tileCacheRef.current;
@@ -3387,78 +3447,114 @@ export function MapViewer() {
 
     if (explorationState && !atlasMode) {
       const region = explorationState.region;
-      const firstTileX = Math.max(
-        region.minTileX,
-        Math.floor(minX / region.tileSpan),
-      );
-      const lastTileXExclusive = Math.min(
-        region.maxTileXExclusive,
-        Math.floor(maxX / region.tileSpan) + 1,
-      );
-      const firstTileZ = Math.max(
-        region.minTileZ,
-        Math.floor(minZ / region.tileSpan),
-      );
-      const lastTileZExclusive = Math.min(
-        region.maxTileZExclusive,
-        Math.floor(maxZ / region.tileSpan) + 1,
-      );
       const cellSize = region.tileSpan * scale;
-      context.font = "10px var(--font-geist-mono), monospace";
-      context.textBaseline = "top";
-      for (
-        let tileZ = firstTileZ;
-        tileZ < lastTileZExclusive;
-        tileZ += 1
-      ) {
+      if (explorationOverview) {
+        const start = screenAtWorld(region.bounds.minX, region.bounds.minZ);
+        const end = screenAtWorld(
+          region.bounds.maxXExclusive,
+          region.bounds.maxZExclusive,
+        );
+        context.save();
+        context.globalAlpha = 1;
+        context.strokeStyle = "rgba(133, 196, 255, 0.92)";
+        context.lineWidth = 2;
+        context.setLineDash([8, 6]);
+        context.strokeRect(
+          start.x + 0.5,
+          start.y + 0.5,
+          end.x - start.x - 1,
+          end.y - start.y - 1,
+        );
+        context.setLineDash([]);
+        const currentCell = cellForIndex(
+          region,
+          explorationState.currentIndex,
+        );
+        const currentPoint = screenAtWorld(
+          currentCell.bounds.minX,
+          currentCell.bounds.minZ,
+        );
+        context.fillStyle = "rgba(98, 168, 255, 0.34)";
+        context.fillRect(
+          currentPoint.x,
+          currentPoint.y,
+          Math.max(2, cellSize),
+          Math.max(2, cellSize),
+        );
+        context.restore();
+      } else {
+        const firstTileX = Math.max(
+          region.minTileX,
+          Math.floor(minX / region.tileSpan),
+        );
+        const lastTileXExclusive = Math.min(
+          region.maxTileXExclusive,
+          Math.floor(maxX / region.tileSpan) + 1,
+        );
+        const firstTileZ = Math.max(
+          region.minTileZ,
+          Math.floor(minZ / region.tileSpan),
+        );
+        const lastTileZExclusive = Math.min(
+          region.maxTileZExclusive,
+          Math.floor(maxZ / region.tileSpan) + 1,
+        );
+        context.font = "10px var(--font-geist-mono), monospace";
+        context.textBaseline = "top";
         for (
-          let tileX = firstTileX;
-          tileX < lastTileXExclusive;
-          tileX += 1
+          let tileZ = firstTileZ;
+          tileZ < lastTileZExclusive;
+          tileZ += 1
         ) {
-          const index = cellIndexAtTile(region, tileX, tileZ);
-          if (index === null) continue;
-          const point = screenAtWorld(
-            tileX * region.tileSpan,
-            tileZ * region.tileSpan,
-          );
-          const current = index === explorationState.currentIndex;
-          const reviewed = isCellReviewed(explorationState, index);
-          const appearance = explorationCellAppearance(
-            explorationState,
-            index,
-          );
-          const visual = EXPLORATION_CELL_VISUALS[appearance];
-          context.globalAlpha = 1;
-          context.fillStyle = visual.fill;
-          context.fillRect(point.x, point.y, cellSize, cellSize);
-          context.save();
-          context.lineWidth = current ? 3 : reviewed ? 1.5 : 1;
-          context.strokeStyle = visual.stroke;
-          context.setLineDash(current ? [] : reviewed ? [] : [7, 6]);
-          if (visual.glow) {
-            context.shadowColor = visual.glow;
-            context.shadowBlur = 16;
-          }
-          context.strokeRect(
-            point.x + 0.5,
-            point.y + 0.5,
-            cellSize - 1,
-            cellSize - 1,
-          );
-          context.restore();
-          if (cellSize >= 94) {
-            const cell = cellForIndex(region, index);
-            context.fillStyle = visual.label;
-            context.fillText(
-              `F${cell.row + 1} · C${cell.column + 1}`,
-              point.x + 9,
-              point.y + 9,
+          for (
+            let tileX = firstTileX;
+            tileX < lastTileXExclusive;
+            tileX += 1
+          ) {
+            const index = cellIndexAtTile(region, tileX, tileZ);
+            if (index === null) continue;
+            const point = screenAtWorld(
+              tileX * region.tileSpan,
+              tileZ * region.tileSpan,
             );
+            const current = index === explorationState.currentIndex;
+            const reviewed = isCellReviewed(explorationState, index);
+            const appearance = explorationCellAppearance(
+              explorationState,
+              index,
+            );
+            const visual = EXPLORATION_CELL_VISUALS[appearance];
+            context.globalAlpha = 1;
+            context.fillStyle = visual.fill;
+            context.fillRect(point.x, point.y, cellSize, cellSize);
+            context.save();
+            context.lineWidth = current ? 3 : reviewed ? 1.5 : 1;
+            context.strokeStyle = visual.stroke;
+            context.setLineDash(current ? [] : reviewed ? [] : [7, 6]);
+            if (visual.glow) {
+              context.shadowColor = visual.glow;
+              context.shadowBlur = 16;
+            }
+            context.strokeRect(
+              point.x + 0.5,
+              point.y + 0.5,
+              cellSize - 1,
+              cellSize - 1,
+            );
+            context.restore();
+            if (cellSize >= 94) {
+              const cell = cellForIndex(region, index);
+              context.fillStyle = visual.label;
+              context.fillText(
+                `F${cell.row + 1} · C${cell.column + 1}`,
+                point.x + 9,
+                point.y + 9,
+              );
+            }
           }
         }
+        context.textBaseline = "alphabetic";
       }
-      context.textBaseline = "alphabetic";
     }
 
     if (highlightRoute) {
@@ -3620,6 +3716,7 @@ export function MapViewer() {
     camera,
     compactHighlights,
     drawMapTile,
+    explorationOverview,
     explorationState,
     gridStep,
     highlightRoute,
@@ -3677,7 +3774,8 @@ export function MapViewer() {
     const minZ = center.z - halfWorldSize;
     const maxZ = center.z + halfWorldSize;
     const visibleWorldBounds = { minX, minZ, maxX, maxZ };
-    const tileSpan = blocksPerTileAtLod(lod);
+    const magnifierLod = explorationState.region.lod;
+    const tileSpan = blocksPerTileAtLod(magnifierLod);
     const minTileX = Math.floor(minX / tileSpan) - 1;
     const maxTileX = Math.floor(maxX / tileSpan) + 1;
     const minTileZ = Math.floor(minZ / tileSpan) - 1;
@@ -3698,7 +3796,7 @@ export function MapViewer() {
         for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
           const key: TileKey = {
             layer: layer.id,
-            lod,
+            lod: magnifierLod,
             dimension: "overworld",
             tileX,
             tileZ,
@@ -3882,7 +3980,6 @@ export function MapViewer() {
     highlightRoute,
     isExploring,
     layers,
-    lod,
     magnifierEnabled,
     magnifierPosition,
     magnifierRenderScale,
@@ -3900,10 +3997,16 @@ export function MapViewer() {
         atlasMode
           ? ATLAS_MIN_SCALE
           : explorationState
-            ? explorationMinimumScale
+            ? explorationInteractionMinimumScale
             : MIN_SCALE,
         MAX_SCALE,
       );
+      if (
+        explorationOverview &&
+        nextScale >= explorationMinimumScale
+      ) {
+        setExplorationOverview(false);
+      }
       setCamera(
         constrainActiveExplorationCamera(
           {
@@ -3918,7 +4021,9 @@ export function MapViewer() {
     [
       atlasMode,
       constrainActiveExplorationCamera,
+      explorationInteractionMinimumScale,
       explorationMinimumScale,
+      explorationOverview,
       explorationState,
       scale,
       viewSize,
@@ -4598,10 +4703,16 @@ export function MapViewer() {
         atlasMode
           ? ATLAS_MIN_SCALE
           : explorationState
-            ? explorationMinimumScale
+            ? explorationInteractionMinimumScale
             : MIN_SCALE,
         MAX_SCALE,
       );
+      if (
+        explorationOverview &&
+        nextScale >= explorationMinimumScale
+      ) {
+        setExplorationOverview(false);
+      }
       setCamera(
         constrainActiveExplorationCamera(
           {
@@ -5287,21 +5398,29 @@ export function MapViewer() {
     }
   };
 
-  const prepareXaeroOperation = async () => {
+  const prepareXaeroOperation = async (
+    requestedOperation?: LocalAtlasXaeroRequest,
+  ) => {
     if (!localRuntime) {
       setXaeroError("El runtime local todavía no está disponible");
       return;
     }
-    if (xaeroScope.kind === "exploration" && !selectedXaeroRegion) {
+    const request: LocalAtlasXaeroRequest = requestedOperation ?? {
+      operation: xaeroOperation,
+      scope: xaeroScope,
+    };
+    const requestedRegion =
+      request.scope.kind === "exploration"
+        ? xaeroRegionOptions.find(
+            (region) => region.id === request.scope.explorationId,
+          ) ?? null
+        : null;
+    if (request.scope.kind === "exploration" && !requestedRegion) {
       setXaeroError(
         "La región elegida ya no está disponible; selecciona otro alcance",
       );
       return;
     }
-    const request: LocalAtlasXaeroRequest = {
-      operation: xaeroOperation,
-      scope: xaeroScope,
-    };
     setXaeroBusy("preview");
     setXaeroError(null);
     setXaeroResult(null);
@@ -5344,6 +5463,31 @@ export function MapViewer() {
     } finally {
       setXaeroBusy(null);
     }
+  };
+
+  const prepareHighlightRouteXaeroExport = async () => {
+    if (!highlightRoute || !activeXaeroRegion) {
+      notify("La región activa no está disponible para exportar");
+      return;
+    }
+    const request: LocalAtlasXaeroRequest = {
+      operation: "export",
+      scope: {
+        kind: "exploration",
+        explorationId: activeXaeroRegion.id,
+      },
+    };
+    setXaeroOperation("export");
+    chooseXaeroScope(request.scope);
+    invalidateXaeroPreview();
+    setXaeroExpanded(true);
+    window.requestAnimationFrame(() => {
+      xaeroCardRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    });
+    await prepareXaeroOperation(request);
   };
 
   const commitXaeroOperation = async () => {
@@ -5465,7 +5609,7 @@ export function MapViewer() {
 
   return (
     <main
-      className={`atlas-shell ${drawer ? "has-drawer" : ""} ${atlasMode ? "is-atlas-mode" : ""} ${isExploring ? "is-exploring" : ""} ${topbarRevealed ? "is-topbar-revealed" : ""} ${markMode ? "is-marking" : ""} ${magnifierEnabled && isExploring ? "is-magnifier-active" : ""}`}
+      className={`atlas-shell ${drawer ? "has-drawer" : ""} ${atlasMode ? "is-atlas-mode" : ""} ${isExploring ? "is-exploring" : ""} ${explorationOverview && isExploring ? "is-exploration-overview" : ""} ${topbarRevealed ? "is-topbar-revealed" : ""} ${markMode ? "is-marking" : ""} ${magnifierEnabled && isExploring ? "is-magnifier-active" : ""}`}
       aria-busy={workspaceMutationsBlocked}
       onPointerMoveCapture={handleShellPointerMove}
       onPointerLeave={() => setTopbarRevealed(false)}
@@ -5615,7 +5759,11 @@ export function MapViewer() {
           </div>
           <div className="coordinate-meta">
             <span>
-              {atlasMode ? "Vista general" : `Zoom ${formatMapZoom(scale)}×`}
+              {atlasMode
+                ? "Vista general"
+                : explorationOverview
+                  ? "Vista regional"
+                  : `Zoom ${formatMapZoom(scale)}×`}
             </span>
             <i />
             <span>{atlasMode ? atlasFocusedCell.id : `LOD ${lod}`}</span>
@@ -5623,7 +5771,9 @@ export function MapViewer() {
             <span>
               {atlasMode
                 ? "sector 32,768 × 32,768"
-                : `${explorationState ? "fuente " : ""}${blocksPerPixel} bloque${blocksPerPixel === 1 ? "" : "s"}/px`}
+                : explorationUsesOverviewTiles
+                  ? `resumen · ${blocksPerPixel} bloques/px`
+                  : `${explorationState ? "fuente " : ""}${blocksPerPixel} bloque${blocksPerPixel === 1 ? "" : "s"}/px`}
             </span>
           </div>
           <div className="coordinate-actions">
@@ -7355,6 +7505,7 @@ export function MapViewer() {
           {drawer === "highlights" && (
             <div className="drawer-content highlight-panel">
               <section
+                ref={xaeroCardRef}
                 className={`xaero-export-card ${xaeroExpanded ? "expanded" : ""}`}
                 aria-busy={xaeroBusy !== null}
               >
@@ -7984,6 +8135,33 @@ export function MapViewer() {
                             ? "Ruta óptima exacta · Held–Karp"
                             : "Ruta heurística escalable · vecino más cercano + 2-opt"}
                         </p>
+                        <div className="highlight-route-primary-actions">
+                          <button
+                            type="button"
+                            onClick={fitActiveExploration}
+                          >
+                            <Maximize2 size={15} />
+                            Ver ruta completa
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void prepareHighlightRouteXaeroExport()
+                            }
+                            disabled={
+                              xaeroBusy !== null ||
+                              workspaceMutationsBlocked ||
+                              activeXaeroRegion === null
+                            }
+                          >
+                            <Navigation size={15} />
+                            Exportar nombres a Xaero
+                          </button>
+                        </div>
+                        <p className="highlight-route-export-note">
+                          Xaero usará los nombres actuales, incluidos los que
+                          acabas de editar.
+                        </p>
                         <div className="highlight-route-actions">
                           <button
                             type="button"
@@ -8549,8 +8727,14 @@ export function MapViewer() {
           <Plus />
         </button>
         <span className="zoom-lod">
-          {explorationState && !atlasMode ? <LockKeyhole size={12} /> : null} L
-          {lod}
+          {explorationState && !atlasMode ? (
+            explorationUsesOverviewTiles ? (
+              <ScanSearch size={12} />
+            ) : (
+              <LockKeyhole size={12} />
+            )
+          ) : null}{" "}
+          L{lod}
         </span>
         <button
           type="button"
@@ -8560,6 +8744,18 @@ export function MapViewer() {
         >
           <Minus />
         </button>
+        {isExploring ? (
+          <button
+            type="button"
+            className={explorationOverview ? "active" : ""}
+            aria-pressed={explorationOverview}
+            aria-label="Encuadrar región activa"
+            title="Ver toda la región, la ruta y los highlights"
+            onClick={fitActiveExploration}
+          >
+            <Maximize2 />
+          </button>
+        ) : null}
         <button
           type="button"
           aria-label={

@@ -116,12 +116,15 @@ LOD de datos = 0
 celda = 512 × 512 bloques
 ```
 
-Rueda, pellizco, doble clic, `+`, `-` y arrastre cambian la vista sin sustituir
-los tiles LOD 0 por otra resolución. Durante **Explorar**, `L` activa una lupa
-circular que vuelve a renderizar el detalle original con gran aumento y sigue
-el puntero sin interferir con clics ni arrastre. El lente conserva su aumento
-5× incluso en el zoom máximo y se recoloca junto a los bordes para no quedar
-recortado.
+Rueda, pellizco, doble clic, `+`, `-` y arrastre cambian la vista detallada sin
+sustituir los tiles LOD 0. **Encuadrar región activa** cierra el panel lateral y
+usa temporalmente el panorama LOD 10 para mostrar juntos la región completa, la
+ruta inteligente y sus highlights sin cargar miles de tiles. Volver a la celda
+activa restaura el detalle LOD 0. Durante **Explorar**, `L` activa una lupa
+circular que siempre vuelve a renderizar el detalle original con gran aumento
+y sigue el puntero sin interferir con clics ni arrastre. El lente conserva su
+aumento 5× incluso en el zoom máximo y se recoloca junto a los bordes para no
+quedar recortado.
 
 ## Atlas global
 
@@ -348,7 +351,9 @@ limita las opciones montadas sin impedir elegir cualquiera. El canvas muestra l�
 `A…Z`, luego `a…z` y, al agotarlos, `A1…z1`, `A2…`; el panel descarga el orden
 completo como
 `obsidian-atlas-ruta-highlights.json` o la vista visible como
-`obsidian-atlas-ruta-vista.png`.
+`obsidian-atlas-ruta-vista.png`. **Exportar nombres a Xaero** prepara el
+alcance de la región activa con los títulos actuales —incluidos los recién
+editados— y abre la vista previa segura antes de escribir en Minecraft.
 
 ## Atajos
 

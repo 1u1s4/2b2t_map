@@ -246,8 +246,43 @@ test("highlight analysis is non-blocking with a selectable start and labeled exp
     /toBlob\([\s\S]*?obsidian-atlas-ruta-vista\.png/,
   );
   assert.match(
+    viewerSource,
+    /const prepareHighlightRouteXaeroExport[\s\S]*?operation: "export"[\s\S]*?explorationId: activeXaeroRegion\.id[\s\S]*?prepareXaeroOperation\(request\)/,
+  );
+  assert.match(
+    viewerSource,
+    /Ver ruta completa[\s\S]*?Exportar nombres a Xaero[\s\S]*?Xaero usará los nombres actuales/,
+  );
+  assert.match(
     styles,
     /\.highlight-route-list\s*\{[\s\S]*?max-height:[\s\S]*?overflow:\s*auto/,
+  );
+});
+
+test("exploration can fit the active region without loading every LOD 0 cell", () => {
+  assert.match(
+    viewerSource,
+    /const explorationUsesOverviewTiles[\s\S]*?scale < explorationMinimumScale/,
+  );
+  assert.match(
+    viewerSource,
+    /const lod =[\s\S]*?explorationUsesOverviewTiles[\s\S]*?MAX_TILE_LOD[\s\S]*?explorationState\.region\.lod/,
+  );
+  assert.match(
+    viewerSource,
+    /const fitActiveExploration[\s\S]*?setDrawer\(null\)[\s\S]*?mode: "overview"/,
+  );
+  assert.match(
+    viewerSource,
+    /aria-label="Encuadrar región activa"[\s\S]*?onClick=\{fitActiveExploration\}/,
+  );
+  assert.match(
+    viewerSource,
+    /if \(explorationOverview\)[\s\S]*?strokeRect\([\s\S]*?currentCell[\s\S]*?else \{[\s\S]*?cellIndexAtTile/,
+  );
+  assert.match(
+    viewerSource,
+    /const magnifierLod = explorationState\.region\.lod[\s\S]*?lod: magnifierLod/,
   );
 });
 

@@ -56,6 +56,36 @@ test("initial activation fits wide and compact desktop viewports", () => {
   assert.deepEqual(compactDesktop.camera, { x: 256, z: 256 });
 });
 
+test("regional overview fits every exploration cell in one view", () => {
+  const state = createMaxDetailExplorationState({
+    id: "regional-overview",
+    name: "Región completa",
+    bounds: {
+      minX: -16_384,
+      minZ: 32_768,
+      maxXExclusive: 16_384,
+      maxZExclusive: 65_536,
+    },
+  });
+  const viewport = { width: 1_440, height: 900 };
+  const view = resolveExplorationFocusView(
+    state,
+    viewport,
+    { mode: "overview" },
+  );
+  const renderedWidth =
+    (state.region.bounds.maxXExclusive - state.region.bounds.minX) *
+    view.scale;
+  const renderedHeight =
+    (state.region.bounds.maxZExclusive - state.region.bounds.minZ) *
+    view.scale;
+
+  assert.deepEqual(view.camera, { x: 0, z: 49_152 });
+  assert.ok(renderedWidth <= viewport.width - 120);
+  assert.ok(renderedHeight <= viewport.height - 180);
+  assert.equal(view.scale, 720 / 32_768);
+});
+
 test("preserved exploration zoom remains inside safe limits", () => {
   const state = exploration();
   const viewport = { width: 1_440, height: 900 };

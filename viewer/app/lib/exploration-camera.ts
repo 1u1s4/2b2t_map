@@ -11,6 +11,7 @@ import {
 
 export type ExplorationFocusRequest =
   | { readonly mode: "fit" }
+  | { readonly mode: "overview" }
   | { readonly mode: "preserve"; readonly scale: number };
 
 export interface ExplorationFocusView {
@@ -54,6 +55,35 @@ export function resolveExplorationFocusView(
     viewport,
   );
   let scale: number;
+
+  if (request.mode === "overview") {
+    const horizontalMargin = 120;
+    const verticalMargin = 180;
+    const availableWidth = Math.max(1, viewport.width - horizontalMargin);
+    const availableHeight = Math.max(1, viewport.height - verticalMargin);
+    const regionWidth =
+      state.region.bounds.maxXExclusive - state.region.bounds.minX;
+    const regionHeight =
+      state.region.bounds.maxZExclusive - state.region.bounds.minZ;
+    scale = Math.min(
+      MAX_DETAIL_EXPLORATION_SCALE,
+      availableWidth / regionWidth,
+      availableHeight / regionHeight,
+    );
+    return Object.freeze({
+      camera: Object.freeze({
+        x:
+          (state.region.bounds.minX +
+            state.region.bounds.maxXExclusive) /
+          2,
+        z:
+          (state.region.bounds.minZ +
+            state.region.bounds.maxZExclusive) /
+          2,
+      }),
+      scale,
+    });
+  }
 
   if (request.mode === "preserve") {
     if (!Number.isFinite(request.scale) || request.scale <= 0) {

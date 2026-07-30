@@ -398,6 +398,60 @@ test("dual export preserves existing rows, backs up, and is idempotent", async (
   }
 });
 
+test("a renamed highlight updates the same Xaero waypoint in both dimensions", async () => {
+  const setup = await fixture();
+  try {
+    const highlight = pin({
+      id: "route-renamed-highlight",
+      title: "Nombre anterior",
+    });
+    const initial = workspace([highlight]);
+    const initialPreview = await setup.exporter.preview(initial);
+    await setup.exporter.commit(
+      initial,
+      initialPreview.previewId,
+      randomUUID(),
+    );
+
+    const renamed = workspace(
+      [{ ...highlight, title: "B · Base D" }],
+      initial.revision + 1,
+    );
+    const renamedPreview = await setup.exporter.preview(renamed);
+    assert.equal(renamedPreview.overworld.updated, 1);
+    assert.equal(renamedPreview.nether.updated, 1);
+    assert.equal(renamedPreview.overworld.added, 0);
+    assert.equal(renamedPreview.nether.added, 0);
+
+    await setup.exporter.commit(
+      renamed,
+      renamedPreview.previewId,
+      randomUUID(),
+    );
+    const [overworld, nether, manifest] = await Promise.all([
+      readFile(setup.overworldPath, "utf8"),
+      readFile(setup.netherPath, "utf8"),
+      readFile(
+        join(
+          setup.backingRoot,
+          "ObsidianAtlas",
+          "state",
+          "xaero-export-manifest.v1.json",
+        ),
+        "utf8",
+      ).then(JSON.parse),
+    ]);
+    assert.match(overworld, /waypoint:B · Base D - Atlas:/);
+    assert.match(nether, /waypoint:B · Base D - Atlas:/);
+    assert.doesNotMatch(overworld, /Nombre anterior - Atlas/);
+    assert.doesNotMatch(nether, /Nombre anterior - Atlas/);
+    assert.equal(manifest.entries.length, 1);
+    assert.equal(manifest.entries[0].highlightId, highlight.id);
+  } finally {
+    await setup.cleanup();
+  }
+});
+
 test("Minecraft open allows preview but blocks every write", async () => {
   const setup = await fixture({ minecraftOpen: true });
   try {

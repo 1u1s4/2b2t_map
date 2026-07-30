@@ -2775,6 +2775,52 @@ canvas:focus-visible {
   color: var(--blue);
 }
 
+.highlight-route-primary-actions {
+  display: grid;
+  grid-template-columns: 0.9fr 1.1fr;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.highlight-route-primary-actions button {
+  display: inline-flex;
+  min-height: 39px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid rgba(38, 217, 199, 0.32);
+  border-radius: 10px;
+  color: #c9fff9;
+  background: rgba(38, 217, 199, 0.09);
+  cursor: pointer;
+  font-size: 8px;
+}
+
+.highlight-route-primary-actions button:first-child {
+  border-color: rgba(98, 168, 255, 0.3);
+  color: #d6eaff;
+  background: rgba(98, 168, 255, 0.08);
+}
+
+.highlight-route-primary-actions button:hover:not(:disabled),
+.highlight-route-primary-actions button:focus-visible {
+  border-color: rgba(38, 217, 199, 0.62);
+  color: #fff;
+}
+
+.highlight-route-primary-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.highlight-route-export-note {
+  margin: 6px 2px 0;
+  color: var(--quiet);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
 .highlight-route-actions {
   display: grid;
   grid-template-columns: 1fr 0.72fr 1fr;
@@ -3422,6 +3468,10 @@ canvas:focus-visible {
   padding: 9px;
   border-color: rgba(38, 217, 199, 0.27);
   border-radius: 16px;
+}
+
+.atlas-shell.is-exploration-overview .exploration-navigation {
+  display: none;
 }
 
 .navigation-progress span,
