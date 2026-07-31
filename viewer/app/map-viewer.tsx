@@ -79,6 +79,7 @@ import {
 } from "./lib/highlights";
 import {
   createHighlightRouteExport,
+  highlightRouteWaypointTitle,
   type HighlightRoutePlan,
   type HighlightRoutePoint,
   type HighlightRouteOverlay,
@@ -1017,6 +1018,7 @@ export function MapViewer() {
   const lastSavedWorkspaceRef = useRef<string | null>(null);
   const xaeroDefaultScopeAppliedRef = useRef(false);
   const xaeroScopeRef = useRef<LocalAtlasXaeroScope>({ kind: "all" });
+  const xaeroPreviewRequestIdRef = useRef(0);
   const xaeroCardRef = useRef<HTMLElement>(null);
   const pendingWorkspaceWriteRef = useRef<{
     readonly content: LocalAtlasWorkspaceContent;
@@ -1742,10 +1744,18 @@ export function MapViewer() {
         const regionKey = highlightRegionKey(
           exploration.state.region.bounds,
         );
+        if (optionsByRegionKey.has(regionKey)) continue;
         optionsByRegionKey.set(regionKey, {
-          id: exploration.id,
+          id: highlightRegionScopeId(regionKey),
           name: exploration.state.region.name,
           regionKey,
+        });
+      }
+      if (activeExplorationRegion && activeHighlightRegionKey) {
+        optionsByRegionKey.set(activeHighlightRegionKey, {
+          id: highlightRegionScopeId(activeHighlightRegionKey),
+          name: activeExplorationRegion.name,
+          regionKey: activeHighlightRegionKey,
         });
       }
       for (const highlight of highlights) {
@@ -1780,7 +1790,12 @@ export function MapViewer() {
           );
         });
     },
-    [highlights, orderedSavedExplorations],
+    [
+      activeExplorationRegion,
+      activeHighlightRegionKey,
+      highlights,
+      orderedSavedExplorations,
+    ],
   );
   const selectedXaeroRegion =
     xaeroScope.kind === "exploration"
@@ -1788,12 +1803,6 @@ export function MapViewer() {
           (region) => region.id === xaeroScope.explorationId,
         ) ?? null
       : null;
-  const activeXaeroRegion =
-    activeHighlightRegionKey === null
-      ? null
-      : xaeroRegionOptions.find(
-          (region) => region.regionKey === activeHighlightRegionKey,
-        ) ?? null;
   const xaeroSelectionLabel =
     xaeroScope.kind === "all"
       ? `Todo el Atlas · ${highlights.filter((highlight) => highlight.type === "pin").length.toLocaleString("es-GT")} puntos actuales`
@@ -1950,6 +1959,8 @@ export function MapViewer() {
   }, [isExploring, quickHighlightMenu, workspaceMutationsBlocked]);
 
   const invalidateXaeroPreview = useCallback(() => {
+    xaeroPreviewRequestIdRef.current += 1;
+    setXaeroBusy((busy) => (busy === "preview" ? null : busy));
     setXaeroPreview(null);
     setXaeroResult(null);
     setXaeroError(null);
@@ -1960,27 +1971,49 @@ export function MapViewer() {
     setXaeroScope(scope);
   }, []);
   const reconcileXaeroScope = useCallback(
-    (explorations: readonly Pick<LocalAtlasWorkspaceExploration, "id">[]) => {
+    (explorations: readonly LocalAtlasWorkspaceExploration[]) => {
       const current = xaeroScopeRef.current;
-      if (
-        current.kind === "all" ||
-        highlightRegionKeyFromScopeId(current.explorationId) !== null ||
-        explorations.some(
-          (exploration) => exploration.id === current.explorationId,
-        )
-      ) {
+      if (current.kind === "all") return;
+      if (highlightRegionKeyFromScopeId(current.explorationId) !== null) {
         return;
       }
-      const replacement = explorations[0];
+      const matchingExploration = explorations.find(
+        (exploration) => exploration.id === current.explorationId,
+      );
+      const replacement = matchingExploration ?? explorations[0];
       chooseXaeroScope(
         replacement
-          ? { kind: "exploration", explorationId: replacement.id }
+          ? {
+              kind: "exploration",
+              explorationId: highlightRegionScopeId(
+                highlightRegionKey(replacement.state.region.bounds),
+              ),
+            }
           : { kind: "all" },
       );
       invalidateXaeroPreview();
     },
     [chooseXaeroScope, invalidateXaeroPreview],
   );
+
+  useEffect(() => {
+    if (!activeHighlightRegionKey) return;
+    const explorationId = highlightRegionScopeId(activeHighlightRegionKey);
+    const current = xaeroScopeRef.current;
+    if (
+      current.kind === "exploration" &&
+      current.explorationId === explorationId
+    ) {
+      return;
+    }
+    xaeroDefaultScopeAppliedRef.current = true;
+    chooseXaeroScope({ kind: "exploration", explorationId });
+    invalidateXaeroPreview();
+  }, [
+    activeHighlightRegionKey,
+    chooseXaeroScope,
+    invalidateXaeroPreview,
+  ]);
 
   const clearTileCache = useCallback(() => {
     tileGenerationRef.current += 1;
@@ -2080,7 +2113,13 @@ export function MapViewer() {
               name: `${requestedState.region.name} · LOD 0`,
               bounds: requestedState.region.bounds,
             });
-      reconcileXaeroScope([{ id: state.region.id }]);
+      chooseXaeroScope({
+        kind: "exploration",
+        explorationId: highlightRegionScopeId(
+          highlightRegionKey(state.region.bounds),
+        ),
+      });
+      invalidateXaeroPreview();
       explorationStateRef.current = null;
       setExplorationState(null);
       setExplorationPlan({
@@ -2098,7 +2137,11 @@ export function MapViewer() {
       clearTileCache();
       setDrawer(source === "hydrated" ? "atlas" : "exploration");
     },
-    [clearTileCache, reconcileXaeroScope],
+    [
+      chooseXaeroScope,
+      clearTileCache,
+      invalidateXaeroPreview,
+    ],
   );
 
   const activateDownloadedExploration = useCallback(
@@ -2506,7 +2549,9 @@ export function MapViewer() {
         xaeroDefaultScopeAppliedRef.current = true;
         chooseXaeroScope({
           kind: "exploration",
-          explorationId: singleton.id,
+          explorationId: highlightRegionScopeId(
+            highlightRegionKey(singleton.state.region.bounds),
+          ),
         });
       } else {
         reconcileXaeroScope(canonical.explorations);
@@ -5415,7 +5460,23 @@ export function MapViewer() {
             (region) => region.id === request.scope.explorationId,
           ) ?? null
         : null;
-    if (request.scope.kind === "exploration" && !requestedRegion) {
+    const requestedRegionKey =
+      request.scope.kind === "exploration"
+        ? highlightRegionKeyFromScopeId(request.scope.explorationId)
+        : null;
+    const requestsActiveExploration =
+      request.scope.kind === "exploration" &&
+      request.scope.explorationId === activeExplorationRegion?.id;
+    const previewRequestId = xaeroPreviewRequestIdRef.current + 1;
+    xaeroPreviewRequestIdRef.current = previewRequestId;
+    if (
+      request.scope.kind === "exploration" &&
+      !requestedRegion &&
+      requestedRegionKey === null &&
+      !requestsActiveExploration
+    ) {
+      setXaeroBusy(null);
+      setXaeroPreview(null);
       setXaeroError(
         "La región elegida ya no está disponible; selecciona otro alcance",
       );
@@ -5432,7 +5493,22 @@ export function MapViewer() {
           "No se pudo asegurar la versión más reciente en LuisA",
         );
       }
+      if (xaeroPreviewRequestIdRef.current !== previewRequestId) return;
       const preview = await readLocalAtlasXaeroPreview(request);
+      if (xaeroPreviewRequestIdRef.current !== previewRequestId) return;
+      const expectedExplorationId =
+        request.scope.kind === "exploration"
+          ? request.scope.explorationId
+          : null;
+      if (
+        preview.operation !== request.operation ||
+        preview.scope !== request.scope.kind ||
+        preview.explorationId !== expectedExplorationId
+      ) {
+        throw new Error(
+          "Xaero devolvió un alcance distinto al solicitado; no se aplicó ningún cambio",
+        );
+      }
       setXaeroPreview(preview);
       if (preview.minecraftOpen) {
         notify(
@@ -5454,6 +5530,7 @@ export function MapViewer() {
         );
       }
     } catch (error) {
+      if (xaeroPreviewRequestIdRef.current !== previewRequestId) return;
       setXaeroPreview(null);
       setXaeroError(
         error instanceof Error
@@ -5461,20 +5538,70 @@ export function MapViewer() {
           : "No se pudo comprobar Xaero",
       );
     } finally {
-      setXaeroBusy(null);
+      if (xaeroPreviewRequestIdRef.current === previewRequestId) {
+        setXaeroBusy(null);
+      }
     }
   };
 
   const prepareHighlightRouteXaeroExport = async () => {
-    if (!highlightRoute || !activeXaeroRegion) {
+    if (!highlightRoute || !activeExplorationRegion) {
       notify("La región activa no está disponible para exportar");
       return;
     }
+    const routeWaypointTitles = new Map(
+      highlightRoute.stops.flatMap((stop) =>
+        stop.highlight.type === "pin"
+          ? [
+              [
+                stop.highlight.id,
+                highlightRouteWaypointTitle(
+                  stop.order,
+                  stop.highlight.title,
+                ),
+              ] as const,
+            ]
+          : [],
+      ),
+    );
+    const baseContent = workspaceContentRef.current ?? workspaceContent;
+    let matchedRoutePoints = 0;
+    let renamedRoutePoints = 0;
+    const renamedHighlights: Highlight[] = baseContent.highlights.map(
+      (highlight) => {
+        const title = routeWaypointTitles.get(highlight.id);
+        if (highlight.type !== "pin" || title === undefined) {
+          return { ...highlight };
+        }
+        matchedRoutePoints += 1;
+        if (highlight.title === title) return { ...highlight };
+        renamedRoutePoints += 1;
+        return { ...highlight, title };
+      },
+    );
+    if (matchedRoutePoints !== routeWaypointTitles.size) {
+      notify("Los highlights cambiaron; vuelve a calcular la ruta");
+      return;
+    }
+    if (renamedRoutePoints > 0) {
+      const nextContent: LocalAtlasWorkspaceContent = {
+        ...baseContent,
+        highlights: renamedHighlights,
+      };
+      workspaceContentRef.current = nextContent;
+      if (!journalWorkspace(nextContent)) {
+        notify("No se pudo actualizar la copia inmediata de recuperación");
+      }
+      setHighlights(renamedHighlights);
+    }
+    const activeRegionScopeId = highlightRegionScopeId(
+      highlightRegionKey(activeExplorationRegion.bounds),
+    );
     const request: LocalAtlasXaeroRequest = {
       operation: "export",
       scope: {
         kind: "exploration",
-        explorationId: activeXaeroRegion.id,
+        explorationId: activeRegionScopeId,
       },
     };
     setXaeroOperation("export");
@@ -8151,16 +8278,18 @@ export function MapViewer() {
                             disabled={
                               xaeroBusy !== null ||
                               workspaceMutationsBlocked ||
-                              activeXaeroRegion === null
+                              activeExplorationRegion === null
                             }
                           >
                             <Navigation size={15} />
-                            Exportar nombres a Xaero
+                            Renombrar y exportar a Xaero
                           </button>
                         </div>
                         <p className="highlight-route-export-note">
-                          Xaero usará los nombres actuales, incluidos los que
-                          acabas de editar.
+                          Atlas guardará los puntos como A · Nombre, B ·
+                          Nombre… únicamente en{" "}
+                          <strong>{activeExplorationRegion?.name}</strong> y
+                          abrirá la vista previa de Xaero.
                         </p>
                         <div className="highlight-route-actions">
                           <button

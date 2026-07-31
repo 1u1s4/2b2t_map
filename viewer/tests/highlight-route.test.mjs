@@ -6,6 +6,7 @@ import {
   HIGHLIGHT_ROUTE_EXPORT_VERSION,
   createHighlightRouteExport,
   highlightRouteLabel,
+  highlightRouteWaypointTitle,
   planHighlightRoute,
 } from "../app/lib/highlight-route.ts";
 
@@ -76,6 +77,35 @@ test("route labels progress through uppercase, lowercase, then suffixed cycles",
     ["A", "Z", "a", "z", "A1", "B1", "a1", "z1", "A2"],
   );
   assert.throws(() => highlightRouteLabel(0), /positive integer/);
+});
+
+test("route waypoint titles replace old labels and stay workspace-safe", () => {
+  assert.equal(
+    highlightRouteWaypointTitle(1, "Portal norte"),
+    "A · Portal norte",
+  );
+  assert.equal(
+    highlightRouteWaypointTitle(2, "A · Portal norte"),
+    "B · Portal norte",
+  );
+  assert.equal(
+    highlightRouteWaypointTitle(53, "z9 · Base D"),
+    "A1 · Base D",
+  );
+  assert.equal(
+    highlightRouteWaypointTitle(1, "A · Portal norte"),
+    highlightRouteWaypointTitle(
+      1,
+      highlightRouteWaypointTitle(1, "Portal norte"),
+    ),
+  );
+
+  const longTitle = highlightRouteWaypointTitle(
+    10_000,
+    `Base ${"😀".repeat(200)}`,
+  );
+  assert.equal(longTitle.length <= 200, true);
+  assert.doesNotMatch(longTitle, /[\uD800-\uDBFF]$/u);
 });
 
 test("the route starts nearest minX/minZ with canonical distance ties", () => {

@@ -454,9 +454,10 @@ El planificador corre en segundo plano y puede cancelarse sin bloquear el mapa. 
 superpone segmentos y etiquetas `A…Z`, `a…z`, `A1…`. **JSON** crea
 `obsidian-atlas-ruta-highlights.json` con puntos, distancias y orden completo;
 **PNG vista** captura el canvas visible con la ruta superpuesta. Desde la misma
-tarjeta, **Exportar nombres a Xaero** usa los títulos actuales de los puntos,
-limita el alcance a la región activa y abre la vista previa antes de modificar
-los waypoints de Minecraft.
+tarjeta, **Renombrar y exportar a Xaero** guarda cada punto con su orden
+(`A · Nombre`, `B · Nombre`…), limita el alcance a la región activa y abre la
+vista previa antes de modificar los waypoints de Minecraft. Las áreas conservan
+su título porque Xaero solo admite puntos.
 
 ## Variables locales
 

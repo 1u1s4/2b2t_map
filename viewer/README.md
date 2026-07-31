@@ -351,9 +351,10 @@ limita las opciones montadas sin impedir elegir cualquiera. El canvas muestra l�
 `A…Z`, luego `a…z` y, al agotarlos, `A1…z1`, `A2…`; el panel descarga el orden
 completo como
 `obsidian-atlas-ruta-highlights.json` o la vista visible como
-`obsidian-atlas-ruta-vista.png`. **Exportar nombres a Xaero** prepara el
-alcance de la región activa con los títulos actuales —incluidos los recién
-editados— y abre la vista previa segura antes de escribir en Minecraft.
+`obsidian-atlas-ruta-vista.png`. **Renombrar y exportar a Xaero** guarda los
+puntos como `A · Nombre`, `B · Nombre`… en el orden calculado, prepara el
+alcance de la región activa y abre la vista previa segura antes de escribir en
+Minecraft. Las áreas no se renombran porque Xaero no las exporta.
 
 ## Atajos
 

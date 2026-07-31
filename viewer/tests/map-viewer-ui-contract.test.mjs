@@ -247,11 +247,36 @@ test("highlight analysis is non-blocking with a selectable start and labeled exp
   );
   assert.match(
     viewerSource,
-    /const prepareHighlightRouteXaeroExport[\s\S]*?operation: "export"[\s\S]*?explorationId: activeXaeroRegion\.id[\s\S]*?prepareXaeroOperation\(request\)/,
+    /const prepareHighlightRouteXaeroExport[\s\S]*?const activeRegionScopeId = highlightRegionScopeId\([\s\S]*?highlightRegionKey\(activeExplorationRegion\.bounds\)[\s\S]*?operation: "export"[\s\S]*?explorationId: activeRegionScopeId[\s\S]*?prepareXaeroOperation\(request\)/,
   );
   assert.match(
     viewerSource,
-    /Ver ruta completa[\s\S]*?Exportar nombres a Xaero[\s\S]*?Xaero usará los nombres actuales/,
+    /const routeWaypointTitles = new Map\([\s\S]*?stop\.highlight\.type === "pin"[\s\S]*?highlightRouteWaypointTitle\([\s\S]*?stop\.order,[\s\S]*?stop\.highlight\.title/,
+  );
+  assert.match(
+    viewerSource,
+    /const nextContent: LocalAtlasWorkspaceContent =[\s\S]*?highlights: renamedHighlights[\s\S]*?workspaceContentRef\.current = nextContent[\s\S]*?journalWorkspace\(nextContent\)[\s\S]*?setHighlights\(renamedHighlights\)[\s\S]*?prepareXaeroOperation\(request\)/,
+  );
+  assert.doesNotMatch(viewerSource, /const activeXaeroRegion\s*=/);
+  assert.match(
+    viewerSource,
+    /if \(activeExplorationRegion && activeHighlightRegionKey\)[\s\S]*?optionsByRegionKey\.set\(activeHighlightRegionKey,[\s\S]*?id: highlightRegionScopeId\(activeHighlightRegionKey\)[\s\S]*?name: activeExplorationRegion\.name/,
+  );
+  assert.match(
+    viewerSource,
+    /if \(!activeHighlightRegionKey\) return;[\s\S]*?const explorationId = highlightRegionScopeId\(activeHighlightRegionKey\)[\s\S]*?chooseXaeroScope\(\{ kind: "exploration", explorationId \}\)[\s\S]*?invalidateXaeroPreview\(\)/,
+  );
+  assert.match(
+    viewerSource,
+    /preview\.operation !== request\.operation[\s\S]*?preview\.scope !== request\.scope\.kind[\s\S]*?preview\.explorationId !== expectedExplorationId[\s\S]*?alcance distinto al solicitado/,
+  );
+  assert.match(
+    viewerSource,
+    /const previewRequestId = xaeroPreviewRequestIdRef\.current \+ 1[\s\S]*?xaeroPreviewRequestIdRef\.current !== previewRequestId[\s\S]*?readLocalAtlasXaeroPreview\(request\)[\s\S]*?xaeroPreviewRequestIdRef\.current !== previewRequestId/,
+  );
+  assert.match(
+    viewerSource,
+    /Ver ruta completa[\s\S]*?Renombrar y exportar a Xaero[\s\S]*?Atlas guardará los puntos como A · Nombre, B ·[\s\S]*?abrirá la vista previa de Xaero/,
   );
   assert.match(
     styles,

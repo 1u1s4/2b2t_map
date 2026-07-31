@@ -11,11 +11,14 @@ export const LARGE_HIGHLIGHT_ROUTE_TWO_OPT_WINDOW = 64;
 /** Bounds synchronous work when routing the workspace maximum of 10,000. */
 export const LARGE_HIGHLIGHT_ROUTE_TWO_OPT_PASSES = 8;
 export const HIGHLIGHT_ROUTE_EXPORT_VERSION = 1 as const;
+export const MAX_HIGHLIGHT_ROUTE_WAYPOINT_TITLE_LENGTH = 200;
 
 const MAX_ABSOLUTE_WORLD_COORDINATE = 30_000_000;
 const TWO_OPT_EPSILON = 1e-9;
 const HIGHLIGHT_ROUTE_LABEL_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const HIGHLIGHT_ROUTE_TITLE_PREFIX =
+  /^[A-Za-z](?:[1-9]\d*)? · /u;
 
 export interface HighlightRoutePoint {
   readonly id: string;
@@ -176,6 +179,41 @@ export function highlightRouteLabel(order: number): string {
     zeroBased / HIGHLIGHT_ROUTE_LABEL_ALPHABET.length,
   );
   return cycle === 0 ? letter : `${letter}${cycle}`;
+}
+
+function truncateRouteWaypointTitle(
+  value: string,
+  maximumLength: number,
+): string {
+  let result = "";
+  for (const character of value) {
+    if (result.length + character.length > maximumLength) break;
+    result += character;
+  }
+  return result.trimEnd();
+}
+
+/**
+ * Turns a route stop into the durable title shared by Atlas and Xaero.
+ * Reapplying it replaces a previous generated route prefix instead of
+ * accumulating labels after every recalculation.
+ */
+export function highlightRouteWaypointTitle(
+  order: number,
+  currentTitle: string,
+): string {
+  if (typeof currentTitle !== "string") {
+    throw new TypeError("Highlight route title must be a string");
+  }
+  const label = highlightRouteLabel(order);
+  const prefix = `${label} · `;
+  const baseTitle =
+    currentTitle.trim().replace(HIGHLIGHT_ROUTE_TITLE_PREFIX, "").trim() ||
+    "Highlight";
+  return `${prefix}${truncateRouteWaypointTitle(
+    baseTitle,
+    MAX_HIGHLIGHT_ROUTE_WAYPOINT_TITLE_LENGTH - prefix.length,
+  )}`;
 }
 
 function squaredRouteDistance(
