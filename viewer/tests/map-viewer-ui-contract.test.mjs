@@ -420,3 +420,66 @@ test("Atlas sectors expose durable Minecraft completion with a blue overlay", ()
     /\.atlas-sector-actions \.atlas-minecraft-toggle\.minecraft-explored[\s\S]*?rgba\(37, 99, 235, 0\.32\)/,
   );
 });
+
+test("Atlas home exposes a guarded save-and-shutdown flow", () => {
+  assert.match(
+    viewerSource,
+    /shutdownLocalAtlasApplication,[\s\S]*?stopLocalRegionJob,[\s\S]*?from "\.\/lib\/local-atlas-runtime"/,
+  );
+  const handlerStart = viewerSource.indexOf(
+    "const requestApplicationShutdown",
+  );
+  const handlerEnd = viewerSource.indexOf(
+    "const copyCoordinates",
+    handlerStart,
+  );
+  const handler = viewerSource.slice(handlerStart, handlerEnd);
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
+  assert.ok(handler.indexOf("stopLocalRegionJob(runtime)") >= 0);
+  assert.ok(
+    handler.indexOf("stopLocalRegionJob(runtime)") <
+      handler.indexOf("flushWorkspace()"),
+  );
+  assert.ok(
+    handler.indexOf("flushWorkspace()") <
+      handler.indexOf("shutdownLocalAtlasApplication(runtime)"),
+  );
+  assert.match(handler, /consecutiveOfflineChecks >= 2/);
+  assert.match(handler, /setApplicationShutdownPhase\("stopped"\)/);
+
+  const keyboardHint = viewerSource.indexOf(
+    'className="atlas-keyboard-hint"',
+  );
+  const controls = viewerSource.indexOf(
+    'className="atlas-app-controls"',
+  );
+  assert.ok(keyboardHint >= 0 && controls > keyboardHint);
+  assert.match(
+    viewerSource,
+    /className="atlas-shutdown-button"[\s\S]*?aria-expanded=\{confirmApplicationShutdown\}[\s\S]*?aria-controls="atlas-shutdown-confirmation"[\s\S]*?shutdownAvailable[\s\S]*?Apagar aplicación/,
+  );
+  assert.match(
+    viewerSource,
+    /id="atlas-shutdown-confirmation"[\s\S]*?role="group"[\s\S]*?¿Guardar y apagar Obsidian Atlas\?[\s\S]*?Cancelar[\s\S]*?requestApplicationShutdown\(\)/,
+  );
+  assert.match(
+    viewerSource,
+    /La descarga regional se pausará de forma segura[\s\S]*?podrás reanudarla/,
+  );
+  assert.match(
+    viewerSource,
+    /const applicationShutdownScreenTitle =[\s\S]*?Obsidian Atlas está apagado[\s\S]*?const applicationShutdownScreenMessage =[\s\S]*?Aplicaciones/,
+  );
+  assert.match(
+    viewerSource,
+    /className=\{`application-shutdown-screen[\s\S]*?role="status"[\s\S]*?aria-live="assertive"[\s\S]*?applicationShutdownScreenTitle[\s\S]*?applicationShutdownScreenMessage/,
+  );
+  assert.match(
+    styles,
+    /\.atlas-shutdown-button[\s\S]*?rgba\(255, 102, 95, 0\.3\)/,
+  );
+  assert.match(
+    styles,
+    /\.application-shutdown-screen[\s\S]*?position:\s*fixed[\s\S]*?z-index:\s*90/,
+  );
+});

@@ -6039,6 +6039,22 @@ export function MapViewer() {
             applicationShutdownPhase === "waiting"
           ? "Apagando…"
           : "Guardar y apagar";
+  const applicationShutdownScreenTitle =
+    applicationShutdownPhase === "stopped"
+      ? "Obsidian Atlas está apagado"
+      : applicationShutdownPhase === "stopping-download"
+        ? "Pausando la descarga regional…"
+        : applicationShutdownPhase === "saving"
+          ? "Guardando los cambios…"
+          : "Apagando Obsidian Atlas…";
+  const applicationShutdownScreenMessage =
+    applicationShutdownPhase === "stopped"
+      ? "Ya puedes cerrar esta pestaña. Para volver a abrirlo, usa Obsidian Atlas en Aplicaciones."
+      : applicationShutdownPhase === "stopping-download"
+        ? "Atlas está cerrando el trabajo de forma reanudable antes de apagar el servidor."
+        : applicationShutdownPhase === "saving"
+          ? "Asegurando el workspace más reciente en LuisA antes de apagar."
+          : "Los cambios están guardados. Esperando que termine el servidor local…";
 
   return (
     <main
@@ -6067,8 +6083,7 @@ export function MapViewer() {
         </div>
       </section>
 
-      {applicationShutdownPhase === "waiting" ||
-      applicationShutdownPhase === "stopped" ? (
+      {applicationShutdownBusy ? (
         <section
           className={`application-shutdown-screen ${applicationShutdownPhase === "stopped" ? "is-stopped" : "is-waiting"}`}
           role="status"
@@ -6081,15 +6096,9 @@ export function MapViewer() {
             </span>
             <span className="application-shutdown-signal" aria-hidden="true" />
             <h1>
-              {applicationShutdownPhase === "stopped"
-                ? "Obsidian Atlas está apagado"
-                : "Apagando Obsidian Atlas…"}
+              {applicationShutdownScreenTitle}
             </h1>
-            <p>
-              {applicationShutdownPhase === "stopped"
-                ? "Ya puedes cerrar esta pestaña. Para volver a abrirlo, usa Obsidian Atlas en Aplicaciones."
-                : "Los cambios están guardados. Esperando que termine el servidor local…"}
-            </p>
+            <p>{applicationShutdownScreenMessage}</p>
           </div>
         </section>
       ) : null}

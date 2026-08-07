@@ -334,6 +334,52 @@ class LocalAtlasLauncherContractTests(unittest.TestCase):
         self.assertIn("trap request_stop HUP INT TERM", self.source)
         self.assertIn("while (( stop_requested == 0 )); do", self.source)
 
+    def test_web_shutdown_is_bound_to_the_exact_supervisor(self) -> None:
+        serve_start = self.position("serve_loop() {")
+        serve_end = self.position("\nstart_viewer() {")
+        serve_body = self.source[serve_start:serve_end]
+        supervisor_export = serve_body.index(
+            'export OBSIDIAN_ATLAS_SUPERVISOR_PID="$$"'
+        )
+        child_launch = serve_body.index("exec npm run dev")
+        self.assertLess(supervisor_export, child_launch)
+
+        stop_start = self.position("stop_viewer() {")
+        stop_end = self.position("\ncase \"${mode}\" in")
+        stop_body = self.source[stop_start:stop_end]
+        expected_check = stop_body.index(
+            '[[ "${owner_pid}" != "${expected_supervisor_pid}" ]]'
+        )
+        signal = stop_body.index('kill -TERM "${owner_pid}"')
+        named_screen_fallback = stop_body.index(
+            '[[ -z "${expected_supervisor_pid}" ]] && screen_has_session'
+        )
+        screen_quit = stop_body.index(
+            'screen -S "${session_name}" -X quit'
+        )
+        self.assertLess(expected_check, signal)
+        self.assertLess(signal, named_screen_fallback)
+        self.assertLess(named_screen_fallback, screen_quit)
+        for broad_kill in ("killall", "pkill", "kill -9", "lsof -ti"):
+            with self.subTest(broad_kill=broad_kill):
+                self.assertNotIn(broad_kill, stop_body)
+
+        invalid = subprocess.run(
+            [
+                "bash",
+                str(LAUNCHER),
+                "--stop",
+                "--expected-supervisor-pid",
+                "not-a-pid",
+            ],
+            cwd=PROJECT_DIR,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("Uso interno inválido", invalid.stderr)
+
     def test_singleton_lock_keeps_inode_and_validates_owner_identity(
         self,
     ) -> None:

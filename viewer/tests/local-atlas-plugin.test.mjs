@@ -215,6 +215,7 @@ test("browser runtime accepts only the projected local capability", () => {
     path: "/Volumes/LuisA/private",
   });
   assert.equal(runtime?.capacity.fits, true);
+  assert.equal(runtime?.shutdownAvailable, false);
   assert.equal("path" in runtime, false);
   assert.equal(
     parseLocalAtlasRuntime({
@@ -222,6 +223,20 @@ test("browser runtime accepts only the projected local capability", () => {
       mutationToken: "short",
     }),
     null,
+  );
+  assert.equal(
+    parseLocalAtlasRuntime({
+      ...runtime,
+      shutdownAvailable: "yes",
+    }),
+    null,
+  );
+  assert.equal(
+    parseLocalAtlasRuntime({
+      ...runtime,
+      shutdownAvailable: true,
+    })?.shutdownAvailable,
+    true,
   );
 });
 

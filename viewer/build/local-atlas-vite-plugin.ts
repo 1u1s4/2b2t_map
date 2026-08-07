@@ -2337,24 +2337,28 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
   const shutdownApplication =
     options.shutdownApplication ??
     (supervisorPid && existsSync(launcherPath)
-      ? () => {
-          const child = spawn(
-            "/bin/bash",
-            [
-              launcherPath,
-              "--stop",
-              "--expected-supervisor-pid",
-              String(supervisorPid),
-            ],
-            {
-              cwd: projectRoot,
-              detached: true,
-              stdio: "ignore",
-            },
-          );
-          child.once("error", () => undefined);
-          child.unref();
-        }
+      ? () =>
+          new Promise<void>((resolveShutdown, rejectShutdown) => {
+            const child = spawn(
+              "/bin/bash",
+              [
+                launcherPath,
+                "--stop",
+                "--expected-supervisor-pid",
+                String(supervisorPid),
+              ],
+              {
+                cwd: projectRoot,
+                detached: true,
+                stdio: "ignore",
+              },
+            );
+            child.once("spawn", () => {
+              child.unref();
+              resolveShutdown();
+            });
+            child.once("error", rejectShutdown);
+          })
       : null);
   const defaultVenvPython = resolve(projectRoot, ".venv", "bin", "python");
   const pythonBin =
@@ -3083,7 +3087,9 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
           const timer = setTimeout(() => {
             void Promise.resolve()
               .then(() => shutdownApplication())
-              .catch(() => undefined);
+              .catch(() => {
+                state.shutdownScheduled = false;
+              });
           }, APPLICATION_SHUTDOWN_DELAY_MS);
           timer.unref();
         });

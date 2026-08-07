@@ -27,6 +27,11 @@ sola vez. Los mapas y el workspace permanecen únicamente en LuisA. Solo hay que
 reinstalar el icono si se mueve el repositorio o cambia la instalación de Node
 o Python.
 
+En **Inicio · Atlas**, la acción **Apagar aplicación** guarda los cambios,
+pausa de forma reanudable cualquier descarga regional y detiene el supervisor.
+La pestaña muestra una confirmación final; el siguiente clic en el icono de
+Aplicaciones inicia de nuevo estos mismos archivos fuente.
+
 El arranque equivalente desde Terminal sigue disponible:
 
 ```bash
@@ -410,6 +415,7 @@ Rutas:
 | `GET` | `/api/local-atlas/region-status?...` | verificar una región y su readiness durable |
 | `POST` | `/api/local-atlas/download` | iniciar o reanudar una región validada |
 | `POST` | `/api/local-atlas/stop` | detener el trabajo activo |
+| `POST` | `/api/local-atlas/shutdown` | guardar desde la UI y detener la aplicación supervisada |
 | `GET`/`HEAD` | `/api/tile` | servir exclusivamente un tile local |
 
 Protecciones:

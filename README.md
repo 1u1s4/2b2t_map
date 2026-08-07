@@ -99,6 +99,12 @@ solicita permiso para acceder al proyecto dentro de `Documents`; hay que elegir
 LuisA. Solo vuelve a ejecutar el instalador si mueves el proyecto o cambias Node
 o Python.
 
+Para cerrar el servidor sin usar Terminal, abre **Inicio · Atlas**, baja hasta
+**Apagar aplicación** y confirma **Guardar y apagar**. Atlas guarda primero el
+workspace; si hay una descarga regional, la pausa de forma reanudable antes de
+detener el supervisor. La pestaña confirma cuándo ya se puede cerrar y el icono
+de Aplicaciones vuelve a iniciar el mismo código fuente.
+
 Inicia el atlas:
 
 ```bash
