@@ -30,7 +30,10 @@ import {
   withCellSkipped,
   withCurrentIndex,
 } from "../app/lib/exploration-grid.ts";
-import { createCoverageSelection } from "../app/lib/overworld-coverage.ts";
+import {
+  createCoverageSelection,
+  overviewCellForIndex,
+} from "../app/lib/overworld-coverage.ts";
 import {
   localAtlasWorkspaceContent,
   parseLocalAtlasWorkspace,
@@ -44,6 +47,8 @@ import {
 } from "../app/lib/single-workspace-session.ts";
 
 const NOW = "2026-07-25T12:00:00.000Z";
+const FIRST_MINECRAFT_SECTOR_ID = overviewCellForIndex(0).id;
+const SECOND_MINECRAFT_SECTOR_ID = overviewCellForIndex(1).id;
 
 function explorationState(id = "region-a") {
   let state = createExplorationState({
@@ -99,6 +104,10 @@ function content(overrides = {}) {
       },
     ],
     coverageSelection: createCoverageSelection(10, 10, 12, 13),
+    minecraftExploredSectorIds: [
+      SECOND_MINECRAFT_SECTOR_ID,
+      FIRST_MINECRAFT_SECTOR_ID,
+    ],
     ...overrides,
   };
 }
@@ -149,6 +158,10 @@ test("workspace parser canonicalizes nested state, coverage, and highlights", ()
   assert.equal(parsed.highlights[0].color, "#ff5f57");
   assert.equal(parsed.highlights[0].regionKey, "-1024:0:1024:1024");
   assert.equal(parsed.coverageSelection?.cellCount, 6);
+  assert.deepEqual(parsed.minecraftExploredSectorIds, [
+    FIRST_MINECRAFT_SECTOR_ID,
+    SECOND_MINECRAFT_SECTOR_ID,
+  ]);
 
   assert.throws(
     () =>
@@ -182,6 +195,17 @@ test("workspace parser canonicalizes nested state, coverage, and highlights", ()
       }),
     /región del highlight no es válida/,
   );
+  assert.throws(
+    () =>
+      parseAtlasWorkspaceContent({
+        ...content(),
+        minecraftExploredSectorIds: [
+          FIRST_MINECRAFT_SECTOR_ID,
+          FIRST_MINECRAFT_SECTOR_ID,
+        ],
+      }),
+    /sectores explorados en Minecraft no son válidos/,
+  );
   const tampered = content();
   tampered.explorations[0].state.reviewedCount = 99;
   assert.throws(
@@ -190,15 +214,18 @@ test("workspace parser canonicalizes nested state, coverage, and highlights", ()
   );
 });
 
-test("workspace v1 accepts legacy highlights without a region scope", () => {
+test("workspace v1 accepts legacy highlights and missing Minecraft progress", () => {
   const legacy = content();
   delete legacy.highlights[0].regionKey;
+  delete legacy.minecraftExploredSectorIds;
 
   const diskParsed = parseAtlasWorkspaceContent(legacy);
   const clientParsed = parseLocalAtlasWorkspaceContent(legacy);
 
   assert.equal("regionKey" in diskParsed.highlights[0], false);
   assert.equal("regionKey" in clientParsed.highlights[0], false);
+  assert.deepEqual(diskParsed.minecraftExploredSectorIds, []);
+  assert.deepEqual(clientParsed.minecraftExploredSectorIds, []);
 });
 
 test("single-session consolidation preserves the richest overlapping review progress", () => {
@@ -283,7 +310,9 @@ test("single-session consolidation preserves the richest overlapping review prog
 });
 
 test("a stale journal merges only progress for the same spatial region", () => {
-  const current = contentForExploration("region-current");
+  const current = contentForExploration("region-current", {
+    minecraftExploredSectorIds: [FIRST_MINECRAFT_SECTOR_ID],
+  });
   let recoveredState = createExplorationState({
     id: "region-recovery",
     name: "Copia inmediata",
@@ -304,6 +333,7 @@ test("a stale journal merges only progress for the same spatial region", () => {
     ],
     highlights: [],
     coverageSelection: null,
+    minecraftExploredSectorIds: [SECOND_MINECRAFT_SECTOR_ID],
   });
 
   const merged = mergeMatchingWorkspaceProgress(current, recovery);
@@ -319,6 +349,10 @@ test("a stale journal merges only progress for the same spatial region", () => {
   );
   assert.deepEqual(merged.highlights, current.highlights);
   assert.deepEqual(merged.coverageSelection, current.coverageSelection);
+  assert.deepEqual(
+    merged.minecraftExploredSectorIds,
+    [FIRST_MINECRAFT_SECTOR_ID, SECOND_MINECRAFT_SECTOR_ID],
+  );
 
   const adjacent = contentForExploration("region-adjacent", {
     explorations: [
@@ -642,11 +676,15 @@ test("updating the same canonical session does not create a replacement archive"
       randomUUID(),
     );
 
-    await store.write(
-      contentForExploration("region-a", { highlights: [] }),
+    const updated = await store.write(
+      contentForExploration("region-a", {
+        highlights: [],
+        minecraftExploredSectorIds: [],
+      }),
       first.workspace,
       randomUUID(),
     );
+    assert.deepEqual(updated.workspace.minecraftExploredSectorIds, []);
 
     await assert.rejects(
       readdir(store.replacementBackupDirectory),

@@ -25,6 +25,9 @@ import {
   type OverworldCoverageSelection,
 } from "../app/lib/overworld-coverage.ts";
 import { isHighlightRegionKey } from "../app/lib/highlights.ts";
+import {
+  parseMinecraftExploredSectorIds,
+} from "../app/lib/minecraft-explored-sectors.ts";
 import { consolidateSingleWorkspaceContent } from "../app/lib/single-workspace-session.ts";
 
 export const ATLAS_WORKSPACE_SCHEMA_VERSION = 1 as const;
@@ -109,6 +112,7 @@ export interface AtlasWorkspaceContent {
   readonly explorations: readonly AtlasWorkspaceExploration[];
   readonly highlights: readonly AtlasWorkspaceHighlight[];
   readonly coverageSelection: OverworldCoverageSelection | null;
+  readonly minecraftExploredSectorIds: readonly string[];
 }
 
 export interface AtlasWorkspaceDocument extends AtlasWorkspaceContent {
@@ -489,6 +493,17 @@ export function parseAtlasWorkspaceContent(
       "INVALID_WORKSPACE",
     );
   }
+  const minecraftExploredSectorIds = parseMinecraftExploredSectorIds(
+    value.minecraftExploredSectorIds === undefined
+      ? []
+      : value.minecraftExploredSectorIds,
+  );
+  if (!minecraftExploredSectorIds) {
+    throw new AtlasWorkspaceError(
+      "Los sectores explorados en Minecraft no son válidos",
+      "INVALID_WORKSPACE",
+    );
+  }
 
   const content: AtlasWorkspaceContent = {
     schemaVersion: ATLAS_WORKSPACE_SCHEMA_VERSION,
@@ -496,6 +511,7 @@ export function parseAtlasWorkspaceContent(
     explorations,
     highlights,
     coverageSelection,
+    minecraftExploredSectorIds,
   };
   if (serializedBytes(content) > MAX_ATLAS_WORKSPACE_BYTES) {
     throw new AtlasWorkspaceError(
@@ -576,6 +592,7 @@ function emptyWorkspace(workspaceId: string): AtlasWorkspaceDocument {
     explorations: [],
     highlights: [],
     coverageSelection: null,
+    minecraftExploredSectorIds: [],
   };
 }
 
@@ -599,6 +616,7 @@ function documentContent(
     explorations: workspace.explorations,
     highlights: workspace.highlights,
     coverageSelection: workspace.coverageSelection,
+    minecraftExploredSectorIds: workspace.minecraftExploredSectorIds,
   };
 }
 

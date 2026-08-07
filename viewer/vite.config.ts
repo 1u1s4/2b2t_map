@@ -68,6 +68,18 @@ export default defineConfig(async ({ command, mode }) => {
   const requirementBytes = requirementText
     ? Number(requirementText)
     : undefined;
+  const supervisorPidText =
+    process.env.OBSIDIAN_ATLAS_SUPERVISOR_PID ??
+    atlasEnvironment.OBSIDIAN_ATLAS_SUPERVISOR_PID;
+  const supervisorPidValue = supervisorPidText
+    ? Number(supervisorPidText)
+    : undefined;
+  const supervisorPid =
+    supervisorPidValue !== undefined &&
+    Number.isSafeInteger(supervisorPidValue) &&
+    supervisorPidValue > 0
+      ? supervisorPidValue
+      : undefined;
   const serverOptions = {
     ...(isCodexSeatbeltSandbox
       ? { watch: { useFsEvents: false, usePolling: true } }
@@ -88,6 +100,7 @@ export default defineConfig(async ({ command, mode }) => {
         minecraftRoot,
         pythonBin,
         projectRoot: fileURLToPath(new URL("..", import.meta.url)),
+        supervisorPid,
         overworldRequirementBytes: requirementBytes,
       }),
       vinext(),

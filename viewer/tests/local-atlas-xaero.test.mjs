@@ -138,7 +138,7 @@ async function fixture({
   };
 }
 
-test("Xaero format adds the suffix once and floors Nether coordinates", () => {
+test("Xaero format adds the suffix once and hides Nether waypoints by default", () => {
   assert.equal(netherCoordinate(7), 0);
   assert.equal(netherCoordinate(8), 1);
   assert.equal(netherCoordinate(-1), -1);
@@ -159,6 +159,16 @@ test("Xaero format adds the suffix once and floors Nether coordinates", () => {
   assert.match(nether, /:-2:~:1:12:true:0:gui\.xaero_default:/);
   assert.equal(overworld.split(":").length, 14);
   assert.equal(nether.split(":").length, 14);
+
+  const visibleHighlight = pin({ visible: true });
+  assert.match(
+    xaeroWaypointLine(visibleHighlight, "overworld"),
+    /:-9:~:15:12:false:0:gui\.xaero_default:/,
+  );
+  assert.match(
+    xaeroWaypointLine(visibleHighlight, "nether"),
+    /:-2:~:1:12:true:0:gui\.xaero_default:/,
+  );
   assert.throws(
     () => xaeroWaypointLine(pin({ title: "Token §§ literal" }), "overworld"),
     /token reservado/,
@@ -347,7 +357,7 @@ test("dual export preserves existing rows, backs up, and is idempotent", async (
     );
     assert.match(
       nether,
-      /waypoint:Punto§§ Norte - Atlas:PN:-2:~:1:12:false:0:gui\.xaero_default:false:0:0:false/,
+      /waypoint:Punto§§ Norte - Atlas:PN:-2:~:1:12:true:0:gui\.xaero_default:false:0:0:false/,
     );
 
     const manifest = JSON.parse(

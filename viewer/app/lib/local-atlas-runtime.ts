@@ -4,6 +4,9 @@ import {
   type WorldBounds,
 } from "./exploration-grid.ts";
 import {
+  parseMinecraftExploredSectorIds,
+} from "./minecraft-explored-sectors.ts";
+import {
   parseCoverageSelection,
   type OverworldCoverageSelection,
 } from "./overworld-coverage.ts";
@@ -143,6 +146,7 @@ export interface LocalGlobalDownloadProgress {
 export interface LocalAtlasRuntime {
   readonly localOnly: true;
   readonly mutationToken: string;
+  readonly shutdownAvailable: boolean;
   readonly capacity: LocalCapacitySnapshot;
   readonly persistence: {
     readonly configured: boolean;
@@ -312,6 +316,7 @@ export interface LocalAtlasWorkspaceContent {
   readonly explorations: readonly LocalAtlasWorkspaceExploration[];
   readonly highlights: readonly LocalAtlasWorkspaceHighlight[];
   readonly coverageSelection: OverworldCoverageSelection | null;
+  readonly minecraftExploredSectorIds: readonly string[];
 }
 
 export interface LocalAtlasWorkspace extends LocalAtlasWorkspaceContent {
@@ -842,6 +847,10 @@ export function parseLocalAtlasRuntime(
   if (
     job === undefined ||
     globalDownload === undefined ||
+    !(
+      value.shutdownAvailable === undefined ||
+      typeof value.shutdownAvailable === "boolean"
+    ) ||
     typeof capacity.configured !== "boolean" ||
     typeof capacity.volume !== "string" ||
     !nullableNumber(capacity.totalBytes) ||
@@ -874,6 +883,7 @@ export function parseLocalAtlasRuntime(
   return {
     localOnly: true,
     mutationToken: value.mutationToken,
+    shutdownAvailable: value.shutdownAvailable === true,
     capacity: {
       configured: capacity.configured,
       volume: capacity.volume,
@@ -1136,6 +1146,12 @@ export function parseLocalAtlasWorkspaceContent(
       ? null
       : parseCoverageSelection(value.coverageSelection);
   if (value.coverageSelection !== null && !coverageSelection) return null;
+  const minecraftExploredSectorIds = parseMinecraftExploredSectorIds(
+    value.minecraftExploredSectorIds === undefined
+      ? []
+      : value.minecraftExploredSectorIds,
+  );
+  if (!minecraftExploredSectorIds) return null;
 
   return {
     schemaVersion: LOCAL_ATLAS_WORKSPACE_SCHEMA_VERSION,
@@ -1143,6 +1159,7 @@ export function parseLocalAtlasWorkspaceContent(
     explorations,
     highlights,
     coverageSelection,
+    minecraftExploredSectorIds,
   };
 }
 
@@ -1188,6 +1205,7 @@ export function localAtlasWorkspaceContent(
     explorations: workspace.explorations,
     highlights: workspace.highlights,
     coverageSelection: workspace.coverageSelection,
+    minecraftExploredSectorIds: workspace.minecraftExploredSectorIds,
   };
 }
 
@@ -1735,5 +1753,30 @@ export async function stopLocalRegionJob(
         ? payload.error
         : "No se pudo detener la descarga regional",
     );
+  }
+}
+
+export async function shutdownLocalAtlasApplication(
+  runtime: LocalAtlasRuntime,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch("/api/local-atlas/shutdown", {
+    method: "POST",
+    cache: "no-store",
+    signal,
+    headers: {
+      "X-Atlas-Token": runtime.mutationToken,
+    },
+  });
+  const payload = (await response.json().catch(() => null)) as unknown;
+  if (!response.ok) {
+    throw new Error(
+      isRecord(payload) && typeof payload.error === "string"
+        ? payload.error
+        : "No se pudo apagar Obsidian Atlas",
+    );
+  }
+  if (!isRecord(payload) || payload.shuttingDown !== true) {
+    throw new Error("El runtime no confirmó el apagado de Obsidian Atlas");
   }
 }

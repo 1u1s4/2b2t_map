@@ -6,6 +6,9 @@ import {
   withCellsReviewed,
   type ExplorationState,
 } from "./exploration-grid.ts";
+import {
+  parseMinecraftExploredSectorIds,
+} from "./minecraft-explored-sectors.ts";
 
 export interface WorkspaceExplorationRecord {
   readonly id: string;
@@ -24,6 +27,8 @@ export interface WorkspaceContentRecord<
   readonly explorations: readonly Exploration[];
   readonly highlights: readonly Highlight[];
   readonly coverageSelection: CoverageSelection | null;
+  /** Optional only while canonicalizing workspaces created before this field. */
+  readonly minecraftExploredSectorIds?: readonly string[];
 }
 
 function stateFor(
@@ -200,12 +205,22 @@ export function mergeMatchingWorkspaceProgress<
   ) {
     return null;
   }
-  return consolidateSingleWorkspaceContent({
+  const merged = consolidateSingleWorkspaceContent({
     ...current,
     activeExplorationId:
       current.activeExplorationId ?? recovery.activeExplorationId,
     explorations: [currentExploration, recoveryExploration],
   });
+  const minecraftExploredSectorIds = parseMinecraftExploredSectorIds([
+    ...new Set([
+      ...(current.minecraftExploredSectorIds ?? []),
+      ...(recovery.minecraftExploredSectorIds ?? []),
+    ]),
+  ]);
+  return {
+    ...merged,
+    minecraftExploredSectorIds: minecraftExploredSectorIds ?? [],
+  };
 }
 
 function richerDuplicate<
@@ -252,6 +267,7 @@ export function mergeWorkspaceContentCandidates<
       explorations: [],
       highlights: [],
       coverageSelection: null,
+      minecraftExploredSectorIds: [],
     };
   }
   const activeExplorationId =
@@ -277,6 +293,13 @@ export function mergeWorkspaceContentCandidates<
       }
     }
   }
+  const minecraftExploredSectorIds = parseMinecraftExploredSectorIds([
+    ...new Set(
+      candidates.flatMap(
+        (candidate) => candidate.minecraftExploredSectorIds ?? [],
+      ),
+    ),
+  ]);
   return {
     schemaVersion: 1,
     activeExplorationId:
@@ -289,5 +312,6 @@ export function mergeWorkspaceContentCandidates<
     coverageSelection:
       candidates.find((candidate) => candidate.coverageSelection !== null)
         ?.coverageSelection ?? null,
+    minecraftExploredSectorIds: minecraftExploredSectorIds ?? [],
   };
 }

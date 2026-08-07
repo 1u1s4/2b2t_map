@@ -13,6 +13,23 @@ y descarga regional únicamente en `localhost`. La interfaz requiere al menos
 La forma recomendada, desde la raíz del repositorio, es:
 
 ```bash
+./install_macos_app.sh
+```
+
+El instalador crea `/Applications/Obsidian Atlas.app`. A partir de entonces,
+abrir el icono inicia el servidor local si está apagado, espera su comprobación
+de salud y abre Atlas en Google Chrome. La app reutiliza el supervisor y el
+workspace de LuisA existentes; no crea otro proceso cuando el visor ya está
+activo. No copia el runtime: siempre ejecuta estos archivos fuente mediante una
+referencia directa al repositorio. En el primer arranque macOS solicita permiso
+para acceder al proyecto dentro de `Documents`; hay que elegir **Permitir** una
+sola vez. Los mapas y el workspace permanecen únicamente en LuisA. Solo hay que
+reinstalar el icono si se mueve el repositorio o cambia la instalación de Node
+o Python.
+
+El arranque equivalente desde Terminal sigue disponible:
+
+```bash
 ./start_local_atlas_luisa.sh
 ```
 
@@ -138,6 +155,12 @@ filtros. El inspector muestra tiles guardados, objetivo, porcentaje y límites
 X/Z. **Anterior**, **Siguiente**, flechas y `Enter` permiten operar sin apuntar
 a celdas pequeñas; un clic selecciona el sector y la cruceta de escritorio
 permite ajustar el sector enfocado antes de elegirlo.
+
+El inspector permite marcar o desmarcar cada sector como **explorado en
+Minecraft**. Ese avance manual se guarda globalmente en el workspace de LuisA,
+independiente de la descarga y de la revisión automática de celdas. Los
+sectores terminados reciben un overlay azul con `✓`, visible aunque después se
+abra o reemplace otra región.
 
 La huella publicada permanece como detalle interno del cálculo, no como una
 vista seleccionable. Cada `404` confirmado se excluye del denominador para que
@@ -354,7 +377,9 @@ completo como
 `obsidian-atlas-ruta-vista.png`. **Renombrar y exportar a Xaero** guarda los
 puntos como `A · Nombre`, `B · Nombre`… en el orden calculado, prepara el
 alcance de la región activa y abre la vista previa segura antes de escribir en
-Minecraft. Las áreas no se renombran porque Xaero no las exporta.
+Minecraft. Los waypoints del Nether se exportan ocultos por defecto para poder
+activar manualmente solo los necesarios. Las áreas no se renombran porque Xaero
+no las exporta.
 
 ## Atajos
 

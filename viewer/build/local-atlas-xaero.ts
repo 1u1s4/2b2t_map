@@ -431,7 +431,7 @@ export function xaeroWaypointLine(
     "~",
     String(z),
     String(xaeroColorIndex(highlight.color)),
-    String(!highlight.visible),
+    String(dimension === "nether" || !highlight.visible),
     "0",
     XAERO_SET,
     "false",

@@ -15,6 +15,7 @@ function emptyContent() {
     explorations: [],
     highlights: [],
     coverageSelection: null,
+    minecraftExploredSectorIds: [],
   };
 }
 
@@ -71,6 +72,7 @@ test("workspace HTTP contract requires local origin, token, ETag, and write id",
     assert.equal(emptyResponse.status, 200);
     const empty = await emptyResponse.json();
     assert.equal(empty.revision, 0);
+    assert.deepEqual(empty.minecraftExploredSectorIds, []);
     const emptyEtag = `"atlas-${empty.workspaceId}-0"`;
     assert.equal(emptyResponse.headers.get("etag"), emptyEtag);
 

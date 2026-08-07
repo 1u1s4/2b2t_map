@@ -82,6 +82,23 @@ npm ci
 cd ..
 ```
 
+Instala también el icono nativo una vez:
+
+```bash
+./install_macos_app.sh
+```
+
+Esto crea **Obsidian Atlas.app** en `/Applications`. Al abrirla desde
+Aplicaciones, el lanzador inicia el servidor supervisado si está apagado,
+espera a que quede listo y abre [http://localhost:3001](http://localhost:3001)
+en Google Chrome. Si Atlas ya está activo, reutiliza la misma instancia. La app
+no se ejecuta al iniciar sesión ni copia el código: cada arranque usa directamente
+los archivos fuente actuales de este repositorio. En el primer arranque macOS
+solicita permiso para acceder al proyecto dentro de `Documents`; hay que elegir
+**Permitir** una sola vez. Los mapas, el workspace y los backups siguen en
+LuisA. Solo vuelve a ejecutar el instalador si mueves el proyecto o cambias Node
+o Python.
+
 Inicia el atlas:
 
 ```bash
@@ -126,6 +143,8 @@ PYTHON_BIN='/Users/luisalvarado/Documents/GitHub/2b2t_map/.venv/bin/python' \
    o **Por explorar**.
 3. Haz clic en un sector o arrastra sobre varios. El panel muestra sus límites
    X/Z y la cantidad de filas y columnas LOD 0.
+   Desde el inspector también puedes marcar un sector como **explorado en
+   Minecraft**; el Atlas lo conserva con un overlay azul y una marca `✓`.
 4. El visor comprueba las tres capas. Si falta algo, elige el ritmo y pulsa
    **Descargar región completa**. La exploración permanece bloqueada.
 5. Puedes detener el trabajo sin perder datos y usar **Reanudar descarga**
@@ -151,6 +170,8 @@ por región y debe terminar antes de entrar; la segunda se registra
 automáticamente al visitar una celda, aunque el relleno de la celda actual se
 retrase para no tapar el mapa. Una ausencia `404` no se disfraza de revisión:
 se guarda en su propio bitset y se excluye del total revisable.
+La marca azul también es independiente: representa únicamente que terminaste
+ese sector en el juego real y puede activarse o quitarse manualmente.
 
 ### Recorrido visual
 
@@ -418,7 +439,8 @@ El runtime guarda el workspace autoritativo en una ruta fija derivada de
 
 Las escrituras usan revisión CAS, identificador idempotente, temporal en el
 mismo directorio, `fsync`, renombrado atómico y backup. El documento conserva
-exactamente cero o una sesión, hasta 10,000 highlights y la selección global.
+exactamente cero o una sesión, hasta 10,000 highlights, la selección global y
+los sectores marcados como explorados en Minecraft.
 Una WAL fija en `localStorage` existe únicamente mientras una escritura está
 pendiente; si su revisión base ya no coincide, LuisA gana automáticamente.
 Nunca se crean ramas por pestaña. Si LuisA no está disponible o está en solo
@@ -457,7 +479,8 @@ superpone segmentos y etiquetas `A…Z`, `a…z`, `A1…`. **JSON** crea
 tarjeta, **Renombrar y exportar a Xaero** guarda cada punto con su orden
 (`A · Nombre`, `B · Nombre`…), limita el alcance a la región activa y abre la
 vista previa antes de modificar los waypoints de Minecraft. Las áreas conservan
-su título porque Xaero solo admite puntos.
+su título porque Xaero solo admite puntos. Los waypoints del Nether se exportan
+ocultos por defecto para activarlos manualmente en Xaero cuando hagan falta.
 
 ## Variables locales
 

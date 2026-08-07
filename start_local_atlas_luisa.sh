@@ -390,6 +390,7 @@ serve_loop() {
       export OBSIDIAN_ATLAS_BACKING_ROOT="${backing_root}"
       export OBSIDIAN_ATLAS_MINECRAFT_ROOT="${minecraft_root}"
       export OBSIDIAN_ATLAS_PYTHON="${python_bin}"
+      export OBSIDIAN_ATLAS_SUPERVISOR_PID="$$"
       exec npm run dev -- \
         --hostname localhost \
         --port "${viewer_port}"
@@ -540,13 +541,29 @@ show_status() {
 
 stop_viewer() {
   local attempt=0
+  local expected_supervisor_pid=""
   local owner_pid=""
+
+  if (( $# > 0 )); then
+    if (( $# != 2 )) ||
+      [[ "${1}" != "--expected-supervisor-pid" ]] ||
+      [[ ! "${2}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "Uso interno inválido de --stop." >&2
+      return 2
+    fi
+    expected_supervisor_pid="${2}"
+  fi
 
   if ! command -v screen >/dev/null 2>&1; then
     echo "No se encontró screen." >&2
     exit 1
   fi
   owner_pid=$(supervisor_pid || true)
+  if [[ -n "${expected_supervisor_pid}" ]] &&
+    [[ "${owner_pid}" != "${expected_supervisor_pid}" ]]; then
+    echo "El supervisor cambió; se canceló la solicitud de apagado antigua." >&2
+    return 1
+  fi
   if [[ -z "${owner_pid}" ]] &&
     [[ ! -e "${lock_file}" ]] &&
     ! screen_has_session &&
@@ -568,7 +585,10 @@ stop_viewer() {
     fi
   fi
 
-  if screen_has_session; then
+  # A request from the web UI is tied to one exact supervisor. Let its screen
+  # session disappear naturally instead of addressing a possibly newer
+  # session by the shared name.
+  if [[ -z "${expected_supervisor_pid}" ]] && screen_has_session; then
     screen -S "${session_name}" -X quit
   fi
 
@@ -607,7 +627,7 @@ case "${mode}" in
     show_status
     ;;
   --stop)
-    stop_viewer
+    stop_viewer "${@:2}"
     ;;
   --serve-loop)
     validate_environment

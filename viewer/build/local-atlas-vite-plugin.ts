@@ -33,6 +33,7 @@ const COVERAGE_ENDPOINT = "/api/local-atlas/coverage";
 const REGION_STATUS_ENDPOINT = "/api/local-atlas/region-status";
 const DOWNLOAD_ENDPOINT = "/api/local-atlas/download";
 const STOP_ENDPOINT = "/api/local-atlas/stop";
+const SHUTDOWN_ENDPOINT = "/api/local-atlas/shutdown";
 const WORKSPACE_ENDPOINT = "/api/local-atlas/workspace";
 const XAERO_PREVIEW_ENDPOINT = "/api/local-atlas/xaero-export/preview";
 const XAERO_EXPORT_ENDPOINT = "/api/local-atlas/xaero-export";
@@ -51,6 +52,7 @@ const DEFAULT_ESTIMATED_TILE_BYTES = 512 * 1024;
 const MIN_ESTIMATED_TILE_BYTES = 64 * 1024;
 const MAX_ESTIMATED_TILE_BYTES = 2 * 1024 * 1024;
 const STOP_GRACE_PERIOD_MS = 15_000;
+const APPLICATION_SHUTDOWN_DELAY_MS = 250;
 const ALLOWED_LAYERS = new Set(["base", "overlay", "newchunks"]);
 const CANONICAL_LAYERS = ["base", "overlay", "newchunks"] as const;
 const INTEGER_PATTERN = /^[+-]?\d+$/;
@@ -510,6 +512,8 @@ export interface LocalAtlasOptions {
   readonly minecraftOpenProbe?: (lockPath: string) => Promise<boolean>;
   readonly pythonBin?: string;
   readonly projectRoot?: string;
+  readonly supervisorPid?: number;
+  readonly shutdownApplication?: () => void | Promise<void>;
   readonly overworldRequirementBytes?: number;
 }
 
@@ -624,6 +628,7 @@ interface RuntimeState {
   job: LocalJob | null;
   child: ChildProcess | null;
   stopTimer: NodeJS.Timeout | null;
+  shutdownScheduled: boolean;
 }
 
 interface LocalCoverageResult {
@@ -2322,11 +2327,45 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
       ? options.overworldRequirementBytes
       : undefined;
   const projectRoot = resolve(options.projectRoot ?? "..");
+  const supervisorPid =
+    options.supervisorPid &&
+    Number.isSafeInteger(options.supervisorPid) &&
+    options.supervisorPid > 0
+      ? options.supervisorPid
+      : undefined;
+  const launcherPath = resolve(projectRoot, "start_local_atlas_luisa.sh");
+  const shutdownApplication =
+    options.shutdownApplication ??
+    (supervisorPid && existsSync(launcherPath)
+      ? () => {
+          const child = spawn(
+            "/bin/bash",
+            [
+              launcherPath,
+              "--stop",
+              "--expected-supervisor-pid",
+              String(supervisorPid),
+            ],
+            {
+              cwd: projectRoot,
+              detached: true,
+              stdio: "ignore",
+            },
+          );
+          child.once("error", () => undefined);
+          child.unref();
+        }
+      : null);
   const defaultVenvPython = resolve(projectRoot, ".venv", "bin", "python");
   const pythonBin =
     options.pythonBin?.trim() ||
     (existsSync(defaultVenvPython) ? defaultVenvPython : "python3");
-  const state: RuntimeState = { job: null, child: null, stopTimer: null };
+  const state: RuntimeState = {
+    job: null,
+    child: null,
+    stopTimer: null,
+    shutdownScheduled: false,
+  };
   const mutationToken = randomUUID();
   const workspaceStore = backingRoot
     ? new LocalAtlasWorkspaceStore(backingRoot)
@@ -2545,6 +2584,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
       path !== REGION_STATUS_ENDPOINT &&
       path !== DOWNLOAD_ENDPOINT &&
       path !== STOP_ENDPOINT &&
+      path !== SHUTDOWN_ENDPOINT &&
       path !== WORKSPACE_ENDPOINT &&
       path !== XAERO_PREVIEW_ENDPOINT &&
       path !== XAERO_EXPORT_ENDPOINT &&
@@ -2786,6 +2826,7 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
       writeJson(response, 200, {
         localOnly: true,
         mutationToken,
+        shutdownAvailable: shutdownApplication !== null,
         capacity,
         persistence,
         // Kept for wire compatibility. Global downloading is deliberately
@@ -2999,6 +3040,55 @@ export function createLocalAtlasMiddleware(options: LocalAtlasOptions) {
         state.child?.kill("SIGTERM");
       }, STOP_GRACE_PERIOD_MS);
       writeJson(response, 202, { job: publicJob(state.job) });
+      return;
+    }
+
+    if (path === SHUTDOWN_ENDPOINT && request.method === "POST") {
+      if (request.headers["x-atlas-token"] !== mutationToken) {
+        writeJson(response, 403, {
+          error: "Token local inválido; recarga el visor",
+        });
+        return;
+      }
+      if (!shutdownApplication) {
+        writeJson(response, 503, {
+          error: "El apagado está disponible solo desde la aplicación supervisada",
+        });
+        return;
+      }
+      const contentLength = request.headers["content-length"];
+      if (
+        request.url !== SHUTDOWN_ENDPOINT ||
+        request.headers["transfer-encoding"] !== undefined ||
+        (contentLength !== undefined && contentLength !== "0")
+      ) {
+        writeJson(response, 400, {
+          error: "La solicitud de apagado no admite parámetros ni contenido",
+        });
+        return;
+      }
+      if (
+        state.child &&
+        (state.job?.status === "running" || state.job?.status === "stopping")
+      ) {
+        writeJson(response, 409, {
+          error: "Espera a que se detenga la descarga regional antes de apagar Atlas",
+          job: publicJob(state.job),
+        });
+        return;
+      }
+      if (!state.shutdownScheduled) {
+        state.shutdownScheduled = true;
+        response.once("finish", () => {
+          const timer = setTimeout(() => {
+            void Promise.resolve()
+              .then(() => shutdownApplication())
+              .catch(() => undefined);
+          }, APPLICATION_SHUTDOWN_DELAY_MS);
+          timer.unref();
+        });
+      }
+      writeJson(response, 202, { shuttingDown: true });
       return;
     }
 

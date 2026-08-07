@@ -373,3 +373,50 @@ test("visited cells use verified green while the active cell stays clear", () =>
     /if \(visual\.glow\) \{[\s\S]*?context\.shadowColor = visual\.glow[\s\S]*?context\.shadowBlur = 16/,
   );
 });
+
+test("Atlas sectors expose durable Minecraft completion with a blue overlay", () => {
+  assert.match(
+    viewerSource,
+    /const \[minecraftExploredSectorIds, setMinecraftExploredSectorIds\][\s\S]*?useState<readonly string\[\]>/,
+  );
+  assert.match(
+    viewerSource,
+    /const workspaceContent = useMemo<LocalAtlasWorkspaceContent>[\s\S]*?minecraftExploredSectorIds/,
+  );
+  assert.match(
+    viewerSource,
+    /setMinecraftExploredSectorIds\(\[[\s\S]*?canonical\.minecraftExploredSectorIds/,
+  );
+  assert.match(
+    viewerSource,
+    /if \(localId === currentId\)[\s\S]*?minecraftExploredSectorIds:[\s\S]*?localCanonical\.minecraftExploredSectorIds/,
+  );
+
+  const toggleStart = viewerSource.indexOf(
+    "const toggleFocusedMinecraftExploredSector",
+  );
+  const toggleEnd = viewerSource.indexOf("const fitAtlasView", toggleStart);
+  const toggleBlock = viewerSource.slice(toggleStart, toggleEnd);
+  assert.ok(toggleStart >= 0 && toggleEnd > toggleStart);
+  assert.match(
+    toggleBlock,
+    /withMinecraftExploredSector\([\s\S]*?minecraftExploredSectorIds: nextSectorIds[\s\S]*?workspaceContentRef\.current = nextContent[\s\S]*?journalWorkspace\(nextContent\)[\s\S]*?setMinecraftExploredSectorIds/,
+  );
+
+  assert.match(
+    viewerSource,
+    /const exploredInMinecraft =[\s\S]*?minecraftExploredSectorIdSet\.has\(cell\.id\)[\s\S]*?if \(exploredInMinecraft\)[\s\S]*?rgba\(37, 99, 235, 0\.38\)[\s\S]*?fillText\("✓"/,
+  );
+  assert.match(
+    viewerSource,
+    /className=\{`atlas-minecraft-toggle[\s\S]*?aria-pressed=\{atlasFocusedMinecraftExplored\}[\s\S]*?onClick=\{toggleFocusedMinecraftExploredSector\}[\s\S]*?Marcar explorado en Minecraft/,
+  );
+  assert.match(
+    styles,
+    /\.atlas-sector-actions \.atlas-minecraft-toggle[\s\S]*?grid-column:\s*1 \/ -1/,
+  );
+  assert.match(
+    styles,
+    /\.atlas-sector-actions \.atlas-minecraft-toggle\.minecraft-explored[\s\S]*?rgba\(37, 99, 235, 0\.32\)/,
+  );
+});

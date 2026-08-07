@@ -4367,6 +4367,44 @@ canvas:focus-visible {
   line-height: 1.5;
 }
 
+.atlas-minecraft-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  margin-top: 9px;
+  padding: 9px 10px;
+  border: 1px solid rgba(98, 168, 255, 0.3);
+  border-radius: 10px;
+  color: #cbe5ff;
+  background: rgba(37, 99, 235, 0.12);
+}
+
+.atlas-minecraft-summary > span {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 9px;
+  color: #ffffff;
+  background: rgba(37, 99, 235, 0.55);
+}
+
+.atlas-minecraft-summary strong,
+.atlas-minecraft-summary small {
+  display: block;
+}
+
+.atlas-minecraft-summary strong {
+  font-size: 10px;
+}
+
+.atlas-minecraft-summary small {
+  margin-top: 3px;
+  color: #98bfe9;
+  font-size: 8px;
+}
+
 .saved-session-mini-track {
   display: block;
   overflow: hidden;
@@ -4660,6 +4698,20 @@ canvas:focus-visible {
   background: rgba(98, 168, 255, 0.09);
 }
 
+.atlas-sector-actions .atlas-minecraft-toggle {
+  grid-column: 1 / -1;
+  border-color: rgba(98, 168, 255, 0.38);
+  color: #cbe5ff;
+  background: rgba(37, 99, 235, 0.1);
+}
+
+.atlas-sector-actions .atlas-minecraft-toggle.minecraft-explored {
+  border-color: rgba(98, 168, 255, 0.75);
+  color: #ffffff;
+  background: rgba(37, 99, 235, 0.32);
+  box-shadow: inset 0 0 0 1px rgba(133, 196, 255, 0.16);
+}
+
 .atlas-selection-summary {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -4706,6 +4758,205 @@ canvas:focus-visible {
   color: var(--muted);
   background: rgba(255, 255, 255, 0.035);
   font-family: var(--font-geist-mono), monospace;
+}
+
+.atlas-app-controls {
+  padding-top: 9px;
+  border-top: 1px solid rgba(255, 102, 95, 0.14);
+}
+
+.atlas-shutdown-button {
+  display: grid;
+  width: 100%;
+  min-height: 48px;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid rgba(255, 102, 95, 0.3);
+  border-radius: 11px;
+  color: #ffc5c1;
+  background: rgba(255, 102, 95, 0.055);
+  cursor: pointer;
+  text-align: left;
+}
+
+.atlas-shutdown-button:hover:not(:disabled),
+.atlas-shutdown-button[aria-expanded="true"] {
+  border-color: rgba(255, 102, 95, 0.52);
+  color: #ffe1df;
+  background: rgba(255, 102, 95, 0.11);
+}
+
+.atlas-shutdown-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.atlas-shutdown-button strong,
+.atlas-shutdown-button small {
+  display: block;
+}
+
+.atlas-shutdown-button strong {
+  font-size: 10px;
+}
+
+.atlas-shutdown-button small {
+  margin-top: 3px;
+  color: var(--quiet);
+  font-size: 8px;
+}
+
+.atlas-shutdown-unavailable {
+  margin: 6px 2px 0;
+  color: var(--quiet);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.atlas-shutdown-confirm {
+  margin-top: 7px;
+  padding: 10px;
+  border: 1px solid rgba(255, 102, 95, 0.3);
+  border-radius: 11px;
+  background:
+    linear-gradient(145deg, rgba(255, 102, 95, 0.09), transparent 62%),
+    rgba(3, 11, 20, 0.88);
+}
+
+.atlas-shutdown-confirm > strong {
+  display: block;
+  color: #ffd5d2;
+  font-size: 10px;
+}
+
+.atlas-shutdown-confirm > p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.atlas-shutdown-confirm .atlas-shutdown-download-note {
+  color: #ffe0a3;
+}
+
+.atlas-shutdown-confirm .atlas-shutdown-error {
+  padding: 7px 8px;
+  border-radius: 8px;
+  color: #ffd1ce;
+  background: rgba(255, 102, 95, 0.1);
+}
+
+.atlas-shutdown-actions {
+  display: grid;
+  grid-template-columns: 0.82fr 1.18fr;
+  gap: 7px;
+  margin-top: 9px;
+}
+
+.atlas-shutdown-actions button {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  cursor: pointer;
+  font-size: 9px;
+}
+
+.atlas-shutdown-actions button.danger {
+  border-color: rgba(255, 102, 95, 0.4);
+  color: #ffd5d2;
+  background: rgba(255, 102, 95, 0.13);
+}
+
+.atlas-shutdown-actions button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.application-shutdown-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  padding: 28px;
+  place-items: center;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(98, 168, 255, 0.13), transparent 30%),
+    rgba(3, 9, 17, 0.96);
+  backdrop-filter: blur(15px);
+}
+
+.application-shutdown-screen > div {
+  display: grid;
+  max-width: 520px;
+  justify-items: center;
+  text-align: center;
+}
+
+.application-shutdown-icon {
+  display: grid;
+  width: 72px;
+  height: 72px;
+  place-items: center;
+  border: 1px solid rgba(98, 168, 255, 0.34);
+  border-radius: 22px;
+  color: #cae4ff;
+  background: rgba(98, 168, 255, 0.09);
+  box-shadow: 0 18px 54px rgba(0, 3, 10, 0.42);
+}
+
+.application-shutdown-screen.is-stopped .application-shutdown-icon {
+  border-color: rgba(38, 217, 199, 0.34);
+  color: #bafff7;
+  background: rgba(38, 217, 199, 0.08);
+}
+
+.application-shutdown-signal {
+  width: 7px;
+  height: 7px;
+  margin-top: 18px;
+  border-radius: 50%;
+  background: var(--blue);
+  box-shadow: 0 0 0 0 rgba(98, 168, 255, 0.5);
+  animation: atlas-shutdown-pulse 1.25s ease-out infinite;
+}
+
+.application-shutdown-screen.is-stopped .application-shutdown-signal {
+  background: var(--mint);
+  box-shadow: 0 0 16px rgba(38, 217, 199, 0.48);
+  animation: none;
+}
+
+.application-shutdown-screen h1 {
+  margin: 13px 0 0;
+  color: var(--text);
+  font-size: clamp(20px, 3vw, 30px);
+}
+
+.application-shutdown-screen p {
+  max-width: 470px;
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+@keyframes atlas-shutdown-pulse {
+  70% {
+    box-shadow: 0 0 0 12px rgba(98, 168, 255, 0);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgba(98, 168, 255, 0);
+  }
 }
 
 .atlas-launch-card {

@@ -31,6 +31,7 @@ import {
   MousePointer2,
   Navigation,
   Plus,
+  Power,
   RotateCcw,
   Route,
   Search,
@@ -142,6 +143,7 @@ import {
   readLocalAtlasWorkspace,
   readLocalAtlasXaeroPreview,
   regionJobMatchesBounds,
+  shutdownLocalAtlasApplication,
   stopLocalRegionJob,
   writeLocalAtlasWorkspace,
   type LocalAtlasRegionStatus,
@@ -166,6 +168,7 @@ import {
   cancelWorkspaceAutosave,
   scheduleWorkspaceAutosave,
 } from "./lib/workspace-autosave";
+import { withMinecraftExploredSector } from "./lib/minecraft-explored-sectors";
 import {
   type ChangeEvent,
   type FormEvent,
@@ -345,6 +348,15 @@ type PersistenceState =
   | "saved"
   | "readonly"
   | "offline"
+  | "error";
+
+type ApplicationShutdownPhase =
+  | "idle"
+  | "stopping-download"
+  | "saving"
+  | "requesting"
+  | "waiting"
+  | "stopped"
   | "error";
 
 type ActivePointer = {
@@ -1002,6 +1014,7 @@ export function MapViewer() {
   const areaStartRef = useRef<{ x: number; z: number } | null>(null);
   const areaPreviewRef = useRef<Highlight["bounds"]>(undefined);
   const coverageStartRef = useRef<OverworldOverviewCell | null>(null);
+  const coveragePreviewRef = useRef<OverworldCoverageSelection | null>(null);
   const atlasReturnViewRef = useRef<{
     readonly camera: Camera;
     readonly scale: number;
@@ -1076,6 +1089,8 @@ export function MapViewer() {
     useState<OverworldCoverageSelection | null>(null);
   const [coveragePreview, setCoveragePreview] =
     useState<OverworldCoverageSelection | null>(null);
+  const [minecraftExploredSectorIds, setMinecraftExploredSectorIds] =
+    useState<readonly string[]>([]);
   const [coverageSelectionReady, setCoverageSelectionReady] = useState(false);
   const [localSource, setLocalSource] = useState<LocalTileSource | null>(null);
   const [archiveName, setArchiveName] = useState<string | null>(null);
@@ -1147,6 +1162,12 @@ export function MapViewer() {
     "Comprobando LuisA…",
   );
   const [toast, setToast] = useState<string | null>(null);
+  const [confirmApplicationShutdown, setConfirmApplicationShutdown] =
+    useState(false);
+  const [applicationShutdownPhase, setApplicationShutdownPhase] =
+    useState<ApplicationShutdownPhase>("idle");
+  const [applicationShutdownError, setApplicationShutdownError] =
+    useState<string | null>(null);
   const [topbarRevealed, setTopbarRevealed] = useState(false);
   const [magnifierEnabled, setMagnifierEnabled] = useState(false);
   const [magnifierPosition, setMagnifierPosition] =
@@ -1714,12 +1735,14 @@ export function MapViewer() {
       explorations: savedExplorations,
       highlights,
       coverageSelection,
+      minecraftExploredSectorIds,
     }),
     [
       coverageSelection,
       explorationPlan,
       explorationState?.region.id,
       highlights,
+      minecraftExploredSectorIds,
       savedExplorations,
     ],
   );
@@ -1813,7 +1836,13 @@ export function MapViewer() {
     () => summarizeLocalCoverage(localCoverage, MAX_DETAIL_EXPLORATION_LOD),
     [localCoverage],
   );
+  const minecraftExploredSectorIdSet = useMemo(
+    () => new Set(minecraftExploredSectorIds),
+    [minecraftExploredSectorIds],
+  );
   const atlasFocusedCell = overviewCellForIndex(atlasFocusedCellIndex);
+  const atlasFocusedMinecraftExplored =
+    minecraftExploredSectorIdSet.has(atlasFocusedCell.id);
   const displayedCoordinate = atlasMode
     ? {
         x:
@@ -1849,9 +1878,13 @@ export function MapViewer() {
     localRuntime?.persistence.configured ?? false;
   const runtimePersistenceWritable =
     localRuntime?.persistence.writable ?? false;
+  const applicationShutdownBusy =
+    applicationShutdownPhase !== "idle" &&
+    applicationShutdownPhase !== "error";
   const workspaceMutationsBlocked =
     !runtimeChecked ||
     pauseBusy ||
+    applicationShutdownBusy ||
     !runtimePersistenceConfigured ||
     !runtimePersistenceWritable ||
     !workspaceReady;
@@ -2560,6 +2593,9 @@ export function MapViewer() {
       invalidateXaeroPreview();
       setHighlights(scopedHighlights);
       setCoverageSelection(canonical.coverageSelection);
+      setMinecraftExploredSectorIds([
+        ...canonical.minecraftExploredSectorIds,
+      ]);
       if (canonical.coverageSelection) {
         setAtlasFocusedCellIndex(
           canonical.coverageSelection.minRow *
@@ -2687,13 +2723,19 @@ export function MapViewer() {
             ) as LocalAtlasWorkspaceContent;
             const localId = localCanonical.explorations[0]?.id ?? null;
             const currentId = currentCanonical.explorations[0]?.id ?? null;
-            if (localId !== null && localId === currentId) {
-              const merged = consolidateSingleWorkspaceContent(
-                mergeWorkspaceContentCandidates([
-                  localCanonical,
-                  currentCanonical,
-                ]),
-              ) as LocalAtlasWorkspaceContent;
+            if (localId === currentId) {
+              const merged = {
+                ...(consolidateSingleWorkspaceContent(
+                  mergeWorkspaceContentCandidates([
+                    localCanonical,
+                    currentCanonical,
+                  ]),
+                ) as LocalAtlasWorkspaceContent),
+                // The first candidate is this tab's explicit state. Keeping
+                // it exact lets a manual unmark win a concurrent CAS retry.
+                minecraftExploredSectorIds:
+                  localCanonical.minecraftExploredSectorIds,
+              } satisfies LocalAtlasWorkspaceContent;
               workspaceContentRef.current = merged;
               reconcileXaeroScope(merged.explorations);
               setSavedExplorations([...merged.explorations]);
@@ -3338,6 +3380,8 @@ export function MapViewer() {
           cell.column >= visibleCoverageSelection.minColumn &&
           cell.column < visibleCoverageSelection.maxColumnExclusive;
         const focused = atlasMode && index === atlasFocusedCellIndex;
+        const exploredInMinecraft =
+          minecraftExploredSectorIdSet.has(cell.id);
         const progress = atlasProgress?.sectors[index] ?? null;
         const progressStatus = progress?.status ?? "pending";
         const filtered =
@@ -3364,6 +3408,31 @@ export function MapViewer() {
           overviewCellSize,
           overviewCellSize,
         );
+        if (exploredInMinecraft) {
+          context.fillStyle = "rgba(37, 99, 235, 0.38)";
+          context.fillRect(
+            point.x,
+            point.y,
+            overviewCellSize,
+            overviewCellSize,
+          );
+          if (overviewCellSize >= 14) {
+            context.save();
+            const markerRadius = Math.min(7, overviewCellSize * 0.2);
+            const markerX = point.x + overviewCellSize - markerRadius - 3;
+            const markerY = point.y + markerRadius + 3;
+            context.fillStyle = "rgba(98, 168, 255, 0.98)";
+            context.beginPath();
+            context.arc(markerX, markerY, markerRadius, 0, Math.PI * 2);
+            context.fill();
+            context.fillStyle = "#ffffff";
+            context.font = `700 ${Math.max(8, markerRadius * 1.45)}px sans-serif`;
+            context.textAlign = "center";
+            context.textBaseline = "middle";
+            context.fillText("✓", markerX, markerY + 0.5);
+            context.restore();
+          }
+        }
         if (
           atlasMode &&
           progressStatus === "in-progress" &&
@@ -3768,6 +3837,7 @@ export function MapViewer() {
     renderedHighlights,
     layers,
     lod,
+    minecraftExploredSectorIdSet,
     renderVersion,
     scale,
     screenAtWorld,
@@ -4206,6 +4276,15 @@ export function MapViewer() {
     ],
   );
 
+  const clearCoverageSelectionForManualRegion = useCallback(() => {
+    setCoverageSelection(null);
+    coverageStartRef.current = null;
+    coveragePreviewRef.current = null;
+    setCoveragePreview(null);
+    setRegionStatusSnapshot(null);
+    setRegionStatusError(null);
+  }, []);
+
   const captureRegionBounds = useCallback(
     (bounds: NonNullable<Highlight["bounds"]>) => {
       const minX = Math.floor(Math.min(bounds.x1, bounds.x2));
@@ -4213,6 +4292,7 @@ export function MapViewer() {
       const maxXExclusive = Math.ceil(Math.max(bounds.x1, bounds.x2));
       const maxZExclusive = Math.ceil(Math.max(bounds.z1, bounds.z2));
       if (maxXExclusive - minX < 2 || maxZExclusive - minZ < 2) return;
+      clearCoverageSelectionForManualRegion();
       setRegionForm((current) => ({
         ...current,
         minX: String(minX),
@@ -4226,7 +4306,7 @@ export function MapViewer() {
       setDrawer("exploration");
       notify("Región capturada; revisa sus límites");
     },
-    [notify],
+    [clearCoverageSelectionForManualRegion, notify],
   );
 
   const applyCoverageSelectionToRegion = useCallback(
@@ -4264,6 +4344,8 @@ export function MapViewer() {
       );
       setRegionStatusError(null);
       setCoverageSelection(selection);
+      coverageStartRef.current = null;
+      coveragePreviewRef.current = null;
       setCoveragePreview(null);
       applyCoverageSelectionToRegion(selection);
       setAtlasFocusedCellIndex(focusedCellIndex);
@@ -4283,6 +4365,8 @@ export function MapViewer() {
         setRegionStatusSnapshot(null);
         setRegionStatusError(null);
         setCoverageSelection(null);
+        coverageStartRef.current = null;
+        coveragePreviewRef.current = null;
         setCoveragePreview(null);
         setAtlasFocusedCellIndex(index);
         notify("Ese sector no contiene datos publicados del Overworld");
@@ -4293,6 +4377,44 @@ export function MapViewer() {
     },
     [commitCoverageSelection, notify],
   );
+
+  const toggleFocusedMinecraftExploredSector = useCallback(() => {
+    if (workspaceMutationsBlocked) {
+      notify("LuisA debe estar disponible para guardar este avance");
+      return;
+    }
+    const baseContent = workspaceContentRef.current ?? workspaceContent;
+    const sectorId = atlasFocusedCell.id;
+    const currentlyExplored =
+      baseContent.minecraftExploredSectorIds.includes(sectorId);
+    const nextSectorIds = withMinecraftExploredSector(
+      baseContent.minecraftExploredSectorIds,
+      sectorId,
+      !currentlyExplored,
+    );
+    const nextContent: LocalAtlasWorkspaceContent = {
+      ...baseContent,
+      minecraftExploredSectorIds: nextSectorIds,
+    };
+    workspaceContentRef.current = nextContent;
+    const journaled = !workspaceReady || journalWorkspace(nextContent);
+    setMinecraftExploredSectorIds([...nextSectorIds]);
+    const message = currentlyExplored
+      ? `${sectorId} ya no figura como explorado en Minecraft`
+      : `${sectorId} marcado como explorado en Minecraft`;
+    notify(
+      journaled
+        ? message
+        : `${message} · recuperación inmediata pendiente`,
+    );
+  }, [
+    atlasFocusedCell.id,
+    journalWorkspace,
+    notify,
+    workspaceContent,
+    workspaceMutationsBlocked,
+    workspaceReady,
+  ]);
 
   const fitAtlasView = useCallback(() => {
     const bounds = OVERWORLD_OVERVIEW_GRID_BOUNDS;
@@ -4338,6 +4460,9 @@ export function MapViewer() {
     setTopbarRevealed(false);
     setShowCoverageGrid(true);
     setMarkMode(null);
+    coverageStartRef.current = null;
+    coveragePreviewRef.current = null;
+    setCoveragePreview(null);
     setAtlasStatusFilter("all");
     setDrawer("atlas");
     fitAtlasView();
@@ -4351,6 +4476,8 @@ export function MapViewer() {
       atlasReturnViewRef.current = null;
       setTopbarRevealed(false);
       setMarkMode(null);
+      coverageStartRef.current = null;
+      coveragePreviewRef.current = null;
       setCoveragePreview(null);
       setDrawer(nextDrawer);
       const restored = resolveAtlasExitView(
@@ -4486,6 +4613,7 @@ export function MapViewer() {
       setAreaPreview(undefined);
       areaStartRef.current = null;
       coverageStartRef.current = null;
+      coveragePreviewRef.current = null;
       setCoveragePreview(null);
       pinStartRef.current = null;
     },
@@ -4571,8 +4699,11 @@ export function MapViewer() {
       }
       coverageStartRef.current = cell;
       try {
-        setCoveragePreview(coverageSelectionBetweenCells(cell, cell));
+        const selection = coverageSelectionBetweenCells(cell, cell);
+        coveragePreviewRef.current = selection;
+        setCoveragePreview(selection);
       } catch {
+        coveragePreviewRef.current = null;
         setCoveragePreview(null);
       }
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -4713,10 +4844,14 @@ export function MapViewer() {
       const cell = overviewCellAtWorld(world.x, world.z);
       if (!cell) return;
       try {
-        setCoveragePreview(
-          coverageSelectionBetweenCells(coverageStartRef.current, cell),
+        const selection = coverageSelectionBetweenCells(
+          coverageStartRef.current,
+          cell,
         );
+        coveragePreviewRef.current = selection;
+        setCoveragePreview(selection);
       } catch {
+        coveragePreviewRef.current = null;
         setCoveragePreview(null);
       }
       return;
@@ -4798,8 +4933,23 @@ export function MapViewer() {
       pinStartRef.current = null;
       if (!pinStart.moved) addPin(pinStart.point);
     } else if (markMode === "coverage" && coverageStartRef.current) {
-      const selection = coveragePreview;
+      const startCell = coverageStartRef.current;
+      let selection = coveragePreviewRef.current;
+      const rect = event.currentTarget.getBoundingClientRect();
+      const point = worldAtScreen(
+        event.clientX - rect.left,
+        event.clientY - rect.top,
+      );
+      const endCell = overviewCellAtWorld(point.x, point.z);
+      if (endCell) {
+        try {
+          selection = coverageSelectionBetweenCells(startCell, endCell);
+        } catch {
+          selection = null;
+        }
+      }
       coverageStartRef.current = null;
+      coveragePreviewRef.current = null;
       setCoveragePreview(null);
       setMarkMode(null);
       if (selection) {
@@ -4885,6 +5035,7 @@ export function MapViewer() {
     if (pinStartRef.current?.id === event.pointerId) pinStartRef.current = null;
     areaStartRef.current = null;
     coverageStartRef.current = null;
+    coveragePreviewRef.current = null;
     areaPreviewRef.current = undefined;
     setAreaPreview(undefined);
     setCoveragePreview(null);
@@ -4985,6 +5136,17 @@ export function MapViewer() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
+      if (
+        event.key === "Escape" &&
+        confirmApplicationShutdown &&
+        !applicationShutdownBusy
+      ) {
+        event.preventDefault();
+        setConfirmApplicationShutdown(false);
+        setApplicationShutdownError(null);
+        setApplicationShutdownPhase("idle");
+        return;
+      }
       if (event.key === "Escape" && quickHighlightMenu) {
         event.preventDefault();
         setQuickHighlightMenu(null);
@@ -5039,6 +5201,7 @@ export function MapViewer() {
         pinStartRef.current = null;
         areaStartRef.current = null;
         coverageStartRef.current = null;
+        coveragePreviewRef.current = null;
         areaPreviewRef.current = undefined;
         setMarkMode(null);
         setAreaPreview(undefined);
@@ -5126,11 +5289,13 @@ export function MapViewer() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
+    applicationShutdownBusy,
     atlasFocusedCellIndex,
     atlasMode,
     beginMarkMode,
     closeAtlas,
     commitCoverageSelection,
+    confirmApplicationShutdown,
     coverageSelection,
     explorationState,
     isExploring,
@@ -5204,6 +5369,7 @@ export function MapViewer() {
   const useCurrentViewForRegion = () => {
     const halfWidth = viewSize.width / (2 * scale);
     const halfHeight = viewSize.height / (2 * scale);
+    clearCoverageSelectionForManualRegion();
     setRegionForm((current) => ({
       ...current,
       minX: String(Math.floor(camera.x - halfWidth)),
@@ -5354,6 +5520,137 @@ export function MapViewer() {
       );
     } finally {
       setRuntimeBusy(false);
+    }
+  };
+
+  const requestApplicationShutdown = async () => {
+    if (applicationShutdownBusy) return;
+    let runtime = workspaceRuntimeRef.current ?? localRuntime;
+    if (!runtime?.shutdownAvailable) {
+      setApplicationShutdownError(
+        "Abre Atlas desde el icono de Aplicaciones para poder apagarlo aquí.",
+      );
+      setApplicationShutdownPhase("error");
+      return;
+    }
+
+    setApplicationShutdownError(null);
+    try {
+      if (
+        runtime.job?.status === "running" ||
+        runtime.job?.status === "stopping"
+      ) {
+        setApplicationShutdownPhase("stopping-download");
+        if (runtime.job.status === "running") {
+          await stopLocalRegionJob(runtime);
+        }
+        const stopDeadline = Date.now() + 20_000;
+        while (Date.now() < stopDeadline) {
+          await new Promise((resolve) => window.setTimeout(resolve, 350));
+          try {
+            const refreshed = await readLocalAtlasRuntime();
+            if (!refreshed) continue;
+            runtime = refreshed;
+            workspaceRuntimeRef.current = refreshed;
+            setLocalRuntime(refreshed);
+            if (
+              refreshed.job?.status !== "running" &&
+              refreshed.job?.status !== "stopping"
+            ) {
+              break;
+            }
+          } catch {
+            // A short bridge hiccup must not turn a resumable download into
+            // an abrupt application shutdown.
+          }
+        }
+        if (
+          runtime.job?.status === "running" ||
+          runtime.job?.status === "stopping"
+        ) {
+          throw new Error(
+            "La descarga regional no terminó de pausarse; Atlas sigue encendido.",
+          );
+        }
+      }
+
+      setApplicationShutdownPhase("saving");
+      const latestContent = workspaceContentRef.current
+        ? (consolidateSingleWorkspaceContent(
+            workspaceContentRef.current,
+          ) as LocalAtlasWorkspaceContent)
+        : null;
+      const hadUnsavedChanges =
+        pendingWorkspaceWriteRef.current !== null ||
+        (latestContent !== null &&
+          JSON.stringify(latestContent) !== lastSavedWorkspaceRef.current);
+      const saved = await flushWorkspace();
+      if (!saved && hadUnsavedChanges) {
+        throw new Error(
+          "No se apagó Atlas porque no se pudieron guardar los cambios pendientes en LuisA.",
+        );
+      }
+
+      runtime = workspaceRuntimeRef.current ?? runtime;
+      if (!runtime.shutdownAvailable) {
+        throw new Error(
+          "El supervisor local dejó de estar disponible; Atlas sigue encendido.",
+        );
+      }
+
+      setApplicationShutdownPhase("requesting");
+      let shutdownRequestError: unknown = null;
+      try {
+        await shutdownLocalAtlasApplication(runtime);
+      } catch (error) {
+        shutdownRequestError = error;
+      }
+
+      setConfirmApplicationShutdown(false);
+      setApplicationShutdownPhase("waiting");
+      let consecutiveOfflineChecks = 0;
+      const shutdownDeadline =
+        Date.now() + (shutdownRequestError ? 3_000 : 30_000);
+      while (Date.now() < shutdownDeadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 1_200);
+        try {
+          const refreshed = await readLocalAtlasRuntime(controller.signal);
+          if (refreshed) {
+            consecutiveOfflineChecks = 0;
+            workspaceRuntimeRef.current = refreshed;
+            setLocalRuntime(refreshed);
+            if (shutdownRequestError) throw shutdownRequestError;
+          } else {
+            consecutiveOfflineChecks += 1;
+          }
+        } catch (error) {
+          if (shutdownRequestError && error === shutdownRequestError) {
+            throw error;
+          }
+          consecutiveOfflineChecks += 1;
+        } finally {
+          window.clearTimeout(timeout);
+        }
+        if (consecutiveOfflineChecks >= 2) {
+          document.title = "Obsidian Atlas · apagado";
+          setApplicationShutdownPhase("stopped");
+          return;
+        }
+      }
+      if (shutdownRequestError) throw shutdownRequestError;
+      throw new Error(
+        "Atlas no confirmó el apagado. El servidor puede seguir encendido.",
+      );
+    } catch (error) {
+      setConfirmApplicationShutdown(true);
+      setApplicationShutdownError(
+        error instanceof Error
+          ? error.message
+          : "No se pudo apagar Obsidian Atlas",
+      );
+      setApplicationShutdownPhase("error");
     }
   };
 
@@ -5733,6 +6030,15 @@ export function MapViewer() {
       })[drawer ?? "layers"],
     [drawer],
   );
+  const applicationShutdownProgressLabel =
+    applicationShutdownPhase === "stopping-download"
+      ? "Pausando descarga…"
+      : applicationShutdownPhase === "saving"
+        ? "Guardando cambios…"
+        : applicationShutdownPhase === "requesting" ||
+            applicationShutdownPhase === "waiting"
+          ? "Apagando…"
+          : "Guardar y apagar";
 
   return (
     <main
@@ -5760,6 +6066,33 @@ export function MapViewer() {
           <code>1024 × 640</code>
         </div>
       </section>
+
+      {applicationShutdownPhase === "waiting" ||
+      applicationShutdownPhase === "stopped" ? (
+        <section
+          className={`application-shutdown-screen ${applicationShutdownPhase === "stopped" ? "is-stopped" : "is-waiting"}`}
+          role="status"
+          aria-live="assertive"
+          aria-atomic="true"
+        >
+          <div>
+            <span className="application-shutdown-icon" aria-hidden="true">
+              <Power size={30} />
+            </span>
+            <span className="application-shutdown-signal" aria-hidden="true" />
+            <h1>
+              {applicationShutdownPhase === "stopped"
+                ? "Obsidian Atlas está apagado"
+                : "Apagando Obsidian Atlas…"}
+            </h1>
+            <p>
+              {applicationShutdownPhase === "stopped"
+                ? "Ya puedes cerrar esta pestaña. Para volver a abrirlo, usa Obsidian Atlas en Aplicaciones."
+                : "Los cambios están guardados. Esperando que termine el servidor local…"}
+            </p>
+          </div>
+        </section>
+      ) : null}
 
       {workspaceMutationsBlocked ? (
         <div
@@ -6244,7 +6577,8 @@ export function MapViewer() {
                 </div>
                 <p className="atlas-availability-copy">
                   Los colores indican qué sectores ya tienen datos locales.
-                  Nada se descarga hasta que tú eliges una región.
+                  Nada se descarga hasta que tú eliges una región. El azul con
+                  ✓ identifica lo que ya exploraste en Minecraft.
                 </p>
                 {localCoverageState === "loading" ? (
                   <p className="atlas-progress-loading" role="status">
@@ -6296,6 +6630,27 @@ export function MapViewer() {
                     ))}
                   </div>
                 )}
+                <div
+                  className="atlas-minecraft-summary"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <span aria-hidden="true">
+                    <CheckCircle2 size={16} />
+                  </span>
+                  <div>
+                    <strong>
+                      {minecraftExploredSectorIds.length.toLocaleString(
+                        "es-GT",
+                      )}{" "}
+                      {minecraftExploredSectorIds.length === 1
+                        ? "sector explorado"
+                        : "sectores explorados"}{" "}
+                      en Minecraft
+                    </strong>
+                    <small>Marcados manualmente y guardados en LuisA</small>
+                  </div>
+                </div>
                 {localCoverageState === "stale" ? (
                   <p className="atlas-progress-stale" role="status">
                     Mostrando la última lectura válida; se reintentará
@@ -6527,6 +6882,7 @@ export function MapViewer() {
                     onClick={() => {
                       if (markMode === "coverage") {
                         coverageStartRef.current = null;
+                        coveragePreviewRef.current = null;
                         setCoveragePreview(null);
                         setMarkMode(null);
                       } else {
@@ -6539,6 +6895,29 @@ export function MapViewer() {
                       ? "Cancelar selección"
                       : "Seleccionar varios"}
                   </button>
+                  <button
+                    type="button"
+                    className={`atlas-minecraft-toggle${atlasFocusedMinecraftExplored ? " minecraft-explored" : ""}`}
+                    aria-pressed={atlasFocusedMinecraftExplored}
+                    disabled={workspaceMutationsBlocked}
+                    title={
+                      workspaceMutationsBlocked
+                        ? "LuisA debe estar disponible para guardar este avance"
+                        : atlasFocusedMinecraftExplored
+                          ? "Quitar la marca de explorado en Minecraft"
+                          : "Guardar este sector como explorado en Minecraft"
+                    }
+                    onClick={toggleFocusedMinecraftExploredSector}
+                  >
+                    {atlasFocusedMinecraftExplored ? (
+                      <CheckCircle2 size={15} />
+                    ) : (
+                      <MapIcon size={15} />
+                    )}
+                    {atlasFocusedMinecraftExplored
+                      ? "Explorado en Minecraft"
+                      : "Marcar explorado en Minecraft"}
+                  </button>
                 </div>
               </section>
 
@@ -6550,6 +6929,96 @@ export function MapViewer() {
                 <kbd>0</kbd>
                 <span>Atlas</span>
               </div>
+
+              <section
+                className="atlas-app-controls"
+                aria-busy={applicationShutdownBusy}
+              >
+                <button
+                  type="button"
+                  className="atlas-shutdown-button"
+                  aria-expanded={confirmApplicationShutdown}
+                  aria-controls="atlas-shutdown-confirmation"
+                  disabled={
+                    applicationShutdownBusy ||
+                    !localRuntime?.shutdownAvailable
+                  }
+                  title={
+                    localRuntime?.shutdownAvailable
+                      ? "Guardar los cambios y apagar el servidor local"
+                      : "Disponible al abrir Atlas desde Aplicaciones"
+                  }
+                  onClick={() => {
+                    setApplicationShutdownError(null);
+                    setApplicationShutdownPhase("idle");
+                    setConfirmApplicationShutdown((current) => !current);
+                  }}
+                >
+                  <Power size={16} aria-hidden="true" />
+                  <span>
+                    <strong>Apagar aplicación</strong>
+                    <small>Detener el servidor local de Atlas</small>
+                  </span>
+                </button>
+                {!localRuntime?.shutdownAvailable ? (
+                  <p className="atlas-shutdown-unavailable" role="status">
+                    Esta acción se activa al abrir Atlas desde su icono en
+                    Aplicaciones.
+                  </p>
+                ) : null}
+                {confirmApplicationShutdown ? (
+                  <div
+                    className="atlas-shutdown-confirm"
+                    id="atlas-shutdown-confirmation"
+                    role="group"
+                    aria-labelledby="atlas-shutdown-title"
+                    aria-describedby="atlas-shutdown-description"
+                  >
+                    <strong id="atlas-shutdown-title">
+                      ¿Guardar y apagar Obsidian Atlas?
+                    </strong>
+                    <p id="atlas-shutdown-description">
+                      Se guardarán los cambios pendientes y se detendrá el
+                      servidor local. Podrás iniciarlo otra vez desde
+                      Aplicaciones.
+                    </p>
+                    {anyRegionDownloadRunning ? (
+                      <p className="atlas-shutdown-download-note">
+                        La descarga regional se pausará de forma segura y
+                        podrás reanudarla la próxima vez.
+                      </p>
+                    ) : null}
+                    {applicationShutdownError ? (
+                      <p className="atlas-shutdown-error" role="alert">
+                        {applicationShutdownError}
+                      </p>
+                    ) : null}
+                    <div className="atlas-shutdown-actions">
+                      <button
+                        type="button"
+                        autoFocus
+                        disabled={applicationShutdownBusy}
+                        onClick={() => {
+                          setConfirmApplicationShutdown(false);
+                          setApplicationShutdownError(null);
+                          setApplicationShutdownPhase("idle");
+                        }}
+                      >
+                        Cancelar
+                      </button>
+                      <button
+                        type="button"
+                        className="danger"
+                        disabled={applicationShutdownBusy}
+                        onClick={() => void requestApplicationShutdown()}
+                      >
+                        <Power size={14} aria-hidden="true" />
+                        {applicationShutdownProgressLabel}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </section>
             </div>
           )}
 
@@ -7370,12 +7839,13 @@ export function MapViewer() {
                               <input
                                 inputMode="numeric"
                                 value={regionForm[field]}
-                                onChange={(event) =>
+                                onChange={(event) => {
+                                  clearCoverageSelectionForManualRegion();
                                   setRegionForm((current) => ({
                                     ...current,
                                     [field]: event.target.value,
-                                  }))
-                                }
+                                  }));
+                                }}
                               />
                             </label>
                           ))}
@@ -8966,6 +9436,7 @@ export function MapViewer() {
               pinStartRef.current = null;
               areaStartRef.current = null;
               coverageStartRef.current = null;
+              coveragePreviewRef.current = null;
               areaPreviewRef.current = undefined;
               setMarkMode(null);
               setAreaPreview(undefined);
